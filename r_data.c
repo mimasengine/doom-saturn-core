@@ -38,6 +38,9 @@
 
 #include "r_data.h"
 
+/* SATURN PERF (1.4): -O3 on R_GetColumn was A/B-tested (row-19 REC) and showed
+   no measurable gain -- R_GetColumn is not a RECORD-pass bottleneck.  Reverted. */
+
 //
 // Graphics.
 // DOOM graphics for walls and sprites

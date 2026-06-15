@@ -96,6 +96,33 @@ fixed_t			cachedxstep[SCREENHEIGHT];
 fixed_t			cachedystep[SCREENHEIGHT];
 
 
+/* SATURN DIAG: visplane-corruption hunt.  Symptom on hardware: a visplane
+   reaches R_DrawPlanes with maxx ~2315 (>> SCREENWIDTH).  That makes
+   `pl->top[pl->maxx+1]=0xff` stomp the zone heap and the span loop iterate
+   thousands of times reading OOB top[]/bottom[] -> screen-wide moire + a
+   flood of OOB R_MapPlane calls (old "MPOOB") + a big FPS hit.
+   We (1) SKIP such visplanes in R_DrawPlanes (a maxx>=SCREENWIDTH plane is
+   definitionally invalid; drawing it corrupts memory), and (2) instrument
+   both ends to localise the source:
+     - VPIN  : R_CheckPlane received a start/stop outside [0,SCREENWIDTH).
+     - VPDRAW: a corrupt minx/maxx reached R_DrawPlanes.
+     - MPOOB : R_MapPlane skipped OOB args (should fall to ~0 once VPDRAW skips).
+   If VPIN fires  -> a caller (BSP/seg clip) passes a bad column range.
+   If VPIN stays 0 while VPDRAW fires -> the plane was stomped by a foreign
+   write AFTER being built (heap corruption elsewhere).
+   Counters reset each frame in R_ClearPlanes, printed once in R_DrawPlanes.
+   Set VP_DIAG 0 to silence.  (OFF now: zero corruption confirmed across all of
+   hardware level 1 on CPU blit; the R_DrawPlanes/R_MapPlane skip-guards stay,
+   only the counting + per-frame prints are dropped -- a real per-frame win.)   */
+#define VP_DIAG 0
+#if VP_DIAG
+extern void jo_print(int x, int y, char *str);
+static int vp_in_bad,   vp_in_lo,   vp_in_hi;
+static int vp_draw_bad, vp_draw_mn, vp_draw_mx;
+static int vp_map_bad,  vp_map_x1,  vp_map_x2, vp_map_y;
+#endif
+
+
 
 //
 // R_InitPlanes
@@ -143,7 +170,12 @@ R_MapPlane
        index. */
     if (x2 < x1 || x1 < 0 || x2 >= viewwidth ||
         y > viewheight || (unsigned int)y >= (unsigned int)SCREENHEIGHT)
+    {
+#if VP_DIAG
+        vp_map_bad++; vp_map_x1 = x1; vp_map_x2 = x2; vp_map_y = y;
+#endif
         return;
+    }
 
 #ifdef RANGECHECK
     if (x2 < x1
@@ -216,6 +248,9 @@ void R_ClearPlanes (void)
         int n = (int)(lastvisplane - visplanes);
         if (n > r_visplane_peak) r_visplane_peak = n;
     }
+#if VP_DIAG
+    vp_in_bad = vp_draw_bad = vp_map_bad = 0;   /* per-frame reset */
+#endif
     lastvisplane = visplanes;
     lastopening = openings;
     
@@ -295,7 +330,17 @@ R_CheckPlane
     int		unionl;
     int		unionh;
     int		x;
-	
+
+#if VP_DIAG
+    /* A valid wall column range is start,stop in [0,SCREENWIDTH).  Anything
+       outside means the caller (BSP/seg clip) handed us garbage -> would
+       propagate straight into pl->maxx/minx. */
+    if (start < 0 || start >= SCREENWIDTH || stop < 0 || stop >= SCREENWIDTH)
+    {
+        vp_in_bad++; vp_in_lo = start; vp_in_hi = stop;
+    }
+#endif
+
     if (start < pl->minx)
     {
 	intrl = pl->minx;
@@ -433,6 +478,17 @@ void R_DrawPlanes (void)
 	if (pl->minx > pl->maxx)
 	    continue;
 
+	/* SATURN: skip a corrupt visplane (minx<0 or maxx>=SCREENWIDTH).
+	   Drawing it would `top[maxx+1]=0xff` into the heap and loop
+	   maxx+1 times reading OOB top[]/bottom[].  See VP_DIAG block. */
+	if (pl->minx < 0 || pl->maxx >= SCREENWIDTH)
+	{
+#if VP_DIAG
+	    vp_draw_bad++; vp_draw_mn = pl->minx; vp_draw_mx = pl->maxx;
+#endif
+	    continue;
+	}
+
 	
 	// sky flat
 	if (pl->picnum == skyflatnum)
@@ -492,4 +548,20 @@ void R_DrawPlanes (void)
         W_ReleaseLumpNum(lumpnum);
         } /* SATURN: end sorted visplane loop */
     }
+
+#if VP_DIAG
+    /* One print per frame (rows 11/13/14 per the overlay map). */
+    {
+        static char b[48];
+        snprintf(b, sizeof b, "MPOOB  n%-5d x%d>%d y%d   ",
+                 vp_map_bad, vp_map_x1, vp_map_x2, vp_map_y);
+        jo_print(0, 11, b);
+        snprintf(b, sizeof b, "VPDRAW n%-5d mn%d mx%d     ",
+                 vp_draw_bad, vp_draw_mn, vp_draw_mx);
+        jo_print(0, 13, b);
+        snprintf(b, sizeof b, "VPIN   n%-5d lo%d hi%d     ",
+                 vp_in_bad, vp_in_lo, vp_in_hi);
+        jo_print(0, 14, b);
+    }
+#endif
 }
