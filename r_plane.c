@@ -433,6 +433,14 @@ R_MakeSpans
 
 
 
+/* SATURN: sky -> VDP2 NBG0 layer.  When set by the platform, R_DrawPlanes leaves
+   the sky region as index 0 (the VDP2 transparent code) instead of drawing the
+   sky texture.  Default 0 => vanilla software sky (DoomJo, which has no VDP2 sky
+   layer, links the same core and keeps drawing the sky). */
+int sat_vdp2_sky = 0;
+extern byte *ylookup[];
+extern int   columnofs[];
+
 //
 // R_DrawPlanes
 // At the end of each frame.
@@ -493,6 +501,27 @@ void R_DrawPlanes (void)
 	// sky flat
 	if (pl->picnum == skyflatnum)
 	{
+	    // SATURN: sky -> VDP2.  Leave the sky region as index 0 (the VDP2
+	    // transparent code) instead of drawing it; the platform composites a
+	    // scrolling VDP2 sky layer behind the framebuffer.  Writing 0 directly
+	    // (no colfunc/R_GetColumn) also drops the sky from REC/EX and the command
+	    // count.  sat_vdp2_sky is 0 by default so DoomJo keeps its software sky.
+	    if (sat_vdp2_sky)
+	    {
+		for (x=pl->minx ; x <= pl->maxx ; x++)
+		{
+		    int yl = pl->top[x];
+		    int yh = pl->bottom[x];
+		    if (yl <= yh)
+		    {
+			byte *d = ylookup[yl] + columnofs[x];
+			int   n = yh - yl + 1;
+			do { *d = 0; d += SCREENWIDTH; } while (--n);
+		    }
+		}
+		continue;
+	    }
+
 	    dc_iscale = pspriteiscale>>detailshift;
 
 	    // Sky is allways drawn full bright,
