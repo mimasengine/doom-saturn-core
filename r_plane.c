@@ -438,6 +438,10 @@ R_MakeSpans
    sky texture.  Default 0 => vanilla software sky (DoomJo, which has no VDP2 sky
    layer, links the same core and keeps drawing the sky). */
 int sat_vdp2_sky = 0;
+/* SATURN: Potato mode -- draw floor/ceiling spans as a single distance-shaded
+   colour instead of texture-mapping them (big EX/fillrate win).  Set by the
+   platform; default 0 (vanilla textured floors, incl. DoomJo). */
+int sat_potato_floors = 0;
 extern byte *ylookup[];
 extern int   columnofs[];
 
@@ -512,10 +516,22 @@ void R_DrawPlanes (void)
 		{
 		    int yl = pl->top[x];
 		    int yh = pl->bottom[x];
-		    if (yl <= yh)
+		    int n;
+		    if (yl > yh) continue;
+		    n = yh - yl + 1;
+		    if (detailshift)
+		    {
+			/* low-detail: the visplane x is the halved column; each one
+			   covers two real screen pixels (x<<1, x<<1+1). */
+			int sx = x << 1;
+			byte *d0 = ylookup[yl] + columnofs[sx];
+			byte *d1 = ylookup[yl] + columnofs[sx + 1];
+			do { *d0 = 0; *d1 = 0; d0 += SCREENWIDTH; d1 += SCREENWIDTH; }
+			while (--n);
+		    }
+		    else
 		    {
 			byte *d = ylookup[yl] + columnofs[x];
-			int   n = yh - yl + 1;
 			do { *d = 0; d += SCREENWIDTH; } while (--n);
 		    }
 		}

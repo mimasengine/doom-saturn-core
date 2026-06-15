@@ -60,6 +60,12 @@ extern int   columnofs[];
 extern int   fuzzoffset[];
 extern int   fuzzpos;
 extern int   detailshift;
+extern int   sat_potato_floors;   /* SATURN: solid-colour floors/ceilings (Potato) */
+/* Potato: one FIXED texel of the 64x64 flat (centre = v32,u32 = 32*64+32) as the
+   span's base colour.  Using a fixed texel (not the view-dependent span-start one)
+   makes the whole flat a single colour that does NOT shift/rotate as the player
+   turns; distance fog is still applied per span via the colormap. */
+#define POTATO_TEXEL 2080
 #define FUZZTABLE 50
 
 /* ------------------------------------------------------------------ */
@@ -254,6 +260,17 @@ static void rp_exec_span(const rp_cmd_t *cm, const int *colofs)
     count = cm->c - cm->b + 1;
 
 #define SPAN_PIX(pos) cmap[src[((pos) >> 26) | (((pos) >> 4) & 0x0fc0)]]
+    if (sat_potato_floors)
+    {
+        /* SATURN Potato: flat-shade the floor/ceiling span -- one FIXED flat texel
+           (POTATO_TEXEL), distance-shaded via cmap, memset across the span.  Much
+           cheaper than the per-pixel textured fill; the fixed texel makes the whole
+           flat a single colour that doesn't shift/rotate with the view, while the
+           per-span cmap keeps distance fog. */
+        byte c = cmap[src[POTATO_TEXEL]];
+        memset(dest, c, (size_t)count);
+        return;
+    }
     while (count >= 8)
     {
         unsigned int p1=position+step,p2=p1+step,p3=p2+step,
@@ -400,6 +417,12 @@ static void rp_exec_span_low(const rp_cmd_t *cm, const int *colofs)
     if (count < 0) return;      /* corrupt/stale cmd guard (do/while runs >=1x) */
     x1    = (int)cm->b << 1;
     dest  = ylookup[cm->a] + colofs[x1];
+    if (sat_potato_floors)
+    {
+        byte c = cmap[src[POTATO_TEXEL]];             /* fixed flat texel (no rotation) */
+        memset(dest, c, (size_t)((count + 1) * 2));   /* low = 2 screen px/source */
+        return;
+    }
     do {
         byte p = cmap[src[((position >> 26)) | ((position >> 4) & 0x0fc0)]];
         *dest++ = p;
