@@ -290,7 +290,7 @@ static void rp_slave_body(void)
 /* Direct SGL wrapper -- avoids SRL::Types::ITask cache-coherency issues.
 ** Completion is tracked via SYNC in uncached low WRAM, so no C++ object
 ** state is needed between frames. */
-static void rp_slave_wrapper(void *) { rp_slave_body(); }
+static void rp_slave_wrapper(void *arg) { (void)arg; rp_slave_body(); }
 
 /* ------------------------------------------------------------------ */
 /* Master side                                                          */
