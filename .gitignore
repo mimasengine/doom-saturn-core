@@ -1,0 +1,5 @@
+# Build artifacts (the ports compile these sources into their own trees)
+*.o
+*.d
+*.elf
+*.map
