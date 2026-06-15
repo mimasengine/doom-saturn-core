@@ -42,8 +42,10 @@ extern void jo_print(int x, int y, char *str);
    while the slave executes in the background) vs EXECUTE (rp_finish: master draws
    its half + waits for the slave).  ms, NTSC-calibrated (FRT = sysclk/128 ~=
    4.47us/tick -> ~224 ticks/ms).  Decides record-bound vs execute-bound.
-   Off in shipped builds; flip to 1 to re-profile (e.g. for the SFX hunt). */
-#define RP_PROF 0
+   Off in shipped builds; flip to 1 to re-profile (e.g. for the SFX hunt).
+   ON during the perf phase: slave confirmed reliable, W measured (~0 = master-
+   bound during EX -> the lever is to give the slave more, not less). */
+#define RP_PROF 1
 
 #if RP_DEBUG
 extern unsigned short sat_frt(void);
@@ -146,15 +148,17 @@ static void rp_exec_col(const rp_cmd_t *cm, const int *colofs)
     fixed_t       frac, step, step2, step3, step4, step5, step6, step7, step8;
     const byte   *src  = cm->src;
     const byte   *cmap = cm->cmap;
-    byte          col_cache[128];
 
     if ((unsigned short)cm->a >= SCREENWIDTH  ||
         (unsigned short)cm->b >= SCREENHEIGHT ||
         (unsigned short)cm->c >= SCREENHEIGHT) return;
     if (count <= 0) return;
 
-    memcpy(col_cache, src, 128);
-    src   = col_cache;
+    /* SATURN PERF (2.2): index cm->src directly with the `& 127` wrap (composite
+       wall columns are tiled at 128, exactly as vanilla R_DrawColumn).  The old
+       per-column `memcpy(col_cache, src, 128)` copied a full 128 bytes to draw as
+       few as ~10 pixels -- pure overhead on every column, and assumed 128-tall
+       sources anyway.  d32xr's hand-asm column does zero source copy; same here. */
     dest  = ylookup[cm->b] + colofs[cm->a];
     step  = cm->f1;
     frac  = cm->f2 + (cm->b - centery) * step;
@@ -267,14 +271,31 @@ static void rp_exec_fuzz(const rp_cmd_t *cm)
     /* SATURN: bounds check — rp_exec_col/trans/span check a, b AND c; fuzz
        used to check only cm->a, so a corrupted cm->b made ylookup[cm->b] a
        stale/uninitialised pointer -> wild dest -> stomps vbl_count / gametic
-       / us_acc and freezes the game.  Check all three like the others. */
-    if ((unsigned short)cm->a >= SCREENWIDTH  ||
-        (unsigned short)cm->b >= SCREENHEIGHT ||
+       / us_acc and freezes the game.  Check all three like the others.
+       (cm->a is checked per detail mode below: full width vs the halved x.) */
+    if ((unsigned short)cm->b >= SCREENHEIGHT ||
         (unsigned short)cm->c >= SCREENHEIGHT) return;
     if (!yl) yl=1;
     if (yh==viewheight-1) yh=viewheight-2;
     count=yh-yl;
     if (count<0 || count>=SCREENHEIGHT) return;
+    if (detailshift)   /* SATURN PERF 2.3: blocky fuzz, mirrors R_DrawFuzzColumnLow */
+    {
+        int   x = (int)cm->a << 1;
+        byte *dest2;
+        if ((unsigned short)cm->a >= (SCREENWIDTH >> 1)) return;
+        dest  = ylookup[yl] + columnofs[x];
+        dest2 = ylookup[yl] + columnofs[x + 1];
+        do {
+            *dest  = colormaps[6*256 + dest [fuzzoffset[fuzzpos]]];
+            *dest2 = colormaps[6*256 + dest2[fuzzoffset[fuzzpos]]];
+            if (++fuzzpos==FUZZTABLE) fuzzpos=0;
+            dest  += SCREENWIDTH;
+            dest2 += SCREENWIDTH;
+        } while (count--);
+        return;
+    }
+    if ((unsigned short)cm->a >= SCREENWIDTH) return;
     dest=ylookup[yl]+columnofs[cm->a];
     do {
         *dest=colormaps[6*256+dest[fuzzoffset[fuzzpos]]];
@@ -283,9 +304,114 @@ static void rp_exec_fuzz(const rp_cmd_t *cm)
     } while (count--);
 }
 
+/* ------------------------------------------------------------------ */
+/* Low-detail executors (SATURN PERF 2.3)                              */
+/*                                                                     */
+/* detailshift!=0 = "blocky" mode: viewwidth is halved and each column */
+/* paints TWO adjacent screen pixels (x = recorded-x << 1).  These     */
+/* mirror R_DrawColumnLow / R_DrawTranslatedColumnLow / R_DrawSpanLow  */
+/* (r_draw.c) byte-for-byte so the parallel path produces identical    */
+/* pixels to the serial low path -- we only split the work across the  */
+/* two SH-2s (parity on the *halved* column index).  Bounds use        */
+/* SCREENWIDTH>>1 because the recorded x is the halved coordinate, and  */
+/* x+1 (= 2*recorded_x + 1) must stay < SCREENWIDTH.                    */
+/* ------------------------------------------------------------------ */
+
+static void rp_exec_col_low(const rp_cmd_t *cm, const int *colofs)
+{
+    int           count = cm->c - cm->b;
+    int           x;
+    byte         *dest, *dest2;
+    const byte   *src  = cm->src;
+    const byte   *cmap = cm->cmap;
+    fixed_t       frac, step;
+
+    if ((unsigned short)cm->a >= (SCREENWIDTH >> 1) ||
+        (unsigned short)cm->b >= SCREENHEIGHT       ||
+        (unsigned short)cm->c >= SCREENHEIGHT) return;
+    if (count < 0) return;
+    x     = (int)cm->a << 1;
+    dest  = ylookup[cm->b] + colofs[x];
+    dest2 = ylookup[cm->b] + colofs[x + 1];
+    step  = cm->f1;
+    frac  = cm->f2 + (cm->b - centery) * step;
+    do {
+        byte p = cmap[src[(frac >> FRACBITS) & 127]];
+        *dest = *dest2 = p;
+        dest  += SCREENWIDTH;
+        dest2 += SCREENWIDTH;
+        frac  += step;
+    } while (count--);
+}
+
+static void rp_exec_trans_low(const rp_cmd_t *cm, const int *colofs)
+{
+    int     count = cm->c - cm->b;
+    int     x;
+    byte   *dest, *dest2;
+    byte   *xlat = (byte *)cm->f3;
+    fixed_t frac, step;
+
+    if ((unsigned short)cm->a >= (SCREENWIDTH >> 1) ||
+        (unsigned short)cm->b >= SCREENHEIGHT       ||
+        (unsigned short)cm->c >= SCREENHEIGHT) return;
+    if (count < 0) return;
+    x     = (int)cm->a << 1;
+    dest  = ylookup[cm->b] + colofs[x];
+    dest2 = ylookup[cm->b] + colofs[x + 1];
+    step  = cm->f1;
+    frac  = cm->f2 + (cm->b - centery) * step;
+    do {
+        byte p = cm->cmap[xlat[cm->src[frac >> FRACBITS]]];
+        *dest = *dest2 = p;
+        dest  += SCREENWIDTH;
+        dest2 += SCREENWIDTH;
+        frac  += step;
+    } while (count--);
+}
+
+static void rp_exec_span_low(const rp_cmd_t *cm, const int *colofs)
+{
+    unsigned int  position, step;
+    byte         *dest;
+    int           count, x1;
+    const byte   *src  = cm->src;
+    const byte   *cmap = cm->cmap;
+
+    position = (((unsigned int)cm->f1 << 10) & 0xffff0000)
+             | (((unsigned int)cm->f2 >> 6)  & 0x0000ffff);
+    step     = (((unsigned int)cm->f3 << 10) & 0xffff0000)
+             | (((unsigned int)cm->f4 >> 6)  & 0x0000ffff);
+
+    if ((unsigned short)cm->a >= SCREENHEIGHT       ||
+        (unsigned short)cm->b >= (SCREENWIDTH >> 1) ||
+        (unsigned short)cm->c >= (SCREENWIDTH >> 1)) return;
+    count = cm->c - cm->b;
+    if (count < 0) return;      /* corrupt/stale cmd guard (do/while runs >=1x) */
+    x1    = (int)cm->b << 1;
+    dest  = ylookup[cm->a] + colofs[x1];
+    do {
+        byte p = cmap[src[((position >> 26)) | ((position >> 4) & 0x0fc0)]];
+        *dest++ = p;
+        *dest++ = p;
+        position += step;
+    } while (count--);
+}
+
 static void rp_exec(const rp_cmd_t *cm, int parity, const int *colofs)
 {
     if ((cm->a & 1) != parity) return;
+    if (detailshift)
+    {
+        switch (cm->type)
+        {
+            case RP_COL:   rp_exec_col_low(cm, colofs);   break;
+            case RP_TRANS: rp_exec_trans_low(cm, colofs); break;
+            case RP_SPAN:  rp_exec_span_low(cm, colofs);  break;
+            default: break;
+        }
+        return;
+    }
     switch (cm->type)
     {
         case RP_COL:   rp_exec_col(cm, colofs);  break;
@@ -643,7 +769,7 @@ static void rp_commit(void)
 
 static void RP_RecordColumn(void)
 {
-    if (rp_disabled) { R_DrawColumn(); return; }
+    if (rp_disabled) { if (detailshift) R_DrawColumnLow(); else R_DrawColumn(); return; }
     rp_cmd_t *cm=rp_alloc();
     cm->type=RP_COL; cm->a=(short)dc_x; cm->b=(short)dc_yl; cm->c=(short)dc_yh;
     cm->src=dc_source; cm->cmap=(byte *)dc_colormap;
@@ -653,7 +779,7 @@ static void RP_RecordColumn(void)
 
 static void RP_RecordTrans(void)
 {
-    if (rp_disabled) { R_DrawTranslatedColumn(); return; }
+    if (rp_disabled) { if (detailshift) R_DrawTranslatedColumnLow(); else R_DrawTranslatedColumn(); return; }
     rp_cmd_t *cm=rp_alloc();
     cm->type=RP_TRANS; cm->a=(short)dc_x; cm->b=(short)dc_yl; cm->c=(short)dc_yh;
     cm->src=dc_source; cm->cmap=(byte *)dc_colormap;
@@ -663,7 +789,7 @@ static void RP_RecordTrans(void)
 
 static void RP_RecordFuzz(void)
 {
-    if (rp_disabled) { R_DrawFuzzColumn(); return; }
+    if (rp_disabled) { if (detailshift) R_DrawFuzzColumnLow(); else R_DrawFuzzColumn(); return; }
     rp_cmd_t *cm=rp_alloc();
     cm->type=RP_FUZZ; cm->a=(short)dc_x; cm->b=(short)dc_yl; cm->c=(short)dc_yh;
     rp_commit();
@@ -671,7 +797,7 @@ static void RP_RecordFuzz(void)
 
 static void RP_RecordSpan(void)
 {
-    if (rp_disabled) { R_DrawSpan(); return; }
+    if (rp_disabled) { if (detailshift) R_DrawSpanLow(); else R_DrawSpan(); return; }
     rp_cmd_t *cm=rp_alloc();
     cm->type=RP_SPAN; cm->a=(short)ds_y; cm->b=(short)ds_x1; cm->c=(short)ds_x2;
     cm->src=ds_source; cm->cmap=(byte *)ds_colormap;
@@ -685,7 +811,11 @@ static void RP_RecordSpan(void)
 
 void RP_BeginFrame(void)
 {
-    if (rp_disabled || detailshift!=0) { rp_active=0; return; }
+    /* SATURN PERF 2.3: low-detail (detailshift!=0) now runs through the parallel
+       path too (rp_exec dispatches to the *_low executors).  Previously this
+       bailed to fully-serial master rendering, so low-detail had no working
+       parallel mode at all. */
+    if (rp_disabled) { rp_active=0; return; }
 #if RP_DEBUG
     rp_t_begin=frt_now();
 #endif
@@ -730,10 +860,11 @@ void RP_EndFrame(void)
                  rec10/10, rec10%10, exe10/10, exe10%10,
                  wai10/10, wai10%10, rec_count);
         jo_print(0, 19, p);
-        snprintf(p, sizeof p, "GRD%d mat%d i%d r%d to%d   ",
-                 SYNC->slave_guard, SYNC->slave_g_mat, SYNC->slave_g_i,
-                 SYNC->slave_g_ready, rp_timeout_count);
-        jo_print(0, 20, p);
+        /* Row 20 (GRD/wedge diagnostic) removed: slave confirmed reliable on
+           hardware (to=0, no wedges).  The anti-wedge guard in rp_slave_body
+           stays as a safety net; only its overlay readout is gone.  The TMO
+           diagnostic in rp_finish still writes row 20 on the (now ~never)
+           timeout path, so a regression would still surface there. */
     }
 #endif
     colfunc=saved_col; basecolfunc=saved_base;
