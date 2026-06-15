@@ -640,6 +640,12 @@ static unsigned short rp_frt(void)
     return (unsigned short)((h << 8) | l);
 }
 static unsigned short prof_begin, prof_recend, prof_wait;
+/* SATURN PERF 2.4 Stage 0: split REC into BSP / planes / masked sub-times to
+   find which generation phase dominates REC (decides what to offload).  Marks:
+   prof_begin (start, RP_BeginFrame) -> prof_bsp_end (RP_MarkBSPDone, after the
+   BSP walk) -> prof_planes_end (RP_BeginMasked, after R_DrawPlanes) -> prof_recend
+   (RP_EndFrame, after R_DrawMasked gen). */
+static unsigned short prof_bsp_end, prof_planes_end;
 #endif
 
 static void rp_finish(void)
@@ -832,9 +838,23 @@ void RP_BeginFrame(void)
 #endif
 }
 
+/* SATURN PERF 2.4 Stage 0: called from R_RenderPlayerView right after the BSP
+   walk, before R_DrawPlanes.  Captures the BSP/planes boundary for the row-20
+   B/P/M breakdown.  No-op (and free) unless RP_PROF; always defined so the
+   shared r_main.c can call it unconditionally on both ports. */
+void RP_MarkBSPDone(void)
+{
+#if RP_PROF
+    if (rp_active && !rp_disabled) prof_bsp_end = rp_frt();
+#endif
+}
+
 void RP_BeginMasked(void)
 {
     if (!rp_active||rp_disabled) return;
+#if RP_PROF
+    prof_planes_end = rp_frt();   /* R_DrawPlanes done; masked gen starts next */
+#endif
     in_masked=1; rec_masked_at=rec_count;
     __asm__ volatile("":::"memory");
     SYNC->ready=rec_count;
@@ -860,11 +880,19 @@ void RP_EndFrame(void)
                  rec10/10, rec10%10, exe10/10, exe10%10,
                  wai10/10, wai10%10, rec_count);
         jo_print(0, 19, p);
-        /* Row 20 (GRD/wedge diagnostic) removed: slave confirmed reliable on
-           hardware (to=0, no wedges).  The anti-wedge guard in rp_slave_body
-           stays as a safety net; only its overlay readout is gone.  The TMO
-           diagnostic in rp_finish still writes row 20 on the (now ~never)
-           timeout path, so a regression would still surface there. */
+        /* Row 20 (SATURN PERF 2.4 Stage 0): REC split into BSP / planes / masked
+           generation sub-times -> tells us which phase owns REC's ~50-100ms and
+           is worth offloading to the slave.  (The wedge GRD diagnostic that lived
+           here is gone -- slave reliable; the TMO timeout path still writes row 20
+           on the ~never timeout, so a regression would still surface.) */
+        {
+            unsigned int b10 = (unsigned short)(prof_bsp_end    - prof_begin)     * 10u / 224u;
+            unsigned int p10 = (unsigned short)(prof_planes_end - prof_bsp_end)   * 10u / 224u;
+            unsigned int m10 = (unsigned short)(prof_recend     - prof_planes_end)* 10u / 224u;
+            snprintf(p, sizeof p, "B%u.%u P%u.%u M%u.%u   ",
+                     b10/10, b10%10, p10/10, p10%10, m10/10, m10%10);
+            jo_print(0, 20, p);
+        }
     }
 #endif
     colfunc=saved_col; basecolfunc=saved_base;

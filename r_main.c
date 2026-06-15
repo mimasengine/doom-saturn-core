@@ -913,6 +913,8 @@ void R_RenderPlayerView (player_t* player)
     // The head node is the last node output.
     R_RenderBSPNode (numnodes-1);
 
+    RP_MarkBSPDone ();   // SATURN: profiler BSP/planes boundary (row-20 B/P/M)
+
     V_Canary ("bsp");
 
     // Check for new console commands.

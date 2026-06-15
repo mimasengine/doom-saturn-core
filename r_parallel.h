@@ -11,6 +11,7 @@
 
 /* Called from R_RenderPlayerView (r_main.c). */
 void RP_BeginFrame(void);
+void RP_MarkBSPDone(void);   /* after the BSP walk, before R_DrawPlanes (profiler) */
 void RP_BeginMasked(void);
 void RP_EndFrame(void);
 
