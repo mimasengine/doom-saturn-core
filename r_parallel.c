@@ -93,6 +93,16 @@ typedef struct
     int slave_masked_done;
     int slave_alive;
     int slave_execs;
+    /* SATURN PERF 2.5 (two-pointers): self-balancing EX opaque drain.  The master
+       draws parity-0 opaque FORWARD from 0 (m_pos = highest index it has drawn);
+       the slave draws parity-0 opaque BACKWARD from mat-1 (s_pos = lowest it has
+       drawn).  Each stops when it reaches the other's pointer -> the slower CPU
+       just covers fewer commands, so W->0 by construction (no static split, no
+       atomics).  Both live in this uncached SYNC struct so writes cross CPUs
+       immediately.  The 0-or-1-command overlap at the crossing is harmless: Doom
+       opaque has no overdraw, so a column drawn by both gets the identical pixel. */
+    int m_pos;
+    int s_pos;
     /* SATURN DIAG: commands the SLAVE read as out-of-range.  The slave reads
        the command buffer from RAM; if the master writes it write-back (not
        write-through), the slave occasionally reads a not-yet-evicted (stale)
@@ -513,6 +523,29 @@ static void rp_slave_body(void)
             }
         }
     }
+    /* SATURN PERF 2.5: two-pointer work-steal.  Help drain the master's parity-0
+       opaque, drawing BACKWARD from mat-1 while the master draws forward from 0.
+       Stop where we meet the master (j <= m_pos).  Self-balancing: if we're the
+       slower CPU (we read commands from RAM, the master has them cached) we simply
+       cover fewer commands and W stays ~0 -- no fixed split to mis-tune per scene.
+       All of [0,mat) is generated before masked_at is set, so these are valid; the
+       parity-1 loop above already read every cmd[] here (no new coherency surface).
+       We work in 16-cmd chunks (1 uncached SYNC touch per chunk); the small (<=~1
+       chunk) overlap at the crossing is harmless -- opaque has no overdraw, so a
+       column drawn by both CPUs gets the identical pixel. */
+    {
+        int mat = SYNC->masked_at;
+        int j = mat, end, k;
+        while (j > 0)
+        {
+            if (j - 1 <= SYNC->m_pos) break;      /* master covers [0, m_pos] */
+            end = j - 16;                          /* claim a 16-cmd chunk backward */
+            if (end < 0) end = 0;
+            for (k = j - 1; k >= end; --k) { rp_exec(&cmds[k], 0, columnofs); execs++; }
+            j = end;
+            SYNC->s_pos = j;                        /* publish: slave drew [j, mat-1] */
+        }
+    }
     SYNC->slave_opaque_done=1;
 
     while (!SYNC->go_masked) ;
@@ -616,6 +649,12 @@ static void rp_restart(void)
     SYNC->slave_opaque_done=0;
     SYNC->slave_masked_done=0;
     SYNC->slave_alive=0;
+    /* SATURN PERF 2.5: two-pointer EX drain.  m_pos=-1 so the slave can draw down
+       to index 0; s_pos = a sentinel above any possible mat so the master can draw
+       forward freely until the slave starts decrementing s_pos.  Set before the
+       slave is dispatched, so it sees initialised values. */
+    SYNC->m_pos=-1;
+    SYNC->s_pos=0x7fffffff;
 #if RP_CDIAG
     SYNC->slave_bad=0;
 #endif
@@ -651,7 +690,7 @@ static unsigned short prof_bsp_end, prof_planes_end;
 static void rp_finish(void)
 {
     const rp_cmd_t *cmds=RP_CMDS;
-    int i, mat, tot, ok;
+    int i, mat, tot, ok, oend;
 #if RP_DEBUG
     rp_t_rec=frt_now();
 #endif
@@ -668,7 +707,24 @@ static void rp_finish(void)
     SYNC->masked_at=mat;
     SYNC->total=tot;
 
-    for (i=0; i<mat; ++i) rp_exec(&cmds[i],0,columnofs);
+    /* SATURN PERF 2.5: two-pointer EX drain.  Master draws parity-0 opaque FORWARD
+       from 0, publishing m_pos; the slave draws parity-0 opaque BACKWARD from
+       mat-1 (rp_slave_body), each stopping at the other's pointer.  Self-balancing
+       -> the slower CPU covers fewer commands, W->0 without a static split.  i ends
+       at the crossing = the first index the master did NOT draw. */
+    {
+        int end;
+        i = 0;
+        while (i < mat)
+        {
+            if (i >= SYNC->s_pos) break;          /* slave covers [s_pos, mat-1] */
+            end = i + 16;                          /* claim a 16-cmd chunk so the */
+            if (end > mat) end = mat;              /*  uncached SYNC touch is 1/16 */
+            while (i < end) { rp_exec(&cmds[i],0,columnofs); ++i; }
+            SYNC->m_pos = i - 1;                   /* publish: master drew [0, i-1] */
+        }
+        oend = i;
+    }
 #if RP_PROF
     { unsigned short w=rp_frt();
       ok=rp_wait(&SYNC->slave_opaque_done);
@@ -694,6 +750,9 @@ static void rp_finish(void)
            several CONSECUTIVE timeouts (a genuinely wedged slave), so one
            transient/slow frame doesn't drop us to serial for the whole session. */
         for (i=0; i<tot; ++i) rp_exec(&cmds[i],1,columnofs);
+        /* SATURN PERF 2.5: also cover the parity-0 opaque the slave was meant to
+           draw backward [oend, mat) -- the master only drew forward [0, oend). */
+        for (i=oend; i<mat; ++i) rp_exec(&cmds[i],0,columnofs);
 #if RP_PROF
         {   /* row 20: where did the slave stall?  al=alive od=opaque-done
                ex=commands it drew  r/tot=ready/total.  al0=never started;
