@@ -701,9 +701,13 @@ char *D_TryFindWADByName(char *filename)
 
 char *D_FindIWAD(int mask, GameMission_t *mission)
 {
-    // SATURN: the IWAD always lives in the RAM cartridge under this name.
+    // SATURN: the IWAD always lives at this fixed CD/cartridge slot name, but we
+    // do NOT assume which game it is.  Returning 'none' lets D_IdentifyVersion()
+    // detect the mission from the WAD's own lumps (E1M1 -> Doom 1, MAP01 ->
+    // Doom 2), so the same binary plays any Doom 1 OR Doom 2 IWAD dropped into
+    // the slot.  Forcing 'doom' here would mis-flag a Doom 2 IWAD as shareware.
     (void)mask;
-    *mission = doom;
+    *mission = none;
     return M_StringDuplicate("DOOM1.WAD");
 }
 
