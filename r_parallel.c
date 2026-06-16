@@ -103,6 +103,14 @@ typedef struct
     int slave_masked_done;
     int slave_alive;
     int slave_execs;
+    /* SATURN PERF 2.4 Stage 1 (profiler): the slave self-times its opaque phase
+       on its OWN free-running counter.  opq_total = ticks from dispatch to
+       slave_opaque_done; opq_draw = ticks actually spent inside the draw loops.
+       Reported as a divider-independent ratio (idle% = (total-draw)/total) so the
+       slave FRT's clock divider need not match the master's.  High idle% => the
+       slave spends REC waiting for the master to produce commands => there is room
+       to offload wall-prep onto it (2.4); low idle% => it is saturated drawing. */
+    int slave_opq_total, slave_opq_draw;
     /* SATURN PERF 2.5 (two-pointers): self-balancing EX opaque drain.  The master
        draws parity-0 opaque FORWARD from 0 (m_pos = highest index it has drawn);
        the slave draws parity-0 opaque BACKWARD from mat-1 (s_pos = lowest it has
@@ -153,9 +161,13 @@ static int  rec_count;
 static int  rec_masked_at;
 static int  in_masked;
 static int  rp_active;
-static int  rp_disabled;
+int         rp_disabled;   /* exposed: r_segs.c gates Potato-walls skip on it */
 static int  rp_consec_timeouts = 0;   /* slave timeouts in a row; re-arm unless persistent */
 int rp_timeout_count = 0;
+
+#if RP_PROF
+static unsigned short rp_frt(void);   /* fwd: slave self-timing in rp_slave_body */
+#endif
 
 static void (*saved_col)(void);
 static void (*saved_base)(void);
@@ -509,6 +521,16 @@ static void rp_slave_body(void)
 #if RP_CDIAG
     int bad=0;
 #endif
+#if RP_PROF
+    unsigned short t_prev=0;     /* last FRT sample (bounded-delta accumulation) */
+    unsigned int   total_acc=0;  /* slave FRT ticks: the WHOLE opaque phase */
+    unsigned int   draw_acc=0;   /* slave FRT ticks actually spent drawing */
+    /* The slave FRT runs fast (~phi/8), so the opaque phase can exceed the
+       65535-tick 16-bit range -> a single end-start subtraction wraps (it made
+       total<draw, busy% explode, idle% stick at 0).  Accumulate both as 32-bit
+       sums of <16-bit deltas instead: sample at the top of each opaque iteration
+       (bounds spin) and per steal chunk (bounds draw bursts). */
+#endif
 
     /* SATURN: slave cache setup.
        The CCR ID bit (0x02 = instruction-cache-replacement disable) was removed
@@ -536,6 +558,9 @@ static void rp_slave_body(void)
         *ccr=(unsigned char)(*ccr|0x10);   /* CP: purge for command-buffer coherency */
     }
     SYNC->slave_alive=1;
+#if RP_PROF
+    t_prev = rp_frt();
+#endif
 
     /* Adopt the master's Potato state from uncached SYNC (the cached globals could
        be a frame stale on this CPU after a toggle).  Writing our own cached copies
@@ -549,9 +574,17 @@ static void rp_slave_body(void)
                                        progress, so legit brief waits don't trip) */
         for (;;)
         {
+#if RP_PROF
+            /* sample the previous full iteration (drawing + spin) into total */
+            { unsigned short now=rp_frt();
+              total_acc += (unsigned short)(now - t_prev); t_prev = now; }
+#endif
             int i0 = i;
             opq=SYNC->masked_at;
             lim=(opq>=0 && opq<SYNC->ready) ? opq : SYNC->ready;
+#if RP_PROF
+            if (i<lim) { unsigned short ts=rp_frt();
+#endif
             while (i<lim)
             {
 #if RP_CDIAG
@@ -564,6 +597,9 @@ static void rp_slave_body(void)
 #endif
                 rp_exec(&cmds[i++],1,columnofs); execs++;
             }
+#if RP_PROF
+            draw_acc += (unsigned short)(rp_frt()-ts); }
+#endif
             if (opq>=0 && i>=opq) break;
             if (i != i0) guard = 1000000;   /* progress -> reset the guard */
             else if (--guard <= 0)
@@ -589,6 +625,12 @@ static void rp_slave_body(void)
        We work in 16-cmd chunks (1 uncached SYNC touch per chunk); the small (<=~1
        chunk) overlap at the crossing is harmless -- opaque has no overdraw, so a
        column drawn by both CPUs gets the identical pixel. */
+#if RP_PROF
+    /* total-only sample: fold the breaking iteration's tail in before the steal
+       (t_prev now starts the steal cleanly, so steal deltas aren't double-counted
+       into draw). */
+    { unsigned short now=rp_frt(); total_acc += (unsigned short)(now - t_prev); t_prev = now; }
+#endif
     {
         int mat = SYNC->masked_at;
         int j = mat, end, k;
@@ -600,9 +642,23 @@ static void rp_slave_body(void)
             for (k = j - 1; k >= end; --k) { rp_exec(&cmds[k], 0, columnofs); execs++; }
             j = end;
             SYNC->s_pos = j;                        /* publish: slave drew [j, mat-1] */
+#if RP_PROF
+            /* steal is pure drawing -> one bounded delta feeds both accumulators */
+            { unsigned short now=rp_frt(); unsigned short d=(unsigned short)(now - t_prev);
+              draw_acc += d; total_acc += d; t_prev = now; }
+#endif
         }
     }
     SYNC->slave_opaque_done=1;
+#if RP_PROF
+    /* fold the tail (steal setup / no-steal gap) into total, then publish.  Both
+       accumulators are 32-bit sums of <16-bit deltas, so neither wraps even though
+       the slave FRT is fast.  total = whole opaque phase (incl. spin-waiting for the
+       master); draw = time actually drawing; total-draw = the slack 2.4 reclaims. */
+    total_acc += (unsigned short)(rp_frt() - t_prev);
+    SYNC->slave_opq_total = (int)total_acc;
+    SYNC->slave_opq_draw  = (int)draw_acc;
+#endif
 
     while (!SYNC->go_masked) ;
     {
@@ -705,6 +761,10 @@ static void rp_restart(void)
     SYNC->slave_opaque_done=0;
     SYNC->slave_masked_done=0;
     SYNC->slave_alive=0;
+#if RP_PROF
+    SYNC->slave_opq_total=0;   /* stale-guard: cleared in case the slave wedges */
+    SYNC->slave_opq_draw=0;
+#endif
     /* SATURN PERF 2.5: two-pointer EX drain.  m_pos=-1 so the slave can draw down
        to index 0; s_pos = a sentinel above any possible mat so the master can draw
        forward freely until the slave starts decrementing s_pos.  Set before the
@@ -743,7 +803,28 @@ static unsigned short prof_begin, prof_recend, prof_wait;
    BSP walk) -> prof_planes_end (RP_BeginMasked, after R_DrawPlanes) -> prof_recend
    (RP_EndFrame, after R_DrawMasked gen). */
 static unsigned short prof_bsp_end, prof_planes_end;
+/* SATURN PERF 2.4 Stage 1: time spent inside R_StoreWallRange (wall generation)
+   accumulated across the BSP walk.  prof_wallprep is a subset of B, so the pure
+   BSP traversal = B - prof_wallprep.  prof_wp_t0 = enter timestamp. */
+static unsigned int   prof_wallprep;
+static unsigned short prof_wp_t0;
 #endif
+
+/* SATURN PERF 2.4 Stage 1: wall-prep timer, called by R_StoreWallRange (r_segs.c)
+   on the master during the BSP walk.  A bare empty call unless RP_PROF.  Always
+   defined so the shared core links on both ports regardless of the flag. */
+void RP_WallPrepEnter(void)
+{
+#if RP_PROF
+    prof_wp_t0 = rp_frt();
+#endif
+}
+void RP_WallPrepLeave(void)
+{
+#if RP_PROF
+    prof_wallprep += (unsigned short)(rp_frt() - prof_wp_t0);
+#endif
+}
 
 static void rp_finish(void)
 {
@@ -957,6 +1038,7 @@ void RP_BeginFrame(void)
     rp_restart();
 #if RP_PROF
     prof_begin = rp_frt();      /* recording starts now (slave runs in bg) */
+    prof_wallprep = 0;          /* reset the per-frame wall-prep accumulator */
 #endif
 }
 
@@ -1002,18 +1084,37 @@ void RP_EndFrame(void)
                  rec10/10, rec10%10, exe10/10, exe10%10,
                  wai10/10, wai10%10, rec_count);
         jo_print(0, 19, p);
-        /* Row 20 (SATURN PERF 2.4 Stage 0): REC split into BSP / planes / masked
-           generation sub-times -> tells us which phase owns REC's ~50-100ms and
-           is worth offloading to the slave.  (The wedge GRD diagnostic that lived
-           here is gone -- slave reliable; the TMO timeout path still writes row 20
-           on the ~never timeout, so a regression would still surface.) */
+        /* Row 20 (SATURN PERF 2.4 Stage 1): B (the BSP walk) split into pure BSP
+           traversal (Bw) vs wall-prep (Bp = time in R_StoreWallRange), plus the
+           planes (P) and masked (M) generation.  Bp is what 2.4 would offload to
+           the slave; Bw is the inherently-serial visibility walk that cannot be.
+           (The TMO timeout path still writes row 20 on the ~never timeout, so a
+           regression would still surface there.) */
         {
-            unsigned int b10 = (unsigned short)(prof_bsp_end    - prof_begin)     * 10u / 224u;
+            unsigned int bt  = (unsigned short)(prof_bsp_end - prof_begin);
+            unsigned int bpt = prof_wallprep;
+            unsigned int bwt = (bt > bpt) ? (bt - bpt) : 0u;   /* pure traversal */
+            unsigned int bw10 = bwt * 10u / 224u;
+            unsigned int bp10 = bpt * 10u / 224u;
             unsigned int p10 = (unsigned short)(prof_planes_end - prof_bsp_end)   * 10u / 224u;
             unsigned int m10 = (unsigned short)(prof_recend     - prof_planes_end)* 10u / 224u;
-            snprintf(p, sizeof p, "B%u.%u P%u.%u M%u.%u   ",
-                     b10/10, b10%10, p10/10, p10%10, m10/10, m10%10);
+            snprintf(p, sizeof p, "Bw%u.%u Bp%u.%u P%u.%u M%u.%u ",
+                     bw10/10, bw10%10, bp10/10, bp10%10,
+                     p10/10, p10%10, m10/10, m10%10);
             jo_print(0, 20, p);
+        }
+        /* Row 18 (SATURN PERF 2.4 Stage 1): slave opaque-phase occupancy.  i = idle%
+           (waiting for the master to produce commands during REC), b = busy% drawing.
+           High idle% => the slave has slack REC time that wall-prep could fill (2.4
+           viable); low idle% => it is saturated drawing.  Ratio is divider-independent
+           (slave FRT need not match the master's); t/d are the raw slave ticks. */
+        {
+            unsigned int st = (unsigned int)SYNC->slave_opq_total;
+            unsigned int sd = (unsigned int)SYNC->slave_opq_draw;
+            unsigned int busy = (st > 0u) ? (sd * 100u / st) : 0u;
+            unsigned int idle = (st > sd) ? ((st - sd) * 100u / st) : 0u;
+            snprintf(p, sizeof p, "SLV i%u%% b%u%% t%u d%u   ", idle, busy, st, sd);
+            jo_print(0, 18, p);
         }
     }
 #endif

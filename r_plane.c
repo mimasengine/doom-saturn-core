@@ -124,6 +124,10 @@ static int vp_map_bad,  vp_map_x1,  vp_map_x2, vp_map_y;
 
 
 
+/* SATURN: forward declaration -- the definition lives just above R_DrawPlanes,
+   but R_MapPlane (which uses it for the step-2 generation skip) comes first. */
+extern int sat_potato_floors;
+
 //
 // R_InitPlanes
 // Only at game startup.
@@ -201,10 +205,19 @@ R_MapPlane
 	ds_ystep = cachedystep[y];
     }
 	
-    length = FixedMul (distance,distscale[x1]);
-    angle = (viewangle + xtoviewangle[x1])>>ANGLETOFINESHIFT;
-    ds_xfrac = viewx + FixedMul(finecosine[angle], length);
-    ds_yfrac = -viewy - FixedMul(finesine[angle], length);
+    /* SATURN PERF (step 2): in Potato floors the span executor memsets a fixed
+       texel shaded by ds_colormap and IGNORES ds_xfrac/yfrac (and xstep/ystep) ->
+       skip this per-span texture-coordinate math (length/angle + 2 FixedMul + 2
+       trig-table reads).  Cuts plane GENERATION (REC's "P"), compounding the EX
+       fill win Potato already gives.  Gated on the flag so pot0 is byte-identical
+       and DoomJo (no Potato) is unaffected. */
+    if (!sat_potato_floors)
+    {
+	length = FixedMul (distance,distscale[x1]);
+	angle = (viewangle + xtoviewangle[x1])>>ANGLETOFINESHIFT;
+	ds_xfrac = viewx + FixedMul(finecosine[angle], length);
+	ds_yfrac = -viewy - FixedMul(finesine[angle], length);
+    }
 
     if (fixedcolormap)
 	ds_colormap = fixedcolormap;

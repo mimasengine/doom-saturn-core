@@ -35,6 +35,7 @@
 
 #include "r_local.h"
 #include "r_sky.h"
+#include "r_parallel.h"	/* SATURN PERF: RP_WallPrep{Enter,Leave} (profiler) */
 
 
 // OPTIMIZE: closed two sided lines as single sided
@@ -218,10 +219,18 @@ void R_RenderSegLoop (void)
     fixed_t		texturecolumn;
     int			top;
     int			bottom;
+    int			wall_solid;
 
     /* Keep doors/switches (special lines) textured even in Potato walls, so they
        stay readable against the flat-shaded plain walls. */
     sat_wall_textured = (curline->linedef->special != 0);
+    /* SATURN PERF (step 2): a plain opaque wall in Potato mode is drawn as one
+       solid colour by rp_exec_col (it reads cm->f3 + cm->cmap, NEVER cm->src) ->
+       skip R_GetColumn (the memory-bound texture composite = the bulk of wall-prep
+       "Bp") and the per-column dc_iscale division.  wall_solid matches the
+       executor's solid test exactly (cm->unused = in_masked||sat_wall_textured,
+       and in_masked is 0 during opaque wall generation). */
+    wall_solid = sat_potato_walls && !sat_wall_textured && !rp_disabled;
 
     for ( ; rw_x < rw_stopx ; rw_x++)
     {
@@ -280,7 +289,9 @@ void R_RenderSegLoop (void)
 
 	    dc_colormap = walllights[index];
 	    dc_x = rw_x;
-	    dc_iscale = 0xffffffffu / (unsigned)rw_scale;
+	    /* solid Potato walls ignore dc_iscale -> skip the per-column division */
+	    if (!wall_solid)
+		dc_iscale = 0xffffffffu / (unsigned)rw_scale;
 	}
         else
         {
@@ -296,8 +307,10 @@ void R_RenderSegLoop (void)
 	    dc_yl = yl;
 	    dc_yh = yh;
 	    dc_texturemid = rw_midtexturemid;
-	    dc_source = R_GetColumn(midtexture,texturecolumn);
-	    if (sat_potato_walls) sat_wall_color = R_WallPotatoColor(midtexture);
+	    if (wall_solid)
+		sat_wall_color = R_WallPotatoColor(midtexture);
+	    else
+		dc_source = R_GetColumn(midtexture,texturecolumn);
 	    colfunc ();
 	    ceilingclip[rw_x] = viewheight;
 	    floorclip[rw_x] = -1;
@@ -319,8 +332,10 @@ void R_RenderSegLoop (void)
 		    dc_yl = yl;
 		    dc_yh = mid;
 		    dc_texturemid = rw_toptexturemid;
-		    dc_source = R_GetColumn(toptexture,texturecolumn);
-		    if (sat_potato_walls) sat_wall_color = R_WallPotatoColor(toptexture);
+		    if (wall_solid)
+			sat_wall_color = R_WallPotatoColor(toptexture);
+		    else
+			dc_source = R_GetColumn(toptexture,texturecolumn);
 		    colfunc ();
 		    ceilingclip[rw_x] = mid;
 		}
@@ -349,9 +364,11 @@ void R_RenderSegLoop (void)
 		    dc_yl = mid;
 		    dc_yh = yh;
 		    dc_texturemid = rw_bottomtexturemid;
-		    dc_source = R_GetColumn(bottomtexture,
-					    texturecolumn);
-		    if (sat_potato_walls) sat_wall_color = R_WallPotatoColor(bottomtexture);
+		    if (wall_solid)
+			sat_wall_color = R_WallPotatoColor(bottomtexture);
+		    else
+			dc_source = R_GetColumn(bottomtexture,
+						texturecolumn);
 		    colfunc ();
 		    floorclip[rw_x] = mid;
 		}
@@ -387,8 +404,23 @@ void R_RenderSegLoop (void)
 // A wall segment will be drawn
 //  between start and stop pixels (inclusive).
 //
-void
-R_StoreWallRange
+// SATURN PERF 2.4 Stage 1: the public entry is a thin wrapper that brackets the
+// wall-prep work (texture setup + R_RenderSegLoop column recording) with
+// RP_WallPrep{Enter,Leave} so the profiler can subtract wall-prep from B and
+// expose the pure BSP-walk cost -- the number that bounds the 2.4 slave-offload
+// payoff.  No-op (a bare call) unless RP_PROF.  The real body is _impl below.
+//
+static void R_StoreWallRange_impl(int start, int stop);
+
+void R_StoreWallRange(int start, int stop)
+{
+    RP_WallPrepEnter();
+    R_StoreWallRange_impl(start, stop);
+    RP_WallPrepLeave();
+}
+
+static void
+R_StoreWallRange_impl
 ( int	start,
   int	stop )
 {
