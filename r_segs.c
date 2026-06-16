@@ -209,6 +209,19 @@ extern int  sat_wall_color;
 extern int  sat_wall_textured;
 extern int  R_WallPotatoColor (int tex);
 
+/* SATURN: hand one-sided (solid) walls to a platform VDP1 world renderer.  NULL on
+   DoomJo / when unused -> normal software wall.  Called per seg with the wall's 4
+   SCREEN corners + texture + light (corners from the same topfrac/bottomfrac the
+   software loop steps).  Step 2 = validate the real-wall projection + affine warp. */
+void (*sat_wall_hook)(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
+                      int texnum, int u1, int u2, const unsigned char *cmap) = 0;
+
+/* SATURN: when the VDP1 world renderer owns the one-sided walls, skip the software
+   midtexture column draw (R_GetColumn + colfunc) for them -> measure the perf the
+   VDP1 path buys back.  The ceiling/floor clip + visplane marking still run (floors,
+   ceilings, sprite occlusion stay correct).  0 on DoomJo / when unused. */
+int sat_wall_skip = 0;
+
 void R_RenderSegLoop (void)
 {
     angle_t		angle;
@@ -231,6 +244,55 @@ void R_RenderSegLoop (void)
        executor's solid test exactly (cm->unused = in_masked||sat_wall_textured,
        and in_masked is 0 during opaque wall generation). */
     wall_solid = sat_potato_walls && !sat_wall_textured && !rp_disabled;
+
+    /* SATURN VDP1 world renderer (Step 2): one-sided (solid) walls -> the platform as
+       a quad.  The 4 screen corners come from the same topfrac/bottomfrac the loop
+       below steps; midtexture = the full-height wall texture. */
+    if (sat_wall_hook && midtexture && !curline->backsector && rw_stopx > rw_x)
+    {
+	int n   = rw_stopx - 1 - rw_x;
+	int yl1 = (topfrac + HEIGHTUNIT - 1) >> HEIGHTBITS;
+	int yh1 = bottomfrac >> HEIGHTBITS;
+	int yl2 = (topfrac + topstep * n + HEIGHTUNIT - 1) >> HEIGHTBITS;
+	int yh2 = (bottomfrac + bottomstep * n) >> HEIGHTBITS;
+	/* texture u at the two ends (same perspective formula as the loop below) */
+	int a1 = (rw_centerangle + xtoviewangle[rw_x])        >> ANGLETOFINESHIFT;
+	int a2 = (rw_centerangle + xtoviewangle[rw_stopx - 1]) >> ANGLETOFINESHIFT;
+	int u1 = (rw_offset - FixedMul(finetangent[a1], rw_distance)) >> FRACBITS;
+	int u2 = (rw_offset - FixedMul(finetangent[a2], rw_distance)) >> FRACBITS;
+	const lighttable_t *cm = walllights[MAXLIGHTSCALE / 2];   /* mid-distance light */
+	sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, midtexture, u1, u2, cm);
+    }
+
+    /* SATURN VDP1 world renderer: two-sided walls -> upper (toptexture) + lower
+       (bottomtexture) quads into the SAME painter list as the one-sided walls, so a
+       NEAR two-sided frame correctly draws over a FAR one-sided wall seen through the
+       opening (the gap between upper/lower has no texture -> the far wall shows there). */
+    if (sat_wall_hook && curline->backsector && rw_stopx > rw_x)
+    {
+	int n   = rw_stopx - 1 - rw_x;
+	int a1 = (rw_centerangle + xtoviewangle[rw_x])        >> ANGLETOFINESHIFT;
+	int a2 = (rw_centerangle + xtoviewangle[rw_stopx - 1]) >> ANGLETOFINESHIFT;
+	int u1 = (rw_offset - FixedMul(finetangent[a1], rw_distance)) >> FRACBITS;
+	int u2 = (rw_offset - FixedMul(finetangent[a2], rw_distance)) >> FRACBITS;
+	const lighttable_t *cm = walllights[MAXLIGHTSCALE / 2];
+	if (toptexture)        /* ceiling -> top of the opening */
+	{
+	    int yl1 = (topfrac + HEIGHTUNIT - 1) >> HEIGHTBITS;
+	    int yl2 = (topfrac + topstep * n + HEIGHTUNIT - 1) >> HEIGHTBITS;
+	    int yh1 = pixhigh >> HEIGHTBITS;
+	    int yh2 = (pixhigh + pixhighstep * n) >> HEIGHTBITS;
+	    sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, toptexture, u1, u2, cm);
+	}
+	if (bottomtexture)     /* bottom of the opening -> floor */
+	{
+	    int yl1 = (pixlow + HEIGHTUNIT - 1) >> HEIGHTBITS;
+	    int yl2 = (pixlow + pixlowstep * n + HEIGHTUNIT - 1) >> HEIGHTBITS;
+	    int yh1 = bottomfrac >> HEIGHTBITS;
+	    int yh2 = (bottomfrac + bottomstep * n) >> HEIGHTBITS;
+	    sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, bottomtexture, u1, u2, cm);
+	}
+    }
 
     for ( ; rw_x < rw_stopx ; rw_x++)
     {
@@ -304,14 +366,19 @@ void R_RenderSegLoop (void)
 	if (midtexture)
 	{
 	    // single sided line
-	    dc_yl = yl;
-	    dc_yh = yh;
-	    dc_texturemid = rw_midtexturemid;
-	    if (wall_solid)
-		sat_wall_color = R_WallPotatoColor(midtexture);
-	    else
-		dc_source = R_GetColumn(midtexture,texturecolumn);
-	    colfunc ();
+	    /* SATURN: VDP1 owns this wall -> skip the software column draw, but KEEP the
+	       clip update so floors/ceilings/sprite occlusion stay correct. */
+	    if (!sat_wall_skip)
+	    {
+		dc_yl = yl;
+		dc_yh = yh;
+		dc_texturemid = rw_midtexturemid;
+		if (wall_solid)
+		    sat_wall_color = R_WallPotatoColor(midtexture);
+		else
+		    dc_source = R_GetColumn(midtexture,texturecolumn);
+		colfunc ();
+	    }
 	    ceilingclip[rw_x] = viewheight;
 	    floorclip[rw_x] = -1;
 	}
@@ -329,14 +396,17 @@ void R_RenderSegLoop (void)
 
 		if (mid >= yl)
 		{
-		    dc_yl = yl;
-		    dc_yh = mid;
-		    dc_texturemid = rw_toptexturemid;
-		    if (wall_solid)
-			sat_wall_color = R_WallPotatoColor(toptexture);
-		    else
-			dc_source = R_GetColumn(toptexture,texturecolumn);
-		    colfunc ();
+		    if (!sat_wall_skip)         /* VDP1 owns it -> skip draw, keep clip */
+		    {
+			dc_yl = yl;
+			dc_yh = mid;
+			dc_texturemid = rw_toptexturemid;
+			if (wall_solid)
+			    sat_wall_color = R_WallPotatoColor(toptexture);
+			else
+			    dc_source = R_GetColumn(toptexture,texturecolumn);
+			colfunc ();
+		    }
 		    ceilingclip[rw_x] = mid;
 		}
 		else
@@ -361,15 +431,18 @@ void R_RenderSegLoop (void)
 		
 		if (mid <= yh)
 		{
-		    dc_yl = mid;
-		    dc_yh = yh;
-		    dc_texturemid = rw_bottomtexturemid;
-		    if (wall_solid)
-			sat_wall_color = R_WallPotatoColor(bottomtexture);
-		    else
-			dc_source = R_GetColumn(bottomtexture,
-						texturecolumn);
-		    colfunc ();
+		    if (!sat_wall_skip)         /* VDP1 owns it -> skip draw, keep clip */
+		    {
+			dc_yl = mid;
+			dc_yh = yh;
+			dc_texturemid = rw_bottomtexturemid;
+			if (wall_solid)
+			    sat_wall_color = R_WallPotatoColor(bottomtexture);
+			else
+			    dc_source = R_GetColumn(bottomtexture,
+						    texturecolumn);
+			colfunc ();
+		    }
 		    floorclip[rw_x] = mid;
 		}
 		else
