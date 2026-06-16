@@ -200,6 +200,14 @@ R_RenderMaskedSegRange
 #define HEIGHTBITS		12
 #define HEIGHTUNIT		(1<<HEIGHTBITS)
 
+/* SATURN Potato walls: when enabled, the wall recorder paints each opaque wall
+   column with the texture's dominant colour (sat_wall_color), set here per wall
+   section so the whole wall is one continuous hue.  Off by default. */
+extern int  sat_potato_walls;
+extern int  sat_wall_color;
+extern int  sat_wall_textured;
+extern int  R_WallPotatoColor (int tex);
+
 void R_RenderSegLoop (void)
 {
     angle_t		angle;
@@ -210,6 +218,10 @@ void R_RenderSegLoop (void)
     fixed_t		texturecolumn;
     int			top;
     int			bottom;
+
+    /* Keep doors/switches (special lines) textured even in Potato walls, so they
+       stay readable against the flat-shaded plain walls. */
+    sat_wall_textured = (curline->linedef->special != 0);
 
     for ( ; rw_x < rw_stopx ; rw_x++)
     {
@@ -285,6 +297,7 @@ void R_RenderSegLoop (void)
 	    dc_yh = yh;
 	    dc_texturemid = rw_midtexturemid;
 	    dc_source = R_GetColumn(midtexture,texturecolumn);
+	    if (sat_potato_walls) sat_wall_color = R_WallPotatoColor(midtexture);
 	    colfunc ();
 	    ceilingclip[rw_x] = viewheight;
 	    floorclip[rw_x] = -1;
@@ -307,6 +320,7 @@ void R_RenderSegLoop (void)
 		    dc_yh = mid;
 		    dc_texturemid = rw_toptexturemid;
 		    dc_source = R_GetColumn(toptexture,texturecolumn);
+		    if (sat_potato_walls) sat_wall_color = R_WallPotatoColor(toptexture);
 		    colfunc ();
 		    ceilingclip[rw_x] = mid;
 		}
@@ -337,6 +351,7 @@ void R_RenderSegLoop (void)
 		    dc_texturemid = rw_bottomtexturemid;
 		    dc_source = R_GetColumn(bottomtexture,
 					    texturecolumn);
+		    if (sat_potato_walls) sat_wall_color = R_WallPotatoColor(bottomtexture);
 		    colfunc ();
 		    floorclip[rw_x] = mid;
 		}

@@ -404,6 +404,47 @@ R_GetColumn
 }
 
 
+/* SATURN Potato walls: the texture's DOMINANT palette index (most frequent texel),
+   cached per texture, used as the wall's single "continuous" colour (one hue for
+   the whole wall, then light-shaded per column by the colormap).  Subsampled (step
+   2) for cheapness; computed lazily on first use and cached.  sat_wall_color is the
+   global the wall recorder reads (set per wall section in r_segs.c). */
+int sat_wall_color = 0;
+/* SATURN Potato walls: set per seg in r_segs.c = (the seg's linedef has a special).
+   Interactive surfaces (doors, switches, ...) are special lines; keep them TEXTURED
+   even in Potato so they stay readable (a flat-grey door in a flat-grey corridor
+   is unfindable). */
+int sat_wall_textured = 0;
+int R_WallPotatoColor (int tex)
+{
+    static short *cache = NULL;
+    int   w, h, col, y, i, best, bestn;
+    int   hist[256];
+    byte *p;
+
+    if (tex < 0 || tex >= numtextures) return 0;
+    if (!cache)
+    {
+	cache = Z_Malloc(numtextures * (int)sizeof(short), PU_STATIC, 0);
+	for (i = 0; i < numtextures; i++) cache[i] = -1;
+    }
+    if (cache[tex] >= 0) return cache[tex];
+
+    memset(hist, 0, sizeof hist);
+    w = texturewidthmask[tex] + 1;
+    h = textureheight[tex] >> FRACBITS;
+    for (col = 0; col < w; col += 2)
+    {
+	p = R_GetColumn(tex, col);
+	for (y = 0; y < h; y += 2) hist[p[y]]++;
+    }
+    best = 0; bestn = -1;
+    for (i = 0; i < 256; i++) if (hist[i] > bestn) { bestn = hist[i]; best = i; }
+    cache[tex] = (short)best;
+    return best;
+}
+
+
 static void GenerateTextureHashTable(void)
 {
     texture_t **rover;
@@ -881,13 +922,18 @@ void R_PrecacheLevel (void)
 	    continue;
 
 	texture = textures[i];
-	
+
 	for (j=0 ; j<texture->patchcount ; j++)
 	{
 	    lump = texture->patches[j].patch;
 	    texturememory += lumpinfo[lump].size;
 	    W_CacheLumpNum(lump , PU_CACHE);
 	}
+
+	/* SATURN: precompute the Potato-walls dominant colour here (level load,
+	   under the loading screen) so enabling Potato walls in-game -- or a future
+	   fps-adaptive switch -- doesn't hitch on the first frame. */
+	R_WallPotatoColor (i);
     }
 
     Z_Free(texturepresent);

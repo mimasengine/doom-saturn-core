@@ -442,6 +442,11 @@ int sat_vdp2_sky = 0;
    colour instead of texture-mapping them (big EX/fillrate win).  Set by the
    platform; default 0 (vanilla textured floors, incl. DoomJo). */
 int sat_potato_floors = 0;
+/* SATURN: Potato walls -- opaque wall columns drawn as a single distance-shaded
+   colour (a fixed texel), in rp_exec_col.  Sprites (masked RP_COL) stay textured.
+   Default 0.  Aimed at the future 2/4-player split-screen builds (more views,
+   tighter budget). */
+int sat_potato_walls = 0;
 extern byte *ylookup[];
 extern int   columnofs[];
 

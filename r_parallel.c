@@ -61,10 +61,14 @@ extern int   fuzzoffset[];
 extern int   fuzzpos;
 extern int   detailshift;
 extern int   sat_potato_floors;   /* SATURN: solid-colour floors/ceilings (Potato) */
+extern int   sat_potato_walls;    /* SATURN: solid-colour walls (opaque RP_COL only) */
+extern int   sat_wall_color;      /* SATURN: current wall's dominant colour (r_segs) */
+extern int   sat_wall_textured;   /* SATURN: keep this wall textured (special line) */
 /* Potato: one FIXED texel of the 64x64 flat (centre = v32,u32 = 32*64+32) as the
    span's base colour.  Using a fixed texel (not the view-dependent span-start one)
    makes the whole flat a single colour that does NOT shift/rotate as the player
-   turns; distance fog is still applied per span via the colormap. */
+   turns; distance fog is still applied per span via the colormap.  (Walls use the
+   per-texture dominant colour carried in the command's f3 field instead.) */
 #define POTATO_TEXEL 2080
 #define FUZZTABLE 50
 
@@ -109,6 +113,12 @@ typedef struct
        opaque has no overdraw, so a column drawn by both gets the identical pixel. */
     int m_pos;
     int s_pos;
+    /* SATURN: Potato flags snapshot (bit0=floors, bit1=walls), published by the
+       master each frame in uncached SYNC so the slave sees the SAME state -- the
+       cached globals would otherwise lag a frame on a toggle (master writes
+       write-back; slave reads stale RAM) -> for one frame the two CPUs disagree
+       and you see half the columns textured, half solid. */
+    int potato;
     /* SATURN DIAG: commands the SLAVE read as out-of-range.  The slave reads
        the command buffer from RAM; if the master writes it write-back (not
        write-through), the slave occasionally reads a not-yet-evicted (stale)
@@ -176,6 +186,16 @@ static void rp_exec_col(const rp_cmd_t *cm, const int *colofs)
        few as ~10 pixels -- pure overhead on every column, and assumed 128-tall
        sources anyway.  d32xr's hand-asm column does zero source copy; same here. */
     dest  = ylookup[cm->b] + colofs[cm->a];
+    /* SATURN Potato walls: a wall column (opaque, cm->unused==0) becomes one
+       distance-shaded colour (a fixed texel of its source) -- vertical detail is
+       lost but the per-column horizontal variation stays.  cm->unused==1 = a
+       masked sprite column (also RP_COL): leave it textured. */
+    if (sat_potato_walls && !cm->unused)
+    {
+        byte c = cmap[(unsigned char)cm->f3];   /* wall's dominant colour, light-shaded */
+        do { *dest = c; dest += SCREENWIDTH; } while (--count);
+        return;
+    }
     step  = cm->f1;
     frac  = cm->f2 + (cm->b - centery) * step;
     step2 = step  + step;
@@ -360,6 +380,13 @@ static void rp_exec_col_low(const rp_cmd_t *cm, const int *colofs)
     x     = (int)cm->a << 1;
     dest  = ylookup[cm->b] + colofs[x];
     dest2 = ylookup[cm->b] + colofs[x + 1];
+    if (sat_potato_walls && !cm->unused)   /* opaque wall column -> single colour */
+    {
+        byte c = cmap[(unsigned char)cm->f3];
+        do { *dest = *dest2 = c; dest += SCREENWIDTH; dest2 += SCREENWIDTH; }
+        while (count--);
+        return;
+    }
     step  = cm->f1;
     frac  = cm->f2 + (cm->b - centery) * step;
     do {
@@ -509,6 +536,12 @@ static void rp_slave_body(void)
         *ccr=(unsigned char)(*ccr|0x10);   /* CP: purge for command-buffer coherency */
     }
     SYNC->slave_alive=1;
+
+    /* Adopt the master's Potato state from uncached SYNC (the cached globals could
+       be a frame stale on this CPU after a toggle).  Writing our own cached copies
+       to the same value the master holds keeps both CPUs in agreement this frame. */
+    sat_potato_floors = (SYNC->potato & 1) ? 1 : 0;
+    sat_potato_walls  = (SYNC->potato & 2) ? 1 : 0;
 
     {
         int guard = 100000;         /* anti-wedge: bound pure-spin on masked_at
@@ -678,6 +711,8 @@ static void rp_restart(void)
        slave is dispatched, so it sees initialised values. */
     SYNC->m_pos=-1;
     SYNC->s_pos=0x7fffffff;
+    /* publish the Potato state for the slave (uncached -> coherent this frame) */
+    SYNC->potato = (sat_potato_floors ? 1 : 0) | (sat_potato_walls ? 2 : 0);
 #if RP_CDIAG
     SYNC->slave_bad=0;
 #endif
@@ -862,6 +897,11 @@ static void RP_RecordColumn(void)
     cm->type=RP_COL; cm->a=(short)dc_x; cm->b=(short)dc_yl; cm->c=(short)dc_yh;
     cm->src=dc_source; cm->cmap=(byte *)dc_colormap;
     cm->f1=dc_iscale; cm->f2=dc_texturemid;
+    /* Potato walls: unused 0 = plain wall (-> solid colour), 1 = keep textured.
+       Sprites (in_masked) and interactive walls (special lines: doors/switches,
+       sat_wall_textured) stay textured so they remain readable. */
+    cm->unused=(unsigned char)((in_masked || sat_wall_textured) ? 1 : 0);
+    cm->f3=sat_wall_color;                 /* Potato walls: dominant colour (opaque only) */
     rp_commit();
 }
 
