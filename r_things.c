@@ -71,6 +71,16 @@ typedef struct
 fixed_t		pspritescale;
 fixed_t		pspriteiscale;
 
+/* SATURN: platform hooks to draw the player sprites (weapon / muzzle flash) on
+   VDP1 instead of the software framebuffer.  NULL on DoomJo and when unused ->
+   the normal R_DrawVisSprite software path runs.  sat_psprite_begin is called
+   once at the top of R_DrawPlayerSprites (reset the VDP1 command list); the
+   hook is called per psprite with the cached patch, screen top-left, flip and
+   light colormap. */
+void (*sat_psprite_begin)(void) = 0;
+void (*sat_psprite_hook)(patch_t *patch, int lump, int sx, int sy, int flip,
+                         const unsigned char *cmap) = 0;
+
 lighttable_t**	spritelights;
 
 // constant arrays
@@ -733,7 +743,19 @@ void R_DrawPSprite (pspdef_t* psp)
 	// local light
 	vis->colormap = spritelights[MAXLIGHTSCALE-1];
     }
-	
+
+    /* SATURN: draw the weapon on VDP1 (hardware sprite layer, async, in parallel
+       with the SH-2s) instead of the software framebuffer.  Only the opaque,
+       non-translated case (vis->colormap != NULL); the rare invisibility "shadow"
+       (NULL colormap = fuzz) falls through to the software path below. */
+    if (sat_psprite_hook && vis->colormap)
+    {
+	int ytop = (centeryfrac - FixedMul(vis->texturemid, vis->scale)) >> FRACBITS;
+	patch_t *wp = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
+	sat_psprite_hook (wp, vis->patch, x1, ytop, (int)flip, vis->colormap);
+	return;
+    }
+
     R_DrawVisSprite (vis, vis->x1, vis->x2);
 }
 
@@ -763,7 +785,11 @@ void R_DrawPlayerSprites (void)
     // clip to screen bounds
     mfloorclip = screenheightarray;
     mceilingclip = negonearray;
-    
+
+    /* SATURN: start a fresh VDP1 command list for this frame's player sprites */
+    if (sat_psprite_begin)
+	sat_psprite_begin();
+
     // add all active psprites
     for (i=0, psp=viewplayer->psprites;
 	 i<NUMPSPRITES;
