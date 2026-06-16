@@ -163,8 +163,8 @@ void D_ProcessEvents (void)
 // SATURN: per-frame timing overlays (D_Display sub-phases row 5, doomgeneric_Tick
 // rows 3-4).  Off by default -- they sprintf every frame (SH-2 perf).  Set to 1
 // to re-enable.
-#define DISPLAY_DEBUG     0
-#define SATURN_TICK_DEBUG 0
+#define DISPLAY_DEBUG     1
+#define SATURN_TICK_DEBUG 1
 extern void jo_print(int x, int y, char *str);
 extern uint32_t DG_GetTicksMs(void);
 #define d_ms DG_GetTicksMs
@@ -191,7 +191,7 @@ void D_Display (void)
     boolean			wipe;
     boolean			redrawsbar;
 #if DISPLAY_DEBUG
-    volatile uint32_t dd_t0, dd_t1, dd_t2, dd_t3;
+    volatile uint32_t dd_t0, dd_t1, dd_t2, dd_t3, dd_t4;
 #endif
 
     if (nodrawers)
@@ -347,33 +347,42 @@ void D_Display (void)
     NetUpdate ();         // send out any new accumulation
 
 #if DISPLAY_DEBUG
-    {
-        /* Sub-phase breakdown of D_Display, accumulated 1s window.
-           st = switch/ST_Drawer  rp = R_RenderPlayerView
-           hu = HU_Drawer         ot = rest (M_Drawer, NetUpdate, misc)
-           I_FinishUpdate/DMA not captured here (shown as dma in row 0). */
-        static unsigned int sum_st, sum_rp, sum_hu, sum_ot, dd_win;
-        unsigned int now = (unsigned int)d_ms();
-        sum_st += dd_t1 - dd_t0;
-        sum_rp += dd_t2 - dd_t1;
-        sum_hu += dd_t3 - dd_t2;
-        sum_ot += now   - dd_t3;
-        if (!dd_win) dd_win = now;
-        if (now - dd_win >= 1000)
-        {
-            static char dd_dbg[41];
-            sprintf(dd_dbg, "st%4u rp%4u hu%4u ot%4u", sum_st, sum_rp, sum_hu, sum_ot);
-            jo_print(0, 5, dd_dbg);
-            sum_st = sum_rp = sum_hu = sum_ot = 0;
-            dd_win = now;
-        }
-    }
+    dd_t4 = d_ms();   /* after M_Drawer / NetUpdate, just before the blit */
 #endif
 
     // normal update
     if (!wipe)
     {
 	I_FinishUpdate ();              // page flip or blit buffer
+#if DISPLAY_DEBUG
+	{
+	    /* Sub-phase breakdown of D_Display over a 1s window, in ms (DG_GetTicksMs).
+	       st = switch/ST_Drawer + I_UpdateNoBlit   rp = R_RenderPlayerView (REC+EX)
+	       hu = HU_Drawer   ot = M_Drawer/NetUpdate/border/pause/misc
+	       bl = I_FinishUpdate (the framebuffer blit -- the step-4 SCU-DMA target)
+	       f  = frames in the window (divide each sum by f for per-frame ms).
+	       st+rp+hu+ot+bl should match row-3 "D" (D_Display incl. blit). */
+	    static unsigned int sum_st, sum_rp, sum_hu, sum_ot, sum_bl, dd_win, dd_f;
+	    unsigned int now = (unsigned int)d_ms();
+	    sum_st += dd_t1 - dd_t0;
+	    sum_rp += dd_t2 - dd_t1;
+	    sum_hu += dd_t3 - dd_t2;
+	    sum_ot += dd_t4 - dd_t3;
+	    sum_bl += now   - dd_t4;
+	    dd_f++;
+	    if (!dd_win) dd_win = now;
+	    if (now - dd_win >= 1000)
+	    {
+		static char dd_dbg[41];
+		sprintf(dd_dbg, "st%4u rp%4u hu%3u ot%3u bl%4u f%3u",
+			sum_st, sum_rp, sum_hu, sum_ot, sum_bl, dd_f);
+		jo_print(0, 5, dd_dbg);
+		sum_st = sum_rp = sum_hu = sum_ot = sum_bl = 0;
+		dd_f = 0;
+		dd_win = now;
+	    }
+	}
+#endif
 	return;
     }
     
@@ -483,8 +492,9 @@ boolean D_GrabMouseCallback(void)
     return (gamestate == GS_LEVEL) && !demoplayback && !advancedemo;
 }
 
-// SATURN: per-phase timing; defines moved before D_Display (see above).
-#define SATURN_TICK_DEBUG 0
+// SATURN: per-phase timing -- SATURN_TICK_DEBUG is defined once, before
+// D_Display (see above).  (The duplicate #define here was removed: a mismatch
+// would have let doomgeneric_Tick read the wrong value.)
 
 // SATURN: memory-corruption canary, defined in r_main.c
 void V_Canary (const char* where);
