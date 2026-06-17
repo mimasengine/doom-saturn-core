@@ -891,6 +891,13 @@ void V_Canary (const char* where)
 /* SATURN: phase indicator (defined in dg_saturn.c). */
 extern volatile int game_phase;
 
+/* SATURN: kick the VDP1 world (walls) as soon as the BSP walk has accumulated them, BEFORE the
+   CPU draws floors/sprites -- so VDP1 renders in PARALLEL with the CPU and is ready the SAME
+   frame, instead of being kicked at end-of-frame and lagging a frame behind the software
+   framebuffer (the seam that showed sky between CPU-drawn close walls and VDP1 far walls).
+   NULL on DoomJo / when the VDP1 world renderer is off. */
+void (*sat_walls_done_hook)(void) = 0;
+
 void R_RenderPlayerView (player_t* player)
 {
     V_Canary ("frame start");
@@ -914,6 +921,10 @@ void R_RenderPlayerView (player_t* player)
     R_RenderBSPNode (numnodes-1);
 
     RP_MarkBSPDone ();   // SATURN: profiler BSP/planes boundary (row-20 B/P/M)
+
+    /* SATURN: walls are accumulated -> kick VDP1 NOW so it draws in parallel with the CPU
+       floors/sprites below and presents the SAME frame (no 1-frame lag vs the framebuffer). */
+    if (sat_walls_done_hook) sat_walls_done_hook ();
 
     V_Canary ("bsp");
 

@@ -214,13 +214,31 @@ extern int  R_WallPotatoColor (int tex);
    SCREEN corners + texture + light (corners from the same topfrac/bottomfrac the
    software loop steps).  Step 2 = validate the real-wall projection + affine warp. */
 void (*sat_wall_hook)(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
-                      int texnum, int u1, int u2, const unsigned char *cmap) = 0;
+                      int texnum, int u1, int u2, int v0, int v1,
+                      const unsigned char *cmap) = 0;
 
 /* SATURN: when the VDP1 world renderer owns the one-sided walls, skip the software
    midtexture column draw (R_GetColumn + colfunc) for them -> measure the perf the
    VDP1 path buys back.  The ceiling/floor clip + visplane marking still run (floors,
    ceilings, sprite occlusion stay correct).  0 on DoomJo / when unused. */
 int sat_wall_skip = 0;
+
+/* SATURN close-wall CPU fallback: a seg whose projected vertical span (px) exceeds this is so
+   close/grazing that its VDP1 textured quad would explode the fill (VDP1 rasterises the whole
+   off-screen-tall quad) -> overrun -> sky through walls.  Render THOSE in SOFTWARE instead:
+   Doom's per-column renderer clips them to the screen correctly (no explosion, no texture
+   swim), and via the layer inversion they land in NBG1 ON TOP of the farther VDP1 walls --
+   correct, since a too-close wall is the nearest.  Match the magnitude to the platform; only
+   near-touching walls trip it (few columns of CPU work, occasional). */
+#define SAT_WALL_CPU_SPAN 480   /* span > this: too close for VDP1 -> render in SOFTWARE (CPU). */
+
+/* ONE extra CPU frame on EXIT (Romain): when a one-sided wall leaves the CPU path (moves away,
+   CPU->VDP1), the VDP1 presents 1 frame late -> a 1-frame sky gap.  So for exactly ONE frame after
+   it stops being CPU, the CPU ALSO draws it (overlap) while VDP1 catches up.  Per-seg (not a span
+   band): only the wall that actually transitions pays, this frame only -- economical.  Keyed by the
+   seg index (seg_t's are static level data -> stable pointer); 1 byte = was-CPU-last-frame. */
+#define SAT_SEG_MAX 4096
+static unsigned char sat_seg_cpu[SAT_SEG_MAX];
 
 void R_RenderSegLoop (void)
 {
@@ -233,6 +251,10 @@ void R_RenderSegLoop (void)
     int			top;
     int			bottom;
     int			wall_solid;
+    /* SATURN per-tier draw gates: sat_sw_* = the software draws this tier (CPU + transition zone);
+       sat_v1_* = the VDP1 hook draws it (VDP1 + transition zone).  Both true in [LOW,HIGH] = overlap. */
+    int			sat_sw_mid = 0, sat_sw_up = 0, sat_sw_lo = 0;
+    int			sat_v1_mid = 0, sat_v1_up = 0, sat_v1_lo = 0;
 
     /* Keep doors/switches (special lines) textured even in Potato walls, so they
        stay readable against the flat-shaded plain walls. */
@@ -245,10 +267,65 @@ void R_RenderSegLoop (void)
        and in_masked is 0 during opaque wall generation). */
     wall_solid = sat_potato_walls && !sat_wall_textured && !rp_disabled;
 
+    /* texture ROW (v) at a wall's top/bottom screen y, so the platform maps the right
+       vertical SUBRANGE of the texture (charAddr/height) instead of stretching the whole
+       texture onto the band (the "vertical squish").  ~constant across the seg, so compute
+       it at x1 (rw_scale = scale1 here). */
+#define SAT_VROWS(texmid, ytop, ybot, v0o, v1o) do { \
+	unsigned int _is = 0xffffffffu / (unsigned int)rw_scale; \
+	(v0o) = (int)(((texmid) + (fixed_t)(((ytop) - centery) * (int)_is)) >> FRACBITS); \
+	(v1o) = (int)(((texmid) + (fixed_t)(((ybot) - centery) * (int)_is)) >> FRACBITS); \
+	} while (0)
+
+    /* SATURN: per tier, gate the software draw (sat_sw_*) and the VDP1 hook (sat_v1_*).
+       span > SPAN -> software only.  span <= SPAN -> VDP1 only, EXCEPT the ONE-sided mid tier
+       gets ONE extra CPU frame the moment it leaves the CPU path (sat_seg_cpu) to cover the
+       VDP1's 1-frame lag at the handoff.  Two-sided upper/lower (thin, rarely explode) = plain. */
+    if (sat_wall_hook && sat_wall_skip && rw_stopx > rw_x)
+    {
+	int n = rw_stopx - 1 - rw_x;
+	if (midtexture && !curline->backsector)
+	{
+	    int s1 = (bottomfrac - topfrac) >> HEIGHTBITS;
+	    int s2 = ((bottomfrac + bottomstep * n) - (topfrac + topstep * n)) >> HEIGHTBITS;
+	    int s = s1 > s2 ? s1 : s2;
+	    int cpu_now = (s > SAT_WALL_CPU_SPAN);
+	    int idx = (int)(curline - segs);
+	    unsigned char *st = (idx >= 0 && idx < SAT_SEG_MAX) ? &sat_seg_cpu[idx] : 0;
+	    if (cpu_now)
+	    {
+		sat_sw_mid = 1;  sat_v1_mid = 0;  if (st) *st = 2;   /* arm 2 CPU exit-frames */
+	    }
+	    else
+	    {
+		sat_v1_mid = 1;
+		sat_sw_mid = (st && *st) ? 1 : 0;   /* CPU also draws for 2 frames after exit */
+		if (st && *st) (*st)--;
+	    }
+	}
+	else if (curline->backsector)
+	{
+	    if (toptexture)
+	    {
+		int s1 = (pixhigh - topfrac) >> HEIGHTBITS;
+		int s2 = ((pixhigh + pixhighstep * n) - (topfrac + topstep * n)) >> HEIGHTBITS;
+		int s = s1 > s2 ? s1 : s2;
+		sat_sw_up = (s > SAT_WALL_CPU_SPAN);  sat_v1_up = !sat_sw_up;
+	    }
+	    if (bottomtexture)
+	    {
+		int s1 = (bottomfrac - pixlow) >> HEIGHTBITS;
+		int s2 = ((bottomfrac + bottomstep * n) - (pixlow + pixlowstep * n)) >> HEIGHTBITS;
+		int s = s1 > s2 ? s1 : s2;
+		sat_sw_lo = (s > SAT_WALL_CPU_SPAN);  sat_v1_lo = !sat_sw_lo;
+	    }
+	}
+    }
+
     /* SATURN VDP1 world renderer (Step 2): one-sided (solid) walls -> the platform as
        a quad.  The 4 screen corners come from the same topfrac/bottomfrac the loop
        below steps; midtexture = the full-height wall texture. */
-    if (sat_wall_hook && midtexture && !curline->backsector && rw_stopx > rw_x)
+    if (sat_wall_hook && midtexture && !curline->backsector && rw_stopx > rw_x && sat_v1_mid)
     {
 	int n   = rw_stopx - 1 - rw_x;
 	int yl1 = (topfrac + HEIGHTUNIT - 1) >> HEIGHTBITS;
@@ -260,8 +337,13 @@ void R_RenderSegLoop (void)
 	int a2 = (rw_centerangle + xtoviewangle[rw_stopx - 1]) >> ANGLETOFINESHIFT;
 	int u1 = (rw_offset - FixedMul(finetangent[a1], rw_distance)) >> FRACBITS;
 	int u2 = (rw_offset - FixedMul(finetangent[a2], rw_distance)) >> FRACBITS;
-	const lighttable_t *cm = walllights[MAXLIGHTSCALE / 2];   /* mid-distance light */
-	sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, midtexture, u1, u2, cm);
+	int v0, v1; SAT_VROWS(rw_midtexturemid, yl1, yh1, v0, v1);
+	/* distance-correct light = the colormap the software loop picks (was a FIXED mid-level,
+	   so VDP1 walls did not match the room's per-distance lighting). */
+	int _li = rw_scale >> LIGHTSCALESHIFT;
+	if (_li >= MAXLIGHTSCALE) _li = MAXLIGHTSCALE - 1; else if (_li < 0) _li = 0;
+	const lighttable_t *cm = walllights[_li];
+	sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, midtexture, u1, u2, v0, v1, cm);
     }
 
     /* SATURN VDP1 world renderer: two-sided walls -> upper (toptexture) + lower
@@ -275,24 +357,29 @@ void R_RenderSegLoop (void)
 	int a2 = (rw_centerangle + xtoviewangle[rw_stopx - 1]) >> ANGLETOFINESHIFT;
 	int u1 = (rw_offset - FixedMul(finetangent[a1], rw_distance)) >> FRACBITS;
 	int u2 = (rw_offset - FixedMul(finetangent[a2], rw_distance)) >> FRACBITS;
-	const lighttable_t *cm = walllights[MAXLIGHTSCALE / 2];
-	if (toptexture)        /* ceiling -> top of the opening */
+	int _li = rw_scale >> LIGHTSCALESHIFT;   /* distance-correct light (was fixed mid-level) */
+	if (_li >= MAXLIGHTSCALE) _li = MAXLIGHTSCALE - 1; else if (_li < 0) _li = 0;
+	const lighttable_t *cm = walllights[_li];
+	if (toptexture && sat_v1_up)   /* ceiling -> top of the opening */
 	{
 	    int yl1 = (topfrac + HEIGHTUNIT - 1) >> HEIGHTBITS;
 	    int yl2 = (topfrac + topstep * n + HEIGHTUNIT - 1) >> HEIGHTBITS;
 	    int yh1 = pixhigh >> HEIGHTBITS;
 	    int yh2 = (pixhigh + pixhighstep * n) >> HEIGHTBITS;
-	    sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, toptexture, u1, u2, cm);
+	    int v0, v1; SAT_VROWS(rw_toptexturemid, yl1, yh1, v0, v1);
+	    sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, toptexture, u1, u2, v0, v1, cm);
 	}
-	if (bottomtexture)     /* bottom of the opening -> floor */
+	if (bottomtexture && sat_v1_lo)   /* bottom of the opening -> floor */
 	{
 	    int yl1 = (pixlow + HEIGHTUNIT - 1) >> HEIGHTBITS;
 	    int yl2 = (pixlow + pixlowstep * n + HEIGHTUNIT - 1) >> HEIGHTBITS;
 	    int yh1 = bottomfrac >> HEIGHTBITS;
 	    int yh2 = (bottomfrac + bottomstep * n) >> HEIGHTBITS;
-	    sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, bottomtexture, u1, u2, cm);
+	    int v0, v1; SAT_VROWS(rw_bottomtexturemid, yl1, yh1, v0, v1);
+	    sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, bottomtexture, u1, u2, v0, v1, cm);
 	}
     }
+#undef SAT_VROWS
 
     for ( ; rw_x < rw_stopx ; rw_x++)
     {
@@ -367,8 +454,9 @@ void R_RenderSegLoop (void)
 	{
 	    // single sided line
 	    /* SATURN: VDP1 owns this wall -> skip the software column draw, but KEEP the
-	       clip update so floors/ceilings/sprite occlusion stay correct. */
-	    if (!sat_wall_skip)
+	       clip update so floors/ceilings/sprite occlusion stay correct.  EXCEPT a
+	       too-close OR transition wall (sat_sw_mid): the CPU draws it (no swim/explosion). */
+	    if (!sat_wall_skip || sat_sw_mid)
 	    {
 		dc_yl = yl;
 		dc_yh = yh;
@@ -396,7 +484,7 @@ void R_RenderSegLoop (void)
 
 		if (mid >= yl)
 		{
-		    if (!sat_wall_skip)         /* VDP1 owns it -> skip draw, keep clip */
+		    if (!sat_wall_skip || sat_sw_up)   /* VDP1 owns it (unless close/transition) */
 		    {
 			dc_yl = yl;
 			dc_yh = mid;
@@ -431,7 +519,7 @@ void R_RenderSegLoop (void)
 		
 		if (mid <= yh)
 		{
-		    if (!sat_wall_skip)         /* VDP1 owns it -> skip draw, keep clip */
+		    if (!sat_wall_skip || sat_sw_lo)   /* VDP1 owns it (unless close/transition) */
 		    {
 			dc_yl = mid;
 			dc_yh = yh;
