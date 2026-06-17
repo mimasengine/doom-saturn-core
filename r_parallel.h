@@ -29,4 +29,12 @@ void RP_WallPrepLeave(void);
    dc_source).  Essentially always 0 on current hardware (slave reliable). */
 extern int rp_disabled;
 
+/* SATURN (DoomSRL platform only): rewind the SGL slave work pointers (GBR+72/+68)
+   to their captured base, exactly as slSynch would.  Normally called once per
+   frame from rp_restart; exposed so the platform layer (dg_saturn.cxx dual-CPU
+   blit) can rewind before a 2nd slSlaveFunc/frame and avoid the work-pointer
+   creep that caused the ~2-min freeze.  Safe no-op for DoomJo (it never calls it;
+   declaration only -> zero impact). */
+void rp_sgl_workptr_reset(void);
+
 #endif

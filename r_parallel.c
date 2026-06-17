@@ -719,7 +719,7 @@ static int rp_wait(volatile int *flag)
    -> CPU illegal-instruction exception -> SGL halt-loop = the freeze.  We
    restore GBR+72 to its post-init base before each slSlaveFunc, exactly as
    slSynch would, so the single per-frame record always reuses the same slot. */
-static void rp_sgl_workptr_reset(void)
+void rp_sgl_workptr_reset(void)
 {
     /* The SGL slave work area has TWO pointers that slSlaveFunc/the slave bump
        +12B per frame and that slSynch normally resets together: the WRITE pointer
