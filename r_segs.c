@@ -231,6 +231,10 @@ int sat_wall_skip = 0;
    correct, since a too-close wall is the nearest.  Match the magnitude to the platform; only
    near-touching walls trip it (few columns of CPU work, occasional). */
 #define SAT_WALL_CPU_SPAN 480   /* span > this: too close for VDP1 -> render in SOFTWARE (CPU). */
+#define SAT_WALL_CPU_V1   576   /* VDP1 starts EARLY (span < this, above the CPU threshold) so it
+                                   pre-warms the pipeline a frame+ before the CPU hands off -- on
+                                   Saturn the VDP1 presents >2 frames late, so the 2 CPU exit-frames
+                                   alone still showed sky.  Band [SPAN,V1] = CPU + VDP1 both. */
 
 /* ONE extra CPU frame on EXIT (Romain): when a one-sided wall leaves the CPU path (moves away,
    CPU->VDP1), the VDP1 presents 1 frame late -> a 1-frame sky gap.  So for exactly ONE frame after
@@ -292,13 +296,13 @@ void R_RenderSegLoop (void)
 	    int cpu_now = (s > SAT_WALL_CPU_SPAN);
 	    int idx = (int)(curline - segs);
 	    unsigned char *st = (idx >= 0 && idx < SAT_SEG_MAX) ? &sat_seg_cpu[idx] : 0;
+	    sat_v1_mid = (s < SAT_WALL_CPU_V1);     /* VDP1 pre-warms a frame before the CPU exits */
 	    if (cpu_now)
 	    {
-		sat_sw_mid = 1;  sat_v1_mid = 0;  if (st) *st = 2;   /* arm 2 CPU exit-frames */
+		sat_sw_mid = 1;  if (st) *st = 2;   /* CPU draws (close); arm 2 CPU exit-frames */
 	    }
 	    else
 	    {
-		sat_v1_mid = 1;
 		sat_sw_mid = (st && *st) ? 1 : 0;   /* CPU also draws for 2 frames after exit */
 		if (st && *st) (*st)--;
 	    }
