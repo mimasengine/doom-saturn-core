@@ -233,14 +233,22 @@ int sat_wall_skip = 0;
 #define SAT_WALL_CPU_SPAN 480   /* span > this: too close for VDP1 -> render in SOFTWARE (CPU). */
 #define SAT_WALL_CPU_V1   576   /* VDP1 starts EARLY (span < this, above the CPU threshold) so it
                                    pre-warms the pipeline a frame+ before the CPU hands off -- on
-                                   Saturn the VDP1 presents >2 frames late, so the 2 CPU exit-frames
+                                   Saturn the VDP1 presents >2 frames late, so the CPU exit-frames
                                    alone still showed sky.  Band [SPAN,V1] = CPU + VDP1 both. */
+#define SAT_WALL_CPU_MAG  3     /* MAGNIFICATION (screen px per texel of u) above which a wall is so
+                                   close/face-on that its VDP1 tiling extrapolates past the screen edge
+                                   and the platform SQUISHES it ("ecrasement", worst on doors) -- and
+                                   VDP1 can't draw it right (DISTORSP has no texture column-subrange).
+                                   Render those in SOFTWARE.  Catches close DOORS (short bands the span
+                                   test misses).  Grazing walls have LOW mag -> stay on VDP1.  Lower =
+                                   more walls to CPU (safer, costlier); higher = fewer (risk squish). */
 
-/* ONE extra CPU frame on EXIT (Romain): when a one-sided wall leaves the CPU path (moves away,
-   CPU->VDP1), the VDP1 presents 1 frame late -> a 1-frame sky gap.  So for exactly ONE frame after
-   it stops being CPU, the CPU ALSO draws it (overlap) while VDP1 catches up.  Per-seg (not a span
-   band): only the wall that actually transitions pays, this frame only -- economical.  Keyed by the
-   seg index (seg_t's are static level data -> stable pointer); 1 byte = was-CPU-last-frame. */
+/* EXTRA CPU FRAMES on EXIT (Romain): when a one-sided wall leaves the CPU path (moves away,
+   CPU->VDP1), the VDP1 presents several frames late -> a sky gap at the seam.  So for N frames after
+   it stops being CPU, the CPU ALSO draws it (overlap) while VDP1 catches up.  N=2.  Per-seg (not a
+   span band): only the wall that actually transitions pays, those frames only -- economical.  Keyed
+   by the seg index (seg_t's are
+   static level data -> stable pointer); 1 byte = CPU-exit-frame countdown. */
 #define SAT_SEG_MAX 4096
 static unsigned char sat_seg_cpu[SAT_SEG_MAX];
 
@@ -281,25 +289,40 @@ void R_RenderSegLoop (void)
 	(v1o) = (int)(((texmid) + (fixed_t)(((ybot) - centery) * (int)_is)) >> FRACBITS); \
 	} while (0)
 
-    /* SATURN: per tier, gate the software draw (sat_sw_*) and the VDP1 hook (sat_v1_*).
-       span > SPAN -> software only.  span <= SPAN -> VDP1 only, EXCEPT the ONE-sided mid tier
-       gets ONE extra CPU frame the moment it leaves the CPU path (sat_seg_cpu) to cover the
-       VDP1's 1-frame lag at the handoff.  Two-sided upper/lower (thin, rarely explode) = plain. */
+    /* SATURN: per tier, gate the software draw (sat_sw_*) and the VDP1 hook (sat_v1_*).  A tier goes
+       to SOFTWARE when it is too close for VDP1 -- vertical SPAN explosion (span > SPAN, tall walls)
+       OR horizontal MAGNIFICATION (close/face-on, catches short DOOR bands the span test misses).
+       Both one-sided mid and two-sided upper/lower get the per-seg 3-frame exit handoff (sat_seg_cpu)
+       to cover the VDP1's multi-frame lag when a wall hands back to VDP1.  Else VDP1 owns it. */
     if (sat_wall_hook && sat_wall_skip && rw_stopx > rw_x)
     {
 	int n = rw_stopx - 1 - rw_x;
+	/* MAGNIFICATION = screen px per texel of u (du = the seg's tex u-span over its visible columns,
+	   tier-independent).  HIGH = close/face-on -> the VDP1 world-anchored tiling extrapolates past
+	   the screen edge and the platform squishes ("ecrasement", worst on DOORS) -> render in CPU.
+	   Grazing walls have a huge du -> LOW mag -> stay on VDP1 (cheap). */
+	int sx  = rw_stopx - rw_x;
+	int ma1 = (rw_centerangle + xtoviewangle[rw_x])        >> ANGLETOFINESHIFT;
+	int ma2 = (rw_centerangle + xtoviewangle[rw_stopx - 1]) >> ANGLETOFINESHIFT;
+	int mdu = ((rw_offset - FixedMul(finetangent[ma1], rw_distance)) >> FRACBITS)
+		- ((rw_offset - FixedMul(finetangent[ma2], rw_distance)) >> FRACBITS);
+	int magnified;
+	if (mdu < 0) mdu = -mdu;
+	if (mdu < 1) mdu = 1;
+	magnified = (sx > mdu * SAT_WALL_CPU_MAG);
+
 	if (midtexture && !curline->backsector)
 	{
 	    int s1 = (bottomfrac - topfrac) >> HEIGHTBITS;
 	    int s2 = ((bottomfrac + bottomstep * n) - (topfrac + topstep * n)) >> HEIGHTBITS;
 	    int s = s1 > s2 ? s1 : s2;
-	    int cpu_now = (s > SAT_WALL_CPU_SPAN);
+	    int cpu_now = (s > SAT_WALL_CPU_SPAN) || magnified;
 	    int idx = (int)(curline - segs);
 	    unsigned char *st = (idx >= 0 && idx < SAT_SEG_MAX) ? &sat_seg_cpu[idx] : 0;
-	    sat_v1_mid = (s < SAT_WALL_CPU_V1);     /* VDP1 pre-warms a frame before the CPU exits */
+	    sat_v1_mid = (s < SAT_WALL_CPU_V1) && !magnified;  /* magnified -> NO VDP1 quad (it squishes) */
 	    if (cpu_now)
 	    {
-		sat_sw_mid = 1;  if (st) *st = 2;   /* CPU draws (close); arm 2 CPU exit-frames */
+		sat_sw_mid = 1;  if (st) *st = 2;   /* CPU draws (close/magnified); arm 2 CPU exit-frames */
 	    }
 	    else
 	    {
@@ -309,19 +332,37 @@ void R_RenderSegLoop (void)
 	}
 	else if (curline->backsector)
 	{
+	    /* doors: upper/lower are SHORT bands -> the span test never trips them even up close, but
+	       they squish at the edge when magnified.  Route the whole seg (both tiers) to CPU on span
+	       OR magnification, with the same per-seg 3-frame exit handoff as the one-sided mid. */
+	    int cpu_up = 0, cpu_lo = 0;
 	    if (toptexture)
 	    {
 		int s1 = (pixhigh - topfrac) >> HEIGHTBITS;
 		int s2 = ((pixhigh + pixhighstep * n) - (topfrac + topstep * n)) >> HEIGHTBITS;
 		int s = s1 > s2 ? s1 : s2;
-		sat_sw_up = (s > SAT_WALL_CPU_SPAN);  sat_v1_up = !sat_sw_up;
+		cpu_up = (s > SAT_WALL_CPU_SPAN);
 	    }
 	    if (bottomtexture)
 	    {
 		int s1 = (bottomfrac - pixlow) >> HEIGHTBITS;
 		int s2 = ((bottomfrac + bottomstep * n) - (pixlow + pixlowstep * n)) >> HEIGHTBITS;
 		int s = s1 > s2 ? s1 : s2;
-		sat_sw_lo = (s > SAT_WALL_CPU_SPAN);  sat_v1_lo = !sat_sw_lo;
+		cpu_lo = (s > SAT_WALL_CPU_SPAN);
+	    }
+	    {
+		int cpu_now = cpu_up || cpu_lo || magnified;
+		int idx = (int)(curline - segs);
+		unsigned char *st = (idx >= 0 && idx < SAT_SEG_MAX) ? &sat_seg_cpu[idx] : 0;
+		int overlap = 0;
+		if (cpu_now) { if (st) *st = 2; }       /* arm 2 CPU exit-frames */
+		else if (st && *st) { overlap = 1; (*st)--; }  /* CPU also draws 2 frames after exit */
+		/* VDP1 owns a tier only when it is neither magnified nor span-close (so it never draws the
+		   squishing quad); the CPU draws it when close/magnified OR during the exit overlap. */
+		sat_v1_up = (toptexture    && !magnified && !cpu_up) ? 1 : 0;
+		sat_v1_lo = (bottomtexture && !magnified && !cpu_lo) ? 1 : 0;
+		sat_sw_up = (toptexture    && (cpu_up || magnified || overlap)) ? 1 : 0;
+		sat_sw_lo = (bottomtexture && (cpu_lo || magnified || overlap)) ? 1 : 0;
 	    }
 	}
     }
