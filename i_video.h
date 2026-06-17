@@ -25,7 +25,8 @@
 // Screen width and height.
 
 #define SCREENWIDTH  320
-#define SCREENHEIGHT 200
+#define SCREENHEIGHT 224   /* SATURN: native 320x224 (both ports) -- was 200; the 192-line 3D
+                              view fills up to the 32px status bar at the screen bottom (192-223) */
 
 // Screen width used for "squash" scale functions
 
