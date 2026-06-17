@@ -23,6 +23,21 @@ void RP_EndFrame(void);
 void RP_WallPrepEnter(void);
 void RP_WallPrepLeave(void);
 
+/* SATURN PERF (Phase-0a fine split, profiler): localise WHERE Bp and P spend
+   their time, to rank the REC-reduction levers.  All per-seg / per-visplane (not
+   per-column / per-span), so the overhead is negligible even when on; bare empty
+   calls unless RP_PROF.  Safe on both ports (pure C, GCC 9.3).
+     Bp  = setup (R_StoreWallRange per-seg trig/scale) + loop (R_RenderSegLoop
+           per-column clip/visplane-mark/texturecolumn).  SegLoop brackets the loop.
+     P   = alloc (W_CacheLumpNum/Release per visplane) + makespans (the R_MakeSpans
+           walk + R_MapPlane span math) + other (sort/sky/control). */
+void RP_SegLoopEnter(void);
+void RP_SegLoopLeave(void);
+void RP_FlatCacheEnter(void);
+void RP_FlatCacheLeave(void);
+void RP_MakeSpansEnter(void);
+void RP_MakeSpansLeave(void);
+
 /* Non-zero once the slave SH-2 has wedged and the renderer fell back to serial
    (master-only) drawing.  r_segs.c reads it so the Potato-walls generation skip
    stays off on the serial path (where R_DrawColumn would deref the skipped

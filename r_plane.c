@@ -34,6 +34,7 @@
 
 #include "r_local.h"
 #include "r_sky.h"
+#include "r_parallel.h"	/* SATURN PERF Phase-0a: RP_FlatCache/MakeSpans brackets (profiler) */
 
 
 
@@ -127,6 +128,10 @@ static int vp_map_bad,  vp_map_x1,  vp_map_x2, vp_map_y;
 /* SATURN: forward declaration -- the definition lives just above R_DrawPlanes,
    but R_MapPlane (which uses it for the step-2 generation skip) comes first. */
 extern int sat_potato_floors;
+/* SATURN: framebuffer row/column lookup -- also externed below for R_DrawPlanes;
+   hoisted here so R_MapPlane's inline Potato span memset can reach them. */
+extern byte *ylookup[];
+extern int   columnofs[];
 
 //
 // R_InitPlanes
@@ -230,13 +235,46 @@ R_MapPlane
 
 	ds_colormap = planezlight[index];
     }
-	
+
+    /* SATURN PERF (REC P-cut): in Potato floors the span is a flat memset (one
+       distance-shaded colour).  Draw it INLINE here and SKIP the command record --
+       RP_RecordSpan writes a 32-byte command to slow low work-RAM (the command queue)
+       and the executor reads it back; both are pure memory traffic on the memory-bound
+       plane phase (P), the #1 REC cost at pot0/pot1.  Pixel-safe: floor/ceiling spans
+       never overlap the slave's concurrently-drawn wall/sprite columns (Doom marks no
+       overdraw between planes and walls), the master's writes are write-through (the
+       blit purges before reading), so there is no new cross-CPU coherency surface.
+       Mirrors rp_exec_span / rp_exec_span_low byte-for-byte (fixed flat texel,
+       distance-shaded via ds_colormap).  Gated on sat_potato_floors -> pot0 stays
+       byte-identical and DoomJo (never sets Potato) is unaffected.  Set
+       SAT_POTATO_INLINE_SPANS 0 to revert to the record+execute path. */
+#define SAT_POTATO_INLINE_SPANS 1
+#if SAT_POTATO_INLINE_SPANS
+#define R_POTATO_TEXEL 2080   /* centre texel of a 64x64 flat (v32,u32); == r_parallel.c POTATO_TEXEL */
+    if (sat_potato_floors)
+    {
+	byte  c = ds_colormap[ds_source[R_POTATO_TEXEL]];
+	byte *d;
+	if (detailshift)
+	{
+	    d = ylookup[y] + columnofs[x1 << 1];
+	    memset(d, c, (size_t)((x2 - x1 + 1) * 2));   /* low-detail: 2 screen px / source */
+	}
+	else
+	{
+	    d = ylookup[y] + columnofs[x1];
+	    memset(d, c, (size_t)(x2 - x1 + 1));
+	}
+	return;
+    }
+#endif
+
     ds_y = y;
     ds_x1 = x1;
     ds_x2 = x2;
 
     // high or low detail
-    spanfunc ();	
+    spanfunc ();
 }
 
 
@@ -582,8 +620,10 @@ void R_DrawPlanes (void)
 	
 	// regular flat
         lumpnum = firstflat + flattranslation[pl->picnum];
+	RP_FlatCacheEnter();   /* SATURN PERF Phase-0a: per-visplane flat allocator cost (c P) */
 	ds_source = W_CacheLumpNum(lumpnum, PU_STATIC);
-	
+	RP_FlatCacheLeave();
+
 	planeheight = abs(pl->height-viewz);
 	light = (pl->lightlevel >> LIGHTSEGSHIFT)+extralight;
 
@@ -600,6 +640,7 @@ void R_DrawPlanes (void)
 		
 	stop = pl->maxx + 1;
 
+	RP_MakeSpansEnter();   /* SATURN PERF Phase-0a: R_MakeSpans walk + R_MapPlane (c P) */
 	for (x=pl->minx ; x<= stop ; x++)
 	{
 	    R_MakeSpans(x,pl->top[x-1],
@@ -607,8 +648,11 @@ void R_DrawPlanes (void)
 			pl->top[x],
 			pl->bottom[x]);
 	}
-	
+	RP_MakeSpansLeave();
+
+	RP_FlatCacheEnter();
         W_ReleaseLumpNum(lumpnum);
+	RP_FlatCacheLeave();
         } /* SATURN: end sorted visplane loop */
     }
 

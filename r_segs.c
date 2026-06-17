@@ -263,6 +263,7 @@ void R_RenderSegLoop (void)
     int			top;
     int			bottom;
     int			wall_solid;
+    int			sw_draws = 0;   /* SATURN PERF (lever C): does software draw a tier this seg? */
     /* SATURN per-tier draw gates: sat_sw_* = the software draws this tier (CPU + transition zone);
        sat_v1_* = the VDP1 hook draws it (VDP1 + transition zone).  Both true in [LOW,HIGH] = overlap. */
     int			sat_sw_mid = 0, sat_sw_up = 0, sat_sw_lo = 0;
@@ -426,6 +427,18 @@ void R_RenderSegLoop (void)
     }
 #undef SAT_VROWS
 
+    /* SATURN PERF (lever C): does the SOFTWARE renderer draw any wall tier this seg?
+       When the VDP1 world renderer owns every tier (sat_wall_skip set, no close/
+       transition CPU fallback) no colfunc runs in the loop below, so the per-column
+       lighting lookup + the dc_iscale divide are dead work -> skip them (the divide is
+       the costly part of wall-prep, Bp).  DoomJo / VDP1-off: sat_wall_skip is 0, so
+       sw_draws stays true for any textured tier and the segtextured block is unchanged. */
+    if (midtexture)
+        sw_draws = (!sat_wall_skip || sat_sw_mid);
+    else
+        sw_draws = (toptexture    && (!sat_wall_skip || sat_sw_up))
+                || (bottomtexture && (!sat_wall_skip || sat_sw_lo));
+
     for ( ; rw_x < rw_stopx ; rw_x++)
     {
 	// mark floor / ceiling areas
@@ -469,23 +482,35 @@ void R_RenderSegLoop (void)
 	}
 	
 	// texturecolumn and lighting are independent of wall tiers
-	if (segtextured)
+	/* SATURN PERF (lever C2, REC Bp-cut): texturecolumn feeds ONLY R_GetColumn (the
+	   software column draw, gated by sw_draws) and the masked-midtexture column save
+	   (gated by maskedtexture).  When VDP1 owns every tier of a non-masked seg
+	   (sw_draws==0 && !maskedtexture) it is dead work -- skip the per-column angle
+	   lookup + finetangent read + FixedMul + shift.  On DoomJo / VDP1-off, sat_wall_skip
+	   is 0 so sw_draws is always 1 -> the condition is always true -> byte-identical. */
+	if (segtextured && (sw_draws || maskedtexture))
 	{
 	    // calculate texture offset
 	    angle = (rw_centerangle + xtoviewangle[rw_x])>>ANGLETOFINESHIFT;
 	    texturecolumn = rw_offset-FixedMul(finetangent[angle],rw_distance);
 	    texturecolumn >>= FRACBITS;
-	    // calculate lighting
-	    index = rw_scale>>LIGHTSCALESHIFT;
+	    /* SATURN PERF (lever C): the lighting lookup + the per-column dc_iscale divide
+	       feed only the software column draw (colfunc).  When VDP1 owns every tier this
+	       seg (sw_draws == 0) no colfunc runs -> skip them; the divide is the costly bit. */
+	    if (sw_draws)
+	    {
+		// calculate lighting
+		index = rw_scale>>LIGHTSCALESHIFT;
 
-	    if (index >=  MAXLIGHTSCALE )
-		index = MAXLIGHTSCALE-1;
+		if (index >=  MAXLIGHTSCALE )
+		    index = MAXLIGHTSCALE-1;
 
-	    dc_colormap = walllights[index];
-	    dc_x = rw_x;
-	    /* solid Potato walls ignore dc_iscale -> skip the per-column division */
-	    if (!wall_solid)
-		dc_iscale = 0xffffffffu / (unsigned)rw_scale;
+		dc_colormap = walllights[index];
+		dc_x = rw_x;
+		/* solid Potato walls ignore dc_iscale -> skip the per-column division */
+		if (!wall_solid)
+		    dc_iscale = 0xffffffffu / (unsigned)rw_scale;
+	    }
 	}
         else
         {
@@ -965,9 +990,11 @@ R_StoreWallRange_impl
     if (markfloor)
 	floorplane = R_CheckPlane (floorplane, rw_x, rw_stopx-1);
 
+    RP_SegLoopEnter ();   /* SATURN PERF Phase-0a: bracket the per-column loop (c Bp) */
     R_RenderSegLoop ();
+    RP_SegLoopLeave ();
 
-    
+
     // save sprite clipping info
     if ( ((ds_p->silhouette & SIL_TOP) || maskedtexture)
 	 && !ds_p->sprtopclip)

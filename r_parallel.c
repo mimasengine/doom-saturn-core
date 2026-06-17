@@ -808,6 +808,13 @@ static unsigned short prof_bsp_end, prof_planes_end;
    BSP traversal = B - prof_wallprep.  prof_wp_t0 = enter timestamp. */
 static unsigned int   prof_wallprep;
 static unsigned short prof_wp_t0;
+/* SATURN PERF Phase-0a: finer Bp/P sub-splits (each a subset of Bp or P). */
+static unsigned int   prof_segloop;     /* R_RenderSegLoop (per-column loop) c Bp */
+static unsigned short prof_sl_t0;
+static unsigned int   prof_flatalloc;   /* W_CacheLumpNum/Release per visplane c P  */
+static unsigned short prof_fc_t0;
+static unsigned int   prof_makespans;   /* R_MakeSpans walk + R_MapPlane span math c P */
+static unsigned short prof_ms_t0;
 #endif
 
 /* SATURN PERF 2.4 Stage 1: wall-prep timer, called by R_StoreWallRange (r_segs.c)
@@ -823,6 +830,39 @@ void RP_WallPrepLeave(void)
 {
 #if RP_PROF
     prof_wallprep += (unsigned short)(rp_frt() - prof_wp_t0);
+#endif
+}
+
+/* SATURN PERF Phase-0a fine split (per-seg / per-visplane brackets; profiler).
+   Always defined so the shared core links on both ports; no-op unless RP_PROF. */
+void RP_SegLoopEnter(void)   {
+#if RP_PROF
+    prof_sl_t0 = rp_frt();
+#endif
+}
+void RP_SegLoopLeave(void)   {
+#if RP_PROF
+    prof_segloop += (unsigned short)(rp_frt() - prof_sl_t0);
+#endif
+}
+void RP_FlatCacheEnter(void) {
+#if RP_PROF
+    prof_fc_t0 = rp_frt();
+#endif
+}
+void RP_FlatCacheLeave(void) {
+#if RP_PROF
+    prof_flatalloc += (unsigned short)(rp_frt() - prof_fc_t0);
+#endif
+}
+void RP_MakeSpansEnter(void) {
+#if RP_PROF
+    prof_ms_t0 = rp_frt();
+#endif
+}
+void RP_MakeSpansLeave(void) {
+#if RP_PROF
+    prof_makespans += (unsigned short)(rp_frt() - prof_ms_t0);
 #endif
 }
 
@@ -1039,6 +1079,7 @@ void RP_BeginFrame(void)
 #if RP_PROF
     prof_begin = rp_frt();      /* recording starts now (slave runs in bg) */
     prof_wallprep = 0;          /* reset the per-frame wall-prep accumulator */
+    prof_segloop = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
 #endif
 }
 
@@ -1102,6 +1143,28 @@ void RP_EndFrame(void)
                      bw10/10, bw10%10, bp10/10, bp10%10,
                      p10/10, p10%10, m10/10, m10%10);
             jo_print(0, 20, p);
+            /* Phase-0a fine split (rows 11/12).  Bp -> setup (per-seg trig/scale)
+               + loop (R_RenderSegLoop per-column).  P -> alloc (flat W_Cache/
+               Release) + makespans (R_MakeSpans walk + R_MapPlane) + other. */
+            {
+                unsigned int sll  = prof_segloop;
+                unsigned int slps = (bpt > sll) ? (bpt - sll) : 0u;   /* Bp setup */
+                unsigned int bps10 = slps * 10u / 224u;
+                unsigned int bpl10 = sll  * 10u / 224u;
+                unsigned int ptot = (unsigned short)(prof_planes_end - prof_bsp_end);
+                unsigned int pa   = prof_flatalloc;
+                unsigned int pm   = prof_makespans;
+                unsigned int po   = (ptot > pa + pm) ? (ptot - pa - pm) : 0u;
+                unsigned int pa10 = pa * 10u / 224u;
+                unsigned int pm10 = pm * 10u / 224u;
+                unsigned int po10 = po * 10u / 224u;
+                snprintf(p, sizeof p, "BP s%u.%u l%u.%u   ",
+                         bps10/10, bps10%10, bpl10/10, bpl10%10);
+                jo_print(0, 11, p);
+                snprintf(p, sizeof p, "P a%u.%u m%u.%u o%u.%u ",
+                         pa10/10, pa10%10, pm10/10, pm10%10, po10/10, po10%10);
+                jo_print(0, 12, p);
+            }
         }
         /* Row 18 (SATURN PERF 2.4 Stage 1): slave opaque-phase occupancy.  i = idle%
            (waiting for the master to produce commands during REC), b = busy% drawing.
