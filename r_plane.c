@@ -578,11 +578,16 @@ int sat_vdp2_floor = 0;
    stay software); the platform reads sat_vdp2_floor_h to anchor the RBG0 plane's height. */
 fixed_t sat_vdp2_floor_h   = 0;
 int     sat_vdp2_floor_pic = -1;
-/* SATURN: colormap for the RBG0 floor = the player sector's light level (+extralight),
-   so the hardware floor dims with the room like the software floor.  The HW plane is one
-   uniform brightness (no per-distance gradient -- that would need a per-line K-table), so
-   this is the sector base shade.  Set each frame in R_DrawPlanes; 0 => full bright. */
+/* SATURN: colormap for the RBG0 floor = the player sector's light band (+extralight, like
+   the software floor) -> one uniform brightness (no per-distance gradient; that needs a
+   per-line K-table).  Per-region lighting is handled by the band-matched floor-skip, not
+   here.  Set each frame in R_DrawPlanes; 0 => full bright. */
 lighttable_t *sat_vdp2_floor_cmap = 0;
+/* SATURN: the player floor's light BAND (lightlevel>>LIGHTSEGSHIFT).  The floor-skip leaves
+   for RBG0 ONLY visplanes whose band matches -- a same-flat sector lit differently (a bright
+   or dark ZONE) keeps drawing in software at its own brightness, so it stays correct no
+   matter where the player stands (instead of the whole HW floor flipping brightness). */
+int sat_vdp2_floor_band = 0;
 /* SATURN: the player's-floor flat data (64x64 = 4096 bytes) for the platform to swizzle
    into the RBG0 cells.  Same lump the software floor would use (animated-flat aware via
    flattranslation).  Returns 0 outside a level.  Off-path for DoomJo (never called). */
@@ -637,12 +642,16 @@ void R_DrawPlanes (void)
     if (sat_vdp2_floor)
     {
 	sector_t *vs = R_PointInSubsector(viewx, viewy)->sector;
-	sat_vdp2_floor_h   = vs->floorheight;
-	sat_vdp2_floor_pic = vs->floorpic;
-	/* light: map the view sector's light band (+extralight) to a colormap level
-	   (0 = brightest .. NUMCOLORMAPS-1 = darkest) so the RBG0 floor dims with the room. */
+	sat_vdp2_floor_h    = vs->floorheight;
+	sat_vdp2_floor_pic  = vs->floorpic;
+	sat_vdp2_floor_band = vs->lightlevel >> LIGHTSEGSHIFT;   /* light band, for the skip match */
+	/* light: map the view sector's light band (+extralight, like the software floor) to a
+	   colormap level (0 = brightest .. NUMCOLORMAPS-1 = darkest) so the RBG0 floor dims with
+	   the room.  The floor-skip below leaves ONLY same-band visplanes for RBG0; differently-
+	   lit same-flat sectors (a brighter/darker ZONE) keep drawing in software at THEIR own
+	   brightness -> the bright zone stays bright regardless of where the player stands. */
 	{
-	    int li = (vs->lightlevel >> LIGHTSEGSHIFT) + extralight;
+	    int li = sat_vdp2_floor_band + extralight;
 	    int lvl;
 	    if (li < 0) li = 0; else if (li >= LIGHTLEVELS) li = LIGHTLEVELS - 1;
 	    lvl = (LIGHTLEVELS - 1 - li) * NUMCOLORMAPS / LIGHTLEVELS;   /* bright band -> level 0 */
@@ -742,12 +751,14 @@ void R_DrawPlanes (void)
 	}
 
 	// SATURN: floor -> VDP2 RBG0.  Leave ONLY the player's-floor visplanes (matching
-	// height AND flat) as index 0 so the hardware Mode-7 RBG0 floor -- which is anchored
-	// at that height -- shows through.  Other floor heights / flats and all ceilings keep
-	// drawing in software.  Off by default (DoomJo).
+	// height, flat AND light band) as index 0 so the hardware Mode-7 RBG0 floor -- which is
+	// anchored at that height and shaded at that one brightness -- shows through.  Other
+	// heights/flats, a same-flat sector at a DIFFERENT light band (a bright/dark zone), and
+	// all ceilings keep drawing in software (at their own brightness).  Off by default (DoomJo).
 	if (sat_vdp2_floor
 	    && pl->height == sat_vdp2_floor_h
-	    && pl->picnum == sat_vdp2_floor_pic)
+	    && pl->picnum == sat_vdp2_floor_pic
+	    && (pl->lightlevel >> LIGHTSEGSHIFT) == sat_vdp2_floor_band)
 	{
 	    for (x=pl->minx ; x <= pl->maxx ; x++)
 	    {
