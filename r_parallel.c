@@ -3,11 +3,11 @@
 **
 ** Pure C, SDK-agnostic: the command queue, executors, sync protocol and
 ** cache-coherency rules are all hardware-level (SH-2 / SGL), so this exact
-** file is compiled by BOTH the SRL (DoomSRL) and Jo Engine (SaturnDoom)
-** ports.  The only platform touch-points are:
+** file is compiled by BOTH ports (DoomSRL and DoomJo).  The only platform
+** touch-points are:
 **   - slSlaveFunc()  : SGL, linked by both ports
-**   - jo_print()     : a thin debug-overlay shim each port provides
-**                      (SRL::Debug::Print on DoomSRL, native on SaturnDoom)
+**   - dbg_print()     : a thin debug-overlay shim each port provides
+**                      (SRL::Debug::Print on DoomSRL, native on DoomJo)
 **   - cache purge    : direct CCR register write (same hardware op everywhere)
 */
 #include <stdio.h>
@@ -20,9 +20,9 @@
 #include "r_state.h"
 #include "r_parallel.h"
 
-/* Platform-provided (SGL on both ports; jo_print implemented per platform). */
+/* Platform-provided (SGL on both ports; dbg_print implemented per platform). */
 extern void slSlaveFunc(void (*func)(void *), void *param);
-extern void jo_print(int x, int y, char *str);
+extern void dbg_print(int x, int y, char *str);
 
 /* SATURN PERF (1.4): -O3 on the executors was A/B-tested via the row-19 profiler
    and showed NO gain (EX ~neutral, slightly worse per-command: 61.9 -> 63.0us),
@@ -996,7 +996,7 @@ static void rp_finish(void)
             snprintf(t, sizeof t, "TMO#%d al%d od%d ex%d r%d/%d   ",
                      rp_timeout_count, SYNC->slave_alive, SYNC->slave_opaque_done,
                      SYNC->slave_execs, SYNC->ready, tot);
-            jo_print(0, 20, t);
+            dbg_print(0, 20, t);
         }
 #endif
         if (++rp_consec_timeouts >= 6)
@@ -1022,11 +1022,11 @@ static void rp_finish(void)
         SYNC->master_ccr=*mccr;                 /* master's CCR (this CPU) */
         snprintf(d, sizeof d, "RPBAD  n%-5d t%d a%d b%d c%d   ",
                  SYNC->slave_bad, SYNC->bad_t, SYNC->bad_a, SYNC->bad_b, SYNC->bad_c);
-        jo_print(0, 15, d);
+        dbg_print(0, 15, d);
         snprintf(d, sizeof d, "CCR m%02x s0%02x s1%02x        ",
                  SYNC->master_ccr & 0xff, SYNC->slave_ccr0 & 0xff,
                  SYNC->slave_ccr1 & 0xff);
-        jo_print(0, 16, d);
+        dbg_print(0, 16, d);
     }
 #endif
 
@@ -1039,7 +1039,7 @@ static void rp_finish(void)
                 (unsigned short)(rp_t_begin-rp_frt_entry),
                 (unsigned short)(rp_t_rec-rp_t_begin),
                 (unsigned short)(rp_t_fin-rp_t_rec));
-        jo_print(0, 2, dbg);
+        dbg_print(0, 2, dbg);
     }
 #endif
 }
@@ -1184,7 +1184,7 @@ void RP_EndFrame(void)
         snprintf(p, sizeof p, "REC%u.%u EX%u.%u W%u.%u c%-4d ",
                  rec10/10, rec10%10, exe10/10, exe10%10,
                  wai10/10, wai10%10, rec_count);
-        jo_print(0, 19, p);
+        dbg_print(0, 19, p);
         /* Row 20 (SATURN PERF 2.4 Stage 1): B (the BSP walk) split into pure BSP
            traversal (Bw) vs wall-prep (Bp = time in R_StoreWallRange), plus the
            planes (P) and masked (M) generation.  Bp is what 2.4 would offload to
@@ -1202,7 +1202,7 @@ void RP_EndFrame(void)
             snprintf(p, sizeof p, "Bw%u.%u Bp%u.%u P%u.%u M%u.%u ",
                      bw10/10, bw10%10, bp10/10, bp10%10,
                      p10/10, p10%10, m10/10, m10%10);
-            jo_print(0, 20, p);
+            dbg_print(0, 20, p);
             /* Phase-0a fine split (rows 11/12).  Bp -> setup (per-seg trig/scale)
                + loop (R_RenderSegLoop per-column).  P -> alloc (flat W_Cache/
                Release) + makespans (R_MakeSpans walk + R_MapPlane) + other. */
@@ -1220,10 +1220,10 @@ void RP_EndFrame(void)
                 unsigned int po10 = po * 10u / 224u;
                 snprintf(p, sizeof p, "BP s%u.%u l%u.%u   ",
                          bps10/10, bps10%10, bpl10/10, bpl10%10);
-                jo_print(0, 11, p);
+                dbg_print(0, 11, p);
                 snprintf(p, sizeof p, "P a%u.%u m%u.%u o%u.%u ",
                          pa10/10, pa10%10, pm10/10, pm10%10, po10/10, po10%10);
-                jo_print(0, 12, p);
+                dbg_print(0, 12, p);
             }
         }
         /* Row 13 (SATURN PERF, RBG0 candidate sizing): floor/ceiling FILL and the
@@ -1243,7 +1243,7 @@ void RP_EndFrame(void)
             pct = (tot > 0u) ? (dom * 100u / tot) : 0u;
             snprintf(p, sizeof p, "FLAT t%uk d%uk %u%% n%u   ",
                      tot / 1000u, dom / 1000u, pct, prof_plane_n);
-            jo_print(0, 13, p);
+            dbg_print(0, 13, p);
         }
         /* Row 18: MST (master frame ms, set by dg_saturn.cxx fps_update -- the
            synchronous bottleneck; the standalone MST row 15 was dropped) + the slave
@@ -1259,7 +1259,7 @@ void RP_EndFrame(void)
             unsigned int idle = (st > sd) ? ((st - sd) * 100u / st) : 0u;
             snprintf(p, sizeof p, "MST%ums SLV i%u%% b%u%% t%u d%u  ",
                      rp_master_ms, idle, busy, st, sd);
-            jo_print(0, 18, p);
+            dbg_print(0, 18, p);
         }
     }
 #endif

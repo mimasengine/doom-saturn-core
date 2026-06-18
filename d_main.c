@@ -165,7 +165,7 @@ void D_ProcessEvents (void)
 // to re-enable.
 #define DISPLAY_DEBUG     1
 #define SATURN_TICK_DEBUG 1
-extern void jo_print(int x, int y, char *str);
+extern void dbg_print(int x, int y, char *str);
 extern uint32_t DG_GetTicksMs(void);
 #define d_ms DG_GetTicksMs
 
@@ -376,7 +376,7 @@ void D_Display (void)
 		static char dd_dbg[41];
 		sprintf(dd_dbg, "st%4u rp%4u hu%3u ot%3u bl%4u f%3u",
 			sum_st, sum_rp, sum_hu, sum_ot, sum_bl, dd_f);
-		jo_print(0, 5, dd_dbg);
+		dbg_print(0, 5, dd_dbg);
 		sum_st = sum_rp = sum_hu = sum_ot = sum_bl = 0;
 		dd_f = 0;
 		dd_win = now;
@@ -584,10 +584,10 @@ void doomgeneric_Tick()
             /* row 2: T S D X/total  row 3: G(ap) I(ntra) */
             sprintf(dbg, "T%4u S%4u D%4u X%4u/%4u",
                     mt, ms, md, X, el);
-            jo_print(0, 3, dbg);
+            dbg_print(0, 3, dbg);
             sprintf(dbg, "G%4u I%4u tk%4u",
                     mg, X > mg ? X - mg : 0, mtk);
-            jo_print(0, 4, dbg);
+            dbg_print(0, 4, dbg);
             sum_t = sum_s = sum_d = sum_gap = sum_tick = 0;
             win_start = now;
         }

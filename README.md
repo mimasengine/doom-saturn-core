@@ -11,7 +11,7 @@ This repo holds the SDK-agnostic code that both ports compile verbatim:
 - `r_parallel.c` / `r_parallel.h` — the dual-SH2 (master + slave) column
   renderer. Pure hardware-level C: command queue, executors, sync protocol,
   cache-coherency. Its only platform touch-points are `slSlaveFunc` (SGL, in
-  both ports), a `jo_print` debug-overlay shim (implemented per port), and a
+  both ports), a `dbg_print` debug-overlay shim (implemented per port), and a
   direct CCR cache-purge register write.
 
 Each port adds this repo as a git submodule at `core/` and compiles
