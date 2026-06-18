@@ -566,6 +566,12 @@ R_MakeSpans
    sky texture.  Default 0 => vanilla software sky (DoomJo, which has no VDP2 sky
    layer, links the same core and keeps drawing the sky). */
 int sat_vdp2_sky = 0;
+/* SATURN: floor -> VDP2 RBG0 hardware Mode-7 plane.  When set by the platform,
+   R_DrawPlanes leaves the FLOOR visplanes (a flat below the eye) as index 0 so the
+   RBG0 floor composited behind the framebuffer shows through -- exactly like the sky
+   skip.  Ceilings (above the eye) still draw in software.  Default 0 => DoomJo and the
+   normal build draw floors normally. */
+int sat_vdp2_floor = 0;
 /* SATURN: Potato mode -- draw floor/ceiling spans as a single distance-shaded
    colour instead of texture-mapping them (big EX/fillrate win).  Set by the
    platform; default 0 (vanilla textured floors, incl. DoomJo). */
@@ -694,7 +700,35 @@ void R_DrawPlanes (void)
 	    }
 	    continue;
 	}
-	
+
+	// SATURN: floor -> VDP2 RBG0.  Leave a floor visplane (flat below the eye) as
+	// index 0 so the hardware Mode-7 RBG0 floor shows through, like the sky skip.
+	// Ceilings (height > viewz) keep drawing in software.  Off by default (DoomJo).
+	if (sat_vdp2_floor && pl->height < viewz)
+	{
+	    for (x=pl->minx ; x <= pl->maxx ; x++)
+	    {
+		int yl = pl->top[x];
+		int yh = pl->bottom[x];
+		int n;
+		if (yl > yh) continue;
+		n = yh - yl + 1;
+		if (detailshift)
+		{
+		    int sx = x << 1;
+		    byte *d0 = ylookup[yl] + columnofs[sx];
+		    byte *d1 = ylookup[yl] + columnofs[sx + 1];
+		    do { *d0 = 0; *d1 = 0; d0 += SCREENWIDTH; d1 += SCREENWIDTH; } while (--n);
+		}
+		else
+		{
+		    byte *d = ylookup[yl] + columnofs[x];
+		    do { *d = 0; d += SCREENWIDTH; } while (--n);
+		}
+	    }
+	    continue;
+	}
+
 	// regular flat
         lumpnum = firstflat + flattranslation[pl->picnum];
 	RP_FlatCacheEnter();   /* SATURN PERF Phase-0a: per-visplane flat allocator cost (c P) */
