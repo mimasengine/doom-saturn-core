@@ -396,10 +396,18 @@ void R_RenderSegLoop (void)
 	int _li = rw_scale >> LIGHTSCALESHIFT;
 	if (_li >= MAXLIGHTSCALE) _li = MAXLIGHTSCALE - 1; else if (_li < 0) _li = 0;
 	const lighttable_t *cm = walllights[_li];
-	/* SATURN: cull the wall if it sits ENTIRELY below the player's floor (RBG0).  The wall
-	   top (yl) is already at/below the floor line at both ends -> fully occluded -> skip it
-	   (the software loop clips it to nothing anyway).  No clamp = no texture squish. */
-	if (!(sat_vdp2_floor && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1]))
+	/* SATURN: the RBG0 floor is transparent (index 0), so a VDP1 wall quad reaching below
+	   the floor line bleeds through it.  Three cases vs the floor line (RBG0 floor on):
+	   - ENTIRELY below (top at/below floorclip at BOTH ends): fully occluded -> cull.
+	   - PARTIALLY below (bottom dips past floorclip at either end): VDP1 can't clip the quad
+	     -> hand the tier to the SOFTWARE renderer, which clips each column to floorclip (no
+	     texture squish).  sat_sw_mid forces the column loop + sw_draws below.
+	   - fully above: VDP1 as usual. */
+	if (sat_vdp2_floor && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
+	    { /* entirely below the floor -> cull (neither VDP1 nor CPU draws it) */ }
+	else if (sat_vdp2_floor && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
+	    sat_sw_mid = 1;   /* partially below -> CPU fallback (clipped to the floor line) */
+	else
 	    sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, midtexture, u1, u2, v0, v1, cm);
     }
 
@@ -433,9 +441,14 @@ void R_RenderSegLoop (void)
 	    int yh1 = bottomfrac >> HEIGHTBITS;
 	    int yh2 = (bottomfrac + bottomstep * n) >> HEIGHTBITS;
 	    int v0, v1; SAT_VROWS(rw_bottomtexturemid, yl1, yh1, v0, v1);
-	    /* SATURN: same cull as the one-sided wall -- a lower (bottomtexture) wall fully
-	       below the player's RBG0 floor is occluded by it; skip rather than clamp/squish. */
-	    if (!(sat_vdp2_floor && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1]))
+	    /* SATURN: same floor handling as the one-sided wall -- cull a lower (bottomtexture)
+	       wall entirely below the floor; hand a partially-below one to the CPU, which clips
+	       each column to floorclip (no VDP1 bleed-through, no squish). */
+	    if (sat_vdp2_floor && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
+		{ /* entirely below the floor -> cull */ }
+	    else if (sat_vdp2_floor && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
+		sat_sw_lo = 1;   /* partially below -> CPU fallback (clipped to the floor line) */
+	    else
 		sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, bottomtexture, u1, u2, v0, v1, cm);
 	}
     }
