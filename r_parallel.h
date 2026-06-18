@@ -38,6 +38,17 @@ void RP_FlatCacheLeave(void);
 void RP_MakeSpansEnter(void);
 void RP_MakeSpansLeave(void);
 
+/* SATURN PERF (RBG0 candidate sizing, profiler): R_DrawPlanes hands each regular
+   (non-sky) visplane here.  The hook tallies its span pixels and tracks the
+   largest single (picnum,height) flat -- the VDP2 RBG0 offload candidate -- so the
+   overlay can report what share of the floor/ceiling FILL that one flat owns
+   (decides whether deporting the biggest flat to RBG0 is worth the subsystem).
+   The pixel walk lives INSIDE the hook so it is fully compiled out unless RP_PROF
+   (zero overhead off).  Visplanes arrive picnum-sorted (R_DrawPlanes vpsort) so a
+   same-key run is contiguous and groups in one linear pass.  Pure C, DoomJo-safe. */
+void RP_PlanePixels(int picnum, int height, int minx, int maxx,
+                    const unsigned char *top, const unsigned char *bottom);
+
 /* Non-zero once the slave SH-2 has wedged and the renderer fell back to serial
    (master-only) drawing.  r_segs.c reads it so the Potato-walls generation skip
    stays off on the serial path (where R_DrawColumn would deref the skipped

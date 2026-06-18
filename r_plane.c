@@ -59,6 +59,46 @@ visplane_t*		lastvisplane;
 visplane_t*		floorplane;
 visplane_t*		ceilingplane;
 
+/* SATURN PERF L1: visplane hash (d32xr-style).  Vanilla R_FindPlane is a linear
+   O(n) scan over visplanes, called per subsector for floor AND ceiling => O(n^2)
+   of SLOW low-WRAM reads (visplanes live in the zone heap) in plane-heavy rooms.
+   A picnum/height/light hash bucket cuts the scan to same-key planes.
+   BYTE-IDENTICAL to the linear scan: a plane is appended at the bucket TAIL (FIFO),
+   so chain order == creation/array order == vanilla's first-match-in-array-order.
+   Both creation sites (R_FindPlane + R_CheckPlane splits) feed the hash, exactly
+   the set vanilla scans.  Chain links are SHORT indices in BSS (fast high-WRAM),
+   so the walk never pointer-chases the slow visplane struct except to compare the
+   three key fields.  Gated for a hardware A/B (set 0 = original linear scan).
+   Pure C, DoomJo-safe, no new cross-CPU coherency surface (master-only generation). */
+#define SAT_VISPLANE_HASH 1
+#if SAT_VISPLANE_HASH
+#define VISPLANE_HASH_SIZE 128			/* power of two */
+#define VISPLANE_HASH_MASK (VISPLANE_HASH_SIZE-1)
+static short	visplane_hashhead[VISPLANE_HASH_SIZE];	/* first index in bucket, -1 = empty */
+static short	visplane_hashtail[VISPLANE_HASH_SIZE];	/* last index (for FIFO append)        */
+static short	visplane_hashnext[MAXVISPLANES];	/* next index in chain, -1 = end       */
+
+static int R_PlaneHash (fixed_t height, int picnum, int lightlevel)
+{
+    /* Distribution only -- the field compare still verifies the exact key, so any
+       deterministic mix stays byte-identical. */
+    unsigned h = (unsigned)picnum * 3u
+	       + (unsigned)lightlevel
+	       + ((unsigned)height >> 16);
+    return (int)(h & VISPLANE_HASH_MASK);
+}
+
+static void R_HashInsert (int bucket, int idx)
+{
+    visplane_hashnext[idx] = -1;
+    if (visplane_hashhead[bucket] < 0)
+	visplane_hashhead[bucket] = (short)idx;
+    else
+	visplane_hashnext[visplane_hashtail[bucket]] = (short)idx;
+    visplane_hashtail[bucket] = (short)idx;
+}
+#endif
+
 // ?
 #define MAXOPENINGS	SCREENWIDTH*64
 short			openings[MAXOPENINGS];
@@ -304,7 +344,13 @@ void R_ClearPlanes (void)
 #endif
     lastvisplane = visplanes;
     lastopening = openings;
-    
+
+#if SAT_VISPLANE_HASH
+    /* SATURN PERF L1: empty every hash bucket for the new frame (0xff -> -1).
+       Only heads need clearing; a tail is read only once its head is set. */
+    memset (visplane_hashhead, 0xff, sizeof(visplane_hashhead));
+#endif
+
     // texture calculation
     memset (cachedheight, 0, sizeof(cachedheight));
 
@@ -329,13 +375,32 @@ R_FindPlane
   int		lightlevel )
 {
     visplane_t*	check;
-	
+#if SAT_VISPLANE_HASH
+    int		bucket;
+    int		idx;
+#endif
+
     if (picnum == skyflatnum)
     {
 	height = 0;			// all skys map together
 	lightlevel = 0;
     }
-	
+
+#if SAT_VISPLANE_HASH
+    /* SATURN PERF L1: scan only the planes of this key's bucket (FIFO chain ==
+       array order, so the first match is vanilla's first match). */
+    bucket = R_PlaneHash (height, picnum, lightlevel);
+    for (idx = visplane_hashhead[bucket]; idx >= 0; idx = visplane_hashnext[idx])
+    {
+	check = visplanes + idx;
+	if (height == check->height
+	    && picnum == check->picnum
+	    && lightlevel == check->lightlevel)
+	{
+	    return check;
+	}
+    }
+#else
     for (check=visplanes; check<lastvisplane; check++)
     {
 	if (height == check->height
@@ -345,14 +410,15 @@ R_FindPlane
 	    break;
 	}
     }
-    
-			
+
     if (check < lastvisplane)
 	return check;
-		
+#endif
+
     if (lastvisplane - visplanes == MAXVISPLANES)
 	I_Error ("R_FindPlane: no more visplanes");
-		
+
+    check = lastvisplane;
     lastvisplane++;
 
     check->height = height;
@@ -360,9 +426,13 @@ R_FindPlane
     check->lightlevel = lightlevel;
     check->minx = SCREENWIDTH;
     check->maxx = -1;
-    
+
     memset (check->top,0xff,sizeof(check->top));
-		
+
+#if SAT_VISPLANE_HASH
+    R_HashInsert (bucket, (int)(check - visplanes));
+#endif
+
     return check;
 }
 
@@ -443,7 +513,14 @@ R_CheckPlane
     pl->maxx = stop;
 
     memset (pl->top,0xff,sizeof(pl->top));
-		
+
+#if SAT_VISPLANE_HASH
+    /* SATURN PERF L1: a split plane is scanned by vanilla R_FindPlane too, so it
+       must join the hash (FIFO -> preserves first-match order). */
+    R_HashInsert (R_PlaneHash (pl->height, pl->picnum, pl->lightlevel),
+		  (int)(pl - visplanes));
+#endif
+
     return pl;
 }
 
@@ -649,6 +726,13 @@ void R_DrawPlanes (void)
 			pl->bottom[x]);
 	}
 	RP_MakeSpansLeave();
+
+	/* SATURN PERF (RBG0 candidate sizing, profiler): hand this flat to the
+	   profiler so it can size the single largest floor/ceiling -- the VDP2 RBG0
+	   offload candidate -- against the total plane fill.  Outside the RP_MakeSpans
+	   timer so it doesn't pollute the P 'm' sub-time; no-op unless RP_PROF. */
+	RP_PlanePixels(pl->picnum, (int)pl->height, pl->minx, pl->maxx,
+		       pl->top, pl->bottom);
 
 	RP_FlatCacheEnter();
         W_ReleaseLumpNum(lumpnum);

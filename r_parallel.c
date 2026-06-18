@@ -787,6 +787,12 @@ static void master_cache_purge(void)
     *ccr=(unsigned char)(*ccr|0x10);
 }
 
+/* SATURN PERF: master frame ms, set once/sec by the platform fps_update
+   (dg_saturn.cxx) and printed as the prefix of the slave's row-18 SLV line (the
+   standalone MST row was dropped -- it only pointed at rows 19/20).  Defined
+   unconditionally so the platform's extern links even when RP_PROF is off. */
+unsigned int rp_master_ms = 0;
+
 #if RP_PROF
 /* Read the SH-2 free-running timer (FRC @ 0xFFFFFE12/13).  Read H then L so the
    low byte is latched coherently. */
@@ -815,6 +821,17 @@ static unsigned int   prof_flatalloc;   /* W_CacheLumpNum/Release per visplane c
 static unsigned short prof_fc_t0;
 static unsigned int   prof_makespans;   /* R_MakeSpans walk + R_MapPlane span math c P */
 static unsigned short prof_ms_t0;
+/* SATURN PERF (RBG0 candidate sizing): per-frame floor/ceiling FILL accounting.
+   pix = total non-sky span pixels (the P fill workload); dom = the largest single
+   (picnum,height) flat group's pixels (the RBG0 offload prize); n = non-sky
+   visplane count.  pp_cur_* = the group currently being accumulated (visplanes
+   arrive picnum-sorted, so a same-key run is contiguous). */
+static unsigned int   prof_plane_pix;
+static unsigned int   prof_plane_dom;
+static unsigned int   prof_plane_n;
+static unsigned int   prof_pp_cur_sum;
+static int            prof_pp_cur_pic;
+static int            prof_pp_cur_h;
 #endif
 
 /* SATURN PERF 2.4 Stage 1: wall-prep timer, called by R_StoreWallRange (r_segs.c)
@@ -863,6 +880,45 @@ void RP_MakeSpansEnter(void) {
 void RP_MakeSpansLeave(void) {
 #if RP_PROF
     prof_makespans += (unsigned short)(rp_frt() - prof_ms_t0);
+#endif
+}
+
+/* SATURN PERF (RBG0 candidate sizing, profiler).  Walk the visplane's span pixels
+   (O(width) per visplane -- bounded by, and cheaper than, its R_MakeSpans cost) and
+   fold them into the total + the running same-(picnum,height) group.  A key change
+   finalises the finished group into the max.  Always defined; the whole body is
+   compiled out unless RP_PROF, so a shipping build (RP_PROF 0) pays only an empty
+   call.  Visplanes arrive picnum-sorted, so same-key runs are contiguous. */
+void RP_PlanePixels(int picnum, int height, int minx, int maxx,
+                    const unsigned char *top, const unsigned char *bottom)
+{
+#if RP_PROF
+    unsigned int pix = 0u;
+    int x;
+    for (x = minx; x <= maxx; x++)
+    {
+        unsigned int t = top[x];
+        if (t != 0xffu)
+        {
+            unsigned int b = bottom[x];
+            if (b >= t) pix += b - t + 1u;
+        }
+    }
+    prof_plane_pix += pix;
+    prof_plane_n++;
+    if (picnum == prof_pp_cur_pic && height == prof_pp_cur_h)
+    {
+        prof_pp_cur_sum += pix;
+    }
+    else
+    {
+        if (prof_pp_cur_sum > prof_plane_dom) prof_plane_dom = prof_pp_cur_sum;
+        prof_pp_cur_pic = picnum;
+        prof_pp_cur_h   = height;
+        prof_pp_cur_sum = pix;
+    }
+#else
+    (void)picnum; (void)height; (void)minx; (void)maxx; (void)top; (void)bottom;
 #endif
 }
 
@@ -1080,6 +1136,10 @@ void RP_BeginFrame(void)
     prof_begin = rp_frt();      /* recording starts now (slave runs in bg) */
     prof_wallprep = 0;          /* reset the per-frame wall-prep accumulator */
     prof_segloop = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
+    prof_plane_pix = prof_plane_dom = prof_plane_n = 0;   /* RBG0 candidate sizing */
+    prof_pp_cur_sum = 0;
+    prof_pp_cur_pic = -2147483647;   /* sentinel: no flat group open yet */
+    prof_pp_cur_h   = 0;
 #endif
 }
 
@@ -1166,17 +1226,39 @@ void RP_EndFrame(void)
                 jo_print(0, 12, p);
             }
         }
-        /* Row 18 (SATURN PERF 2.4 Stage 1): slave opaque-phase occupancy.  i = idle%
-           (waiting for the master to produce commands during REC), b = busy% drawing.
-           High idle% => the slave has slack REC time that wall-prep could fill (2.4
-           viable); low idle% => it is saturated drawing.  Ratio is divider-independent
-           (slave FRT need not match the master's); t/d are the raw slave ticks. */
+        /* Row 13 (SATURN PERF, RBG0 candidate sizing): floor/ceiling FILL and the
+           share owned by the single largest flat -- the VDP2 RBG0 offload candidate.
+           t = total non-sky span pixels (the P fill workload), d = the largest
+           (picnum,height) group's pixels, then dom% = d/t, n = the non-sky visplane
+           count.  Low n + high dom% => P is concentrated in one flat (the single-
+           flat RBG0 trick bites); high n + low dom% => fragmented (it won't).
+           Pixels in thousands (k).  NB: the pixel scan runs inside R_DrawPlanes so it
+           inflates row-20 P / row-12 'o' slightly -- this is a measurement build; the
+           dom% RATIO is overhead-insensitive (t and d scale together). */
+        {
+            unsigned int dom = prof_plane_dom;
+            unsigned int tot = prof_plane_pix;
+            unsigned int pct;
+            if (prof_pp_cur_sum > dom) dom = prof_pp_cur_sum;   /* fold the last open group */
+            pct = (tot > 0u) ? (dom * 100u / tot) : 0u;
+            snprintf(p, sizeof p, "FLAT t%uk d%uk %u%% n%u   ",
+                     tot / 1000u, dom / 1000u, pct, prof_plane_n);
+            jo_print(0, 13, p);
+        }
+        /* Row 18: MST (master frame ms, set by dg_saturn.cxx fps_update -- the
+           synchronous bottleneck; the standalone MST row 15 was dropped) + the slave
+           opaque-phase occupancy (SATURN PERF 2.4 Stage 1).  i = idle% (waiting for the
+           master to produce commands during REC), b = busy% drawing.  High idle% => the
+           slave has slack REC time that wall-prep could fill (2.4 viable); low idle% =>
+           it is saturated drawing.  Ratio is divider-independent (slave FRT need not
+           match the master's); t/d are the raw slave ticks. */
         {
             unsigned int st = (unsigned int)SYNC->slave_opq_total;
             unsigned int sd = (unsigned int)SYNC->slave_opq_draw;
             unsigned int busy = (st > 0u) ? (sd * 100u / st) : 0u;
             unsigned int idle = (st > sd) ? ((st - sd) * 100u / st) : 0u;
-            snprintf(p, sizeof p, "SLV i%u%% b%u%% t%u d%u   ", idle, busy, st, sd);
+            snprintf(p, sizeof p, "MST%ums SLV i%u%% b%u%% t%u d%u  ",
+                     rp_master_ms, idle, busy, st, sd);
             jo_print(0, 18, p);
         }
     }
