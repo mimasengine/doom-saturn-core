@@ -578,6 +578,11 @@ int sat_vdp2_floor = 0;
    stay software); the platform reads sat_vdp2_floor_h to anchor the RBG0 plane's height. */
 fixed_t sat_vdp2_floor_h   = 0;
 int     sat_vdp2_floor_pic = -1;
+/* SATURN: colormap for the RBG0 floor = the player sector's light level (+extralight),
+   so the hardware floor dims with the room like the software floor.  The HW plane is one
+   uniform brightness (no per-distance gradient -- that would need a per-line K-table), so
+   this is the sector base shade.  Set each frame in R_DrawPlanes; 0 => full bright. */
+lighttable_t *sat_vdp2_floor_cmap = 0;
 /* SATURN: the player's-floor flat data (64x64 = 4096 bytes) for the platform to swizzle
    into the RBG0 cells.  Same lump the software floor would use (animated-flat aware via
    flattranslation).  Returns 0 outside a level.  Off-path for DoomJo (never called). */
@@ -634,6 +639,16 @@ void R_DrawPlanes (void)
 	sector_t *vs = R_PointInSubsector(viewx, viewy)->sector;
 	sat_vdp2_floor_h   = vs->floorheight;
 	sat_vdp2_floor_pic = vs->floorpic;
+	/* light: map the view sector's light band (+extralight) to a colormap level
+	   (0 = brightest .. NUMCOLORMAPS-1 = darkest) so the RBG0 floor dims with the room. */
+	{
+	    int li = (vs->lightlevel >> LIGHTSEGSHIFT) + extralight;
+	    int lvl;
+	    if (li < 0) li = 0; else if (li >= LIGHTLEVELS) li = LIGHTLEVELS - 1;
+	    lvl = (LIGHTLEVELS - 1 - li) * NUMCOLORMAPS / LIGHTLEVELS;   /* bright band -> level 0 */
+	    if (lvl < 0) lvl = 0; else if (lvl >= NUMCOLORMAPS) lvl = NUMCOLORMAPS - 1;
+	    sat_vdp2_floor_cmap = colormaps + lvl * 256;
+	}
     }
 
     /* SATURN: insertion-sort visplanes by picnum so consecutive R_MakeSpans calls
