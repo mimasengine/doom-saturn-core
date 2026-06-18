@@ -157,7 +157,7 @@ fixed_t			cachedystep[SCREENHEIGHT];
    only the counting + per-frame prints are dropped -- a real per-frame win.)   */
 #define VP_DIAG 0
 #if VP_DIAG
-extern void jo_print(int x, int y, char *str);
+extern void dbg_print(int x, int y, char *str);
 static int vp_in_bad,   vp_in_lo,   vp_in_hi;
 static int vp_draw_bad, vp_draw_mn, vp_draw_mx;
 static int vp_map_bad,  vp_map_x1,  vp_map_x2, vp_map_y;
@@ -572,6 +572,21 @@ int sat_vdp2_sky = 0;
    skip.  Ceilings (above the eye) still draw in software.  Default 0 => DoomJo and the
    normal build draw floors normally. */
 int sat_vdp2_floor = 0;
+/* SATURN: the player's CURRENT floor (height + flat) -- the single floor RBG0 renders.
+   Set each frame in R_DrawPlanes from the view sector.  The floor-skip leaves ONLY the
+   visplanes matching BOTH (so coplanar same-flat floors are covered, other heights/flats
+   stay software); the platform reads sat_vdp2_floor_h to anchor the RBG0 plane's height. */
+fixed_t sat_vdp2_floor_h   = 0;
+int     sat_vdp2_floor_pic = -1;
+/* SATURN: the player's-floor flat data (64x64 = 4096 bytes) for the platform to swizzle
+   into the RBG0 cells.  Same lump the software floor would use (animated-flat aware via
+   flattranslation).  Returns 0 outside a level.  Off-path for DoomJo (never called). */
+unsigned char *sat_vdp2_floor_data(void)
+{
+    if (sat_vdp2_floor_pic < 0) return 0;
+    return (unsigned char *)W_CacheLumpNum(firstflat + flattranslation[sat_vdp2_floor_pic],
+                                           PU_STATIC);
+}
 /* SATURN: Potato mode -- draw floor/ceiling spans as a single distance-shaded
    colour instead of texture-mapping them (big EX/fillrate win).  Set by the
    platform; default 0 (vanilla textured floors, incl. DoomJo). */
@@ -610,6 +625,16 @@ void R_DrawPlanes (void)
 	I_Error ("R_DrawPlanes: opening overflow (%i)",
 		 lastopening - openings);
 #endif
+
+    /* SATURN: RBG0 renders the player's CURRENT floor only.  Capture the view sector's
+       floor height + flat here; the floor-skip below leaves just those visplanes as
+       index 0 (other heights/flats keep drawing in software). */
+    if (sat_vdp2_floor)
+    {
+	sector_t *vs = R_PointInSubsector(viewx, viewy)->sector;
+	sat_vdp2_floor_h   = vs->floorheight;
+	sat_vdp2_floor_pic = vs->floorpic;
+    }
 
     /* SATURN: insertion-sort visplanes by picnum so consecutive R_MakeSpans calls
        share the same 4KB flat in the SH-2 D-cache instead of evicting it.
@@ -701,10 +726,13 @@ void R_DrawPlanes (void)
 	    continue;
 	}
 
-	// SATURN: floor -> VDP2 RBG0.  Leave a floor visplane (flat below the eye) as
-	// index 0 so the hardware Mode-7 RBG0 floor shows through, like the sky skip.
-	// Ceilings (height > viewz) keep drawing in software.  Off by default (DoomJo).
-	if (sat_vdp2_floor && pl->height < viewz)
+	// SATURN: floor -> VDP2 RBG0.  Leave ONLY the player's-floor visplanes (matching
+	// height AND flat) as index 0 so the hardware Mode-7 RBG0 floor -- which is anchored
+	// at that height -- shows through.  Other floor heights / flats and all ceilings keep
+	// drawing in software.  Off by default (DoomJo).
+	if (sat_vdp2_floor
+	    && pl->height == sat_vdp2_floor_h
+	    && pl->picnum == sat_vdp2_floor_pic)
 	{
 	    for (x=pl->minx ; x <= pl->maxx ; x++)
 	    {
@@ -780,13 +808,13 @@ void R_DrawPlanes (void)
         static char b[48];
         snprintf(b, sizeof b, "MPOOB  n%-5d x%d>%d y%d   ",
                  vp_map_bad, vp_map_x1, vp_map_x2, vp_map_y);
-        jo_print(0, 11, b);
+        dbg_print(0, 11, b);
         snprintf(b, sizeof b, "VPDRAW n%-5d mn%d mx%d     ",
                  vp_draw_bad, vp_draw_mn, vp_draw_mx);
-        jo_print(0, 13, b);
+        dbg_print(0, 13, b);
         snprintf(b, sizeof b, "VPIN   n%-5d lo%d hi%d     ",
                  vp_in_bad, vp_in_lo, vp_in_hi);
-        jo_print(0, 14, b);
+        dbg_print(0, 14, b);
     }
 #endif
 }

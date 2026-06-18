@@ -222,6 +222,13 @@ void (*sat_wall_hook)(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
    VDP1 path buys back.  The ceiling/floor clip + visplane marking still run (floors,
    ceilings, sprite occlusion stay correct).  0 on DoomJo / when unused. */
 int sat_wall_skip = 0;
+/* SATURN: set when the floor is rendered on the VDP2 RBG0 hardware plane (r_plane.c).
+   The RBG0 floor is transparent (index 0), so unlike the old opaque software floor it no
+   longer occludes the walls behind it -> lower-area walls would show through the floor.
+   We restore that occlusion by CULLING (not emitting) any wall whose whole screen span is
+   below the floor line -- not by clamping the quad (which would SQUISH the texture, since
+   VDP1 maps the full texture across the quad).  Off => no change (DoomJo, normal build). */
+extern int sat_vdp2_floor;
 
 /* SATURN close-wall CPU fallback: a seg whose projected vertical span (px) exceeds this is so
    close/grazing that its VDP1 textured quad would explode the fill (VDP1 rasterises the whole
@@ -389,7 +396,11 @@ void R_RenderSegLoop (void)
 	int _li = rw_scale >> LIGHTSCALESHIFT;
 	if (_li >= MAXLIGHTSCALE) _li = MAXLIGHTSCALE - 1; else if (_li < 0) _li = 0;
 	const lighttable_t *cm = walllights[_li];
-	sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, midtexture, u1, u2, v0, v1, cm);
+	/* SATURN: cull the wall if it sits ENTIRELY below the player's floor (RBG0).  The wall
+	   top (yl) is already at/below the floor line at both ends -> fully occluded -> skip it
+	   (the software loop clips it to nothing anyway).  No clamp = no texture squish. */
+	if (!(sat_vdp2_floor && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1]))
+	    sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, midtexture, u1, u2, v0, v1, cm);
     }
 
     /* SATURN VDP1 world renderer: two-sided walls -> upper (toptexture) + lower
@@ -422,7 +433,10 @@ void R_RenderSegLoop (void)
 	    int yh1 = bottomfrac >> HEIGHTBITS;
 	    int yh2 = (bottomfrac + bottomstep * n) >> HEIGHTBITS;
 	    int v0, v1; SAT_VROWS(rw_bottomtexturemid, yl1, yh1, v0, v1);
-	    sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, bottomtexture, u1, u2, v0, v1, cm);
+	    /* SATURN: same cull as the one-sided wall -- a lower (bottomtexture) wall fully
+	       below the player's RBG0 floor is occluded by it; skip rather than clamp/squish. */
+	    if (!(sat_vdp2_floor && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1]))
+		sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, bottomtexture, u1, u2, v0, v1, cm);
 	}
     }
 #undef SAT_VROWS
