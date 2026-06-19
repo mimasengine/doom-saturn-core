@@ -167,6 +167,17 @@ int rp_timeout_count = 0;
 
 #if RP_PROF
 static unsigned short rp_frt(void);   /* fwd: slave self-timing in rp_slave_body */
+/* P3 profiler state (defined early: the plane dispatch below references it).  Used when the
+   parity renderer is OFF (rp_disabled / sat_plane_parallel), where the existing B/P/M/SLV rows
+   are all gated on rp_active and go blank.  Phase marks sampled unconditionally; the slave
+   plane-draw time is the slave's own FRT delta; p3_wait = master idle in RP_WaitPlanes. */
+static unsigned short p3_t_begin, p3_t_bsp, p3_t_planes;
+static unsigned short p3_slave_ticks, p3_wait_ticks;
+/* slave utilisation = busy / frame-period, BOTH in slave FRT so the (unknown, different from
+   the master's) slave-FRT rate CANCELS -> a meaningful %.  period = gap between the slave's two
+   consecutive plane dispatches (one game frame, since dispatched once per frame). */
+static unsigned short p3_slave_last;
+static unsigned int   p3_slave_util;
 #endif
 
 static void (*saved_col)(void);
@@ -842,10 +853,19 @@ static void rp_plane_run_on_stack(void)
 static void rp_plane_slave_body(void *param)
 {
     int packed = (int)(unsigned int)param;   /* (from<<16)|to -- avoids a shared coherency word */
+#if RP_PROF
+    unsigned short t0 = rp_frt();             /* slave FRT: time the slave's plane half */
+    unsigned short period = (unsigned short)(t0 - p3_slave_last);   /* = one frame (slave FRT) */
+    p3_slave_last = t0;
+#endif
     master_cache_purge();                    /* slave: read the master's fresh worklist + tables */
     rp_plane_from = (packed >> 16) & 0xffff;
     rp_plane_to   = packed & 0xffff;
     rp_plane_run_on_stack();                 /* draw on the dedicated stack */
+#if RP_PROF
+    p3_slave_ticks = (unsigned short)(rp_frt() - t0);
+    p3_slave_util  = period ? ((unsigned int)p3_slave_ticks * 100u / period) : 0u;
+#endif
     PLANE_DONE = 1;
 }
 
@@ -859,7 +879,13 @@ void RP_DispatchPlanes(int from, int to)
 void RP_WaitPlanes(void)
 {
     volatile int guard = 30000000;           /* ~bounded spin; never wedge if the slave dies */
+#if RP_PROF
+    unsigned short t0 = rp_frt();             /* master idle while the slave finishes = imbalance */
+#endif
     while (!PLANE_DONE && guard-- > 0) { }
+#if RP_PROF
+    p3_wait_ticks = (unsigned short)(rp_frt() - t0);
+#endif
     master_cache_purge();                     /* read the slave's drawn plane pixels before the blit */
 }
 
@@ -1196,7 +1222,11 @@ void RP_BeginFrame(void)
        path too (rp_exec dispatches to the *_low executors).  Previously this
        bailed to fully-serial master rendering, so low-detail had no working
        parallel mode at all. */
-    if (rp_disabled) { rp_active=0; return; }
+    if (rp_disabled) { rp_active=0;
+#if RP_PROF
+        p3_t_begin = rp_frt();   /* P3 profiler: frame start (parity rows are off here) */
+#endif
+        return; }
 #if RP_DEBUG
     rp_t_begin=frt_now();
 #endif
@@ -1226,12 +1256,16 @@ void RP_BeginFrame(void)
 void RP_MarkBSPDone(void)
 {
 #if RP_PROF
-    if (rp_active && !rp_disabled) prof_bsp_end = rp_frt();
+    p3_t_bsp = rp_frt();                       /* P3: BSP done (unconditional) */
+    if (rp_active && !rp_disabled) prof_bsp_end = p3_t_bsp;
 #endif
 }
 
 void RP_BeginMasked(void)
 {
+#if RP_PROF
+    if (rp_disabled) p3_t_planes = rp_frt();   /* P3: R_DrawPlanes done (parity path is off) */
+#endif
     if (!rp_active||rp_disabled) return;
 #if RP_PROF
     prof_planes_end = rp_frt();   /* R_DrawPlanes done; masked gen starts next */
@@ -1242,9 +1276,40 @@ void RP_BeginMasked(void)
     SYNC->masked_at=rec_count;
 }
 
+#if RP_PROF
+/* P3 profiler readout (rows 18/20), used when the parity renderer is OFF (rp_disabled, the
+   sat_plane_parallel config).  B = full BSP walk, P = plane phase (master half + the wait for
+   the slave half), M = masked.  SLVp = the slave's plane-draw ms, w = master wait (imbalance:
+   high w => the master's half was lighter and it idled), u% = slave busy as a share of P.
+   VDP1 utilisation is dg_saturn row 16 (VD1 cmds + D/B). */
+static void rp_p3_prof_show(void)
+{
+    unsigned short t_mask = rp_frt();
+    unsigned int b10  = (unsigned short)(p3_t_bsp    - p3_t_begin)  * 10u / 224u;
+    unsigned int p10  = (unsigned short)(p3_t_planes - p3_t_bsp)    * 10u / 224u;
+    unsigned int m10  = (unsigned short)(t_mask      - p3_t_planes) * 10u / 224u;
+    unsigned int w10  = p3_wait_ticks  * 10u / 224u;   /* master FRT -> ms (reliable) */
+    char p[44];
+    snprintf(p, sizeof p, "B%u.%u P%u.%u M%u.%u       ",
+             b10/10,b10%10, p10/10,p10%10, m10/10,m10%10);
+    dbg_print(0, 20, p);
+    /* w = master idle waiting for the slave (master FRT, ms): w~0 => the slave keeps up / the
+       split is balanced.  SLV% = slave busy / frame (slave FRT, rate-independent): the share of
+       the frame the slave works -> 100-SLV% = its slack during B+M that masked/wall-prep can fill. */
+    snprintf(p, sizeof p, "MST%ums w%u.%u SLV%u%%     ",
+             rp_master_ms, w10/10, w10%10, p3_slave_util);
+    dbg_print(0, 18, p);
+}
+#endif
+
 void RP_EndFrame(void)
 {
-    if (!rp_active) return;
+    if (!rp_active) {
+#if RP_PROF
+        if (rp_disabled) rp_p3_prof_show();   /* P3: the only readout when parity is off */
+#endif
+        return;
+    }
 #if RP_PROF
     prof_recend = rp_frt();     /* recording done; rp_finish = execute+wait */
 #endif
