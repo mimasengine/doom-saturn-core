@@ -560,6 +560,173 @@ R_MakeSpans
 }
 
 
+/* SATURN parallel-REC (Option C / P1) -- the d32xr r_phase7 plane model adapted to DoomSRL.
+   A POTATO-floor visplane drawn SELF-CONTAINED: ALL per-CPU state on the STACK (a local
+   spanstart[] + the height/colormap/source passed by value) with an inline span memset --
+   NO plane globals (planeheight, planezlight, the ds_ span state, cachedheight, spanstart).  This is the unit
+   the visplane WORK-STEAL (P3) will run on both SH-2 concurrently, each with its own stack,
+   so it needs no duplicated BSS (the 117KB trap of the abandoned full-duplication x-split).
+   Render-IDENTICAL to the global path (R_MakeSpans -> R_MapPlane potato-inline): the only
+   change is distance is recomputed per span (drops the cachedheight[y] cache, exactly like
+   d32xr's R_MapPlane) -- same pixels.  Only the potato path (the ship config); textured
+   planes keep the global path.  Gated SAT_PLANE_LOCAL for a clean A/B on Ymir. */
+#define SAT_PLANE_LOCAL 1
+#if SAT_PLANE_LOCAL
+static inline void R_PotatoSpan (int y, int x1, int x2, fixed_t plheight,
+                                 lighttable_t **plzlight, byte *src)
+{
+    fixed_t       distance;
+    unsigned      index;
+    lighttable_t *cmap;
+    byte          c, *d;
+
+    if (x2 < x1 || x1 < 0 || x2 >= viewwidth || (unsigned int)y >= (unsigned int)SCREENHEIGHT)
+        return;
+
+    distance = FixedMul (plheight, yslope[y]);   /* per span (no cachedheight cache, d32xr-style) */
+
+    if (fixedcolormap)
+        cmap = fixedcolormap;
+    else
+    {
+        index = distance >> LIGHTZSHIFT;
+        if (index >= MAXLIGHTZ) index = MAXLIGHTZ-1;
+        cmap = plzlight[index];
+    }
+
+    c = cmap[src[R_POTATO_TEXEL]];
+    if (detailshift)
+    {
+        d = ylookup[y] + columnofs[x1 << 1];
+        memset (d, c, (size_t)((x2 - x1 + 1) * 2));
+    }
+    else
+    {
+        d = ylookup[y] + columnofs[x1];
+        memset (d, c, (size_t)(x2 - x1 + 1));
+    }
+}
+
+static void R_DrawVisplanePotato (visplane_t *pl, byte *src,
+                                  lighttable_t **plzlight, fixed_t plheight)
+{
+    int spanstart_l[SCREENHEIGHT];   /* per-CPU, on the stack */
+    int x, stop = pl->maxx + 1;
+
+    /* the R_MakeSpans walk, inline-drawing each completed span via R_PotatoSpan.
+       top[minx-1]/top[maxx+1] sentinels (0xff) are set by the caller, as for R_MakeSpans. */
+    for (x = pl->minx; x <= stop; x++)
+    {
+        int t1 = pl->top[x-1], b1 = pl->bottom[x-1];
+        int t2 = pl->top[x],   b2 = pl->bottom[x];
+
+        while (t1 < t2 && t1 <= b1) { R_PotatoSpan (t1, spanstart_l[t1], x-1, plheight, plzlight, src); t1++; }
+        while (b1 > b2 && b1 >= t1) { R_PotatoSpan (b1, spanstart_l[b1], x-1, plheight, plzlight, src); b1--; }
+        while (t2 < t1 && t2 <= b2) { spanstart_l[t2] = x; t2++; }
+        while (b2 > b1 && b2 >= t2) { spanstart_l[b2] = x; b2--; }
+    }
+}
+
+/* SATURN parallel-REC (Option C / P1) -- TEXTURED self-contained span, the 1p-bonus case
+   (no Potato).  Computes the texture coordinates locally (distance/xstep/ystep/xfrac/yfrac
+   + the distance colormap) and fills the span inline, replicating R_DrawSpan but with NO
+   ds_* globals (so two CPU can work-steal it, P3).  High-detail only (detailshift==0, the
+   native 320 render); low-detail keeps the global path.  Render-identical to R_MapPlane +
+   R_DrawSpan (basexscale/baseyscale/distscale/viewangle are shared read-only). */
+static inline void R_TexturedSpan (int y, int x1, int x2, fixed_t plheight,
+                                   lighttable_t **plzlight, byte *src)
+{
+    fixed_t       distance, length, xfrac, yfrac, xstep, ystep;
+    angle_t       angle;
+    unsigned int  index, position, step, xtemp, ytemp;
+    lighttable_t *cmap;
+    byte         *dest;
+    int           count, spot;
+
+    if (x2 < x1 || x1 < 0 || x2 >= viewwidth || (unsigned int)y >= (unsigned int)SCREENHEIGHT)
+        return;
+
+    distance = FixedMul (plheight, yslope[y]);
+    xstep    = FixedMul (distance, basexscale);
+    ystep    = FixedMul (distance, baseyscale);
+    length   = FixedMul (distance, distscale[x1]);
+    angle    = (viewangle + xtoviewangle[x1]) >> ANGLETOFINESHIFT;
+    xfrac    =  viewx + FixedMul (finecosine[angle], length);
+    yfrac    = -viewy - FixedMul (finesine[angle], length);
+
+    if (fixedcolormap)
+        cmap = fixedcolormap;
+    else
+    {
+        index = distance >> LIGHTZSHIFT;
+        if (index >= MAXLIGHTZ) index = MAXLIGHTZ-1;
+        cmap = plzlight[index];
+    }
+
+    /* span fill -- identical packing/loop to R_DrawSpan, local args instead of ds_* globals */
+    position = ((xfrac << 10) & 0xffff0000) | ((yfrac >> 6) & 0x0000ffff);
+    step     = ((xstep << 10) & 0xffff0000) | ((ystep >> 6) & 0x0000ffff);
+    dest = ylookup[y] + columnofs[x1];
+    count = x2 - x1;
+    do {
+        ytemp = (position >> 4) & 0x0fc0;
+        xtemp = (position >> 26);
+        spot  = xtemp | ytemp;
+        *dest++ = cmap[src[spot]];
+        position += step;
+    } while (count--);
+}
+
+static void R_DrawVisplaneTextured (visplane_t *pl, byte *src,
+                                    lighttable_t **plzlight, fixed_t plheight)
+{
+    int spanstart_l[SCREENHEIGHT];   /* per-CPU, on the stack */
+    int x, stop = pl->maxx + 1;
+
+    for (x = pl->minx; x <= stop; x++)
+    {
+        int t1 = pl->top[x-1], b1 = pl->bottom[x-1];
+        int t2 = pl->top[x],   b2 = pl->bottom[x];
+
+        while (t1 < t2 && t1 <= b1) { R_TexturedSpan (t1, spanstart_l[t1], x-1, plheight, plzlight, src); t1++; }
+        while (b1 > b2 && b1 >= t1) { R_TexturedSpan (b1, spanstart_l[b1], x-1, plheight, plzlight, src); b1--; }
+        while (t2 < t1 && t2 <= b2) { spanstart_l[t2] = x; t2++; }
+        while (b2 > b1 && b2 >= t2) { spanstart_l[b2] = x; b2--; }
+    }
+}
+
+/* SATURN parallel-REC (Option C / P3) -- the d32xr visplane split.  The master accumulates
+   the regular-flat visplanes (flat ALREADY cached, so the slave never touches the zone
+   allocator) into this worklist; then master + slave each draw a half via the self-contained
+   R_DrawVisplane* (stack-local + shared read-only tables -> NO per-CPU state, NO big slave
+   stack: there is no BSP recursion here).  Disjoint visplanes -> disjoint framebuffer (Doom
+   has no plane overdraw), so the two halves are race-free. */
+typedef struct { visplane_t *pl; byte *src; lighttable_t **plzlight;
+                 fixed_t plheight; int potato, lumpnum; } planework_t;
+planework_t plane_worklist[MAXVISPLANES];
+int         plane_worklist_n;
+/* master gate: 0 = old global record/parity path (DoomJo + the working baseline, byte-
+   identical); 1 = the P3 worklist + master/slave visplane split (set by the DoomSRL
+   platform, main.cxx).  Defined in r_parallel.c with the dispatch. */
+extern int  sat_plane_parallel;
+
+/* draw worklist entries [from,to) -- run by the master for its half AND by the slave (via
+   r_parallel.c RP_DispatchPlanes) for the other half. */
+void R_DrawPlaneWorklist (int from, int to)
+{
+    int i;
+    for (i = from; i < to; i++)
+    {
+        planework_t *w = &plane_worklist[i];
+        if (w->potato)
+            R_DrawVisplanePotato   (w->pl, w->src, w->plzlight, w->plheight);
+        else
+            R_DrawVisplaneTextured (w->pl, w->src, w->plzlight, w->plheight);
+    }
+}
+#endif
+
+
 
 /* SATURN: sky -> VDP2 NBG0 layer.  When set by the platform, R_DrawPlanes leaves
    the sky region as index 0 (the VDP2 transparent code) instead of drawing the
@@ -634,6 +801,10 @@ void R_DrawPlanes (void)
     if (lastopening - openings > MAXOPENINGS)
 	I_Error ("R_DrawPlanes: opening overflow (%i)",
 		 lastopening - openings);
+#endif
+
+#if SAT_PLANE_LOCAL
+    plane_worklist_n = 0;   /* P3: reset the regular-flat worklist for this frame */
 #endif
 
     /* SATURN: RBG0 renders the player's CURRENT floor.  Capture the view sector's floor
@@ -806,6 +977,23 @@ void R_DrawPlanes (void)
 		
 	stop = pl->maxx + 1;
 
+	/* SATURN PERF (RBG0 candidate sizing, profiler): no-op unless RP_PROF. */
+	RP_PlanePixels(pl->picnum, (int)pl->height, pl->minx, pl->maxx,
+		       pl->top, pl->bottom);
+
+#if SAT_PLANE_LOCAL
+	/* P3: QUEUE this regular flat (potato or textured high-detail) for the master+slave
+	   visplane split after the loop (R_DrawPlaneWorklist).  The flat is ALREADY cached, so
+	   the slave never touches the zone allocator; the lump release is DEFERRED (the slave
+	   reads src during the draw) -> done post-loop.  Low-detail keeps the global path. */
+	if ((sat_potato_floors || !detailshift) && plane_worklist_n < MAXVISPLANES)
+	{
+	    planework_t *w = &plane_worklist[plane_worklist_n++];
+	    w->pl = pl; w->src = ds_source; w->plzlight = planezlight;
+	    w->plheight = planeheight; w->potato = sat_potato_floors; w->lumpnum = lumpnum;
+	    continue;
+	}
+#endif
 	RP_MakeSpansEnter();   /* SATURN PERF Phase-0a: R_MakeSpans walk + R_MapPlane (c P) */
 	for (x=pl->minx ; x<= stop ; x++)
 	{
@@ -816,18 +1004,35 @@ void R_DrawPlanes (void)
 	}
 	RP_MakeSpansLeave();
 
-	/* SATURN PERF (RBG0 candidate sizing, profiler): hand this flat to the
-	   profiler so it can size the single largest floor/ceiling -- the VDP2 RBG0
-	   offload candidate -- against the total plane fill.  Outside the RP_MakeSpans
-	   timer so it doesn't pollute the P 'm' sub-time; no-op unless RP_PROF. */
-	RP_PlanePixels(pl->picnum, (int)pl->height, pl->minx, pl->maxx,
-		       pl->top, pl->bottom);
-
 	RP_FlatCacheEnter();
         W_ReleaseLumpNum(lumpnum);
 	RP_FlatCacheLeave();
         } /* SATURN: end sorted visplane loop */
     }
+
+#if SAT_PLANE_LOCAL
+    /* P3: draw the queued regular flats -- master + slave each draw a half (the d32xr visplane
+       split).  sat_plane_parallel (set by the DoomSRL platform via main.cxx) enables the slave
+       half via r_parallel.c; otherwise (DoomJo / off) the master draws them all.  Then release
+       the deferred flat locks (no-op on the cart, where W_CacheLumpNum is a direct pointer). */
+    {
+        extern int sat_plane_parallel;
+        extern void RP_DispatchPlanes(int from, int to);
+        extern void RP_WaitPlanes(void);
+        int n = plane_worklist_n, i;
+        if (sat_plane_parallel && n > 1)
+        {
+            int half = n >> 1;
+            RP_DispatchPlanes(half, n);      /* slave draws [half, n)  */
+            R_DrawPlaneWorklist(0, half);    /* master draws [0, half) */
+            RP_WaitPlanes();                 /* wait for the slave's half */
+        }
+        else
+            R_DrawPlaneWorklist(0, n);
+        for (i = 0; i < n; i++)
+            W_ReleaseLumpNum(plane_worklist[i].lumpnum);
+    }
+#endif
 
 #if VP_DIAG
     /* One print per frame (rows 11/13/14 per the overlay map). */

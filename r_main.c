@@ -1048,6 +1048,13 @@ void R_RenderPlayerView (player_t* player)
     }
     else
     {
+        /* SATURN P3 (parallel-REC plane split, r_plane.c + r_parallel.c RP_DispatchPlanes):
+           force the command-renderer parity OFF so the slave SH-2 is free for the visplane
+           work-steal dispatch (no 2nd-dispatch conflict).  Walls stay on VDP1 (sat_wall_skip
+           untouched), sprites/masked draw direct (master) -- cheap in the 1p ship config; the
+           win is the master-only P phase split across both CPUs.  One full-width pass. */
+        extern int sat_plane_parallel;
+        if (sat_plane_parallel) rp_disabled = 1;
         R_RenderViewPass (1);            /* single full-width pass (sat_view_* default to full) */
     }
 }

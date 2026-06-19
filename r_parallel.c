@@ -787,6 +787,82 @@ static void master_cache_purge(void)
     *ccr=(unsigned char)(*ccr|0x10);
 }
 
+/* ------------------------------------------------------------------------------------------ *
+ * SATURN parallel-REC (Option C / P3) -- the d32xr visplane split.                            *
+ * The slave SH-2 draws a HALF of the regular-flat worklist (r_plane.c R_DrawPlaneWorklist)    *
+ * while the master draws the other half.  This offloads the master-only plane phase (P) onto  *
+ * BOTH CPUs.  It REPLACES the command-renderer parity for planes, so the platform forces       *
+ * rp_disabled=1 (src/main.cxx) when sat_plane_parallel: the parity slave is then NEVER          *
+ * dispatched, so the slave SH-2 is free for RP_DispatchPlanes, and there is no second-dispatch  *
+ * conflict.  Pre-conditions held by the master: every flat is already cached (the worklist     *
+ * stores src), so the slave never touches the zone allocator; the visplanes the two CPUs draw  *
+ * are disjoint, so their framebuffer writes never overlap (Doom has no plane overdraw).        *
+ * A 2nd slSlaveFunc per frame -> rewind the SGL slave work pointer first (the same GBR-creep    *
+ * guard rp_restart uses).  No big slave stack: there is NO BSP recursion in the plane draw      *
+ * (R_DrawPlaneWorklist -> R_DrawVisplane* -> R_*Span, shallow; the only stack cost is the       *
+ * local spanstart_l[SCREENHEIGHT] ~0.9KB).                                                      *
+ * ------------------------------------------------------------------------------------------ */
+int sat_plane_parallel = 0;              /* set by the DoomSRL platform (src/main.cxx) */
+extern void R_DrawPlaneWorklist(int from, int to);
+
+static volatile int rp_plane_done = 1;
+#define PLANE_DONE (*(volatile int *)((unsigned int)&rp_plane_done | 0x20000000u))
+
+/* SGL's slave stack (0x06001e00) is only ~1-2KB before it hits SGL system data, but
+   R_DrawVisplane* puts a local spanstart_l[SCREENHEIGHT] (~0.9KB) + frames on the stack ->
+   it would overflow and corrupt SGL.  Give the plane slave its OWN 4KB stack and switch to
+   it for the draw.  (Only the slave touches this, so its write-through writes need no purge.) */
+static char rp_plane_slave_stack[4 * 1024] __attribute__((aligned(16)));
+static int  rp_plane_from, rp_plane_to;
+
+static void rp_plane_worklist_noarg(void)
+{
+    R_DrawPlaneWorklist(rp_plane_from, rp_plane_to);
+}
+
+/* SH-2 trampoline: save r14 on the old stack, keep the old SP in r14 (callee-saved, so the
+   call preserves it), switch r15 to the dedicated stack, call the no-arg draw, restore. */
+static void rp_plane_run_on_stack(void)
+{
+    void *newsp = rp_plane_slave_stack + sizeof(rp_plane_slave_stack);
+    void (*fn)(void) = rp_plane_worklist_noarg;
+    __asm__ volatile (
+        "mov.l  r14, @-r15\n\t"   /* save r14 on the OLD stack */
+        "mov    r15, r14\n\t"     /* r14 = old SP (survives the call) */
+        "mov    %[ns], r15\n\t"   /* switch to the dedicated stack */
+        "jsr    @%[fn]\n\t"
+        "nop\n\t"
+        "mov    r14, r15\n\t"     /* restore old SP */
+        "mov.l  @r15+, r14\n\t"   /* restore r14 */
+        :
+        : [ns]"r"(newsp), [fn]"r"(fn)
+        : "r0","r1","r2","r3","r4","r5","r6","r7","pr","t","mach","macl","memory");
+}
+
+static void rp_plane_slave_body(void *param)
+{
+    int packed = (int)(unsigned int)param;   /* (from<<16)|to -- avoids a shared coherency word */
+    master_cache_purge();                    /* slave: read the master's fresh worklist + tables */
+    rp_plane_from = (packed >> 16) & 0xffff;
+    rp_plane_to   = packed & 0xffff;
+    rp_plane_run_on_stack();                 /* draw on the dedicated stack */
+    PLANE_DONE = 1;
+}
+
+void RP_DispatchPlanes(int from, int to)
+{
+    PLANE_DONE = 0;
+    rp_sgl_workptr_reset();                  /* GBR-creep guard for this 2nd dispatch/frame */
+    slSlaveFunc(rp_plane_slave_body, (void *)(unsigned int)(((from & 0xffff) << 16) | (to & 0xffff)));
+}
+
+void RP_WaitPlanes(void)
+{
+    volatile int guard = 30000000;           /* ~bounded spin; never wedge if the slave dies */
+    while (!PLANE_DONE && guard-- > 0) { }
+    master_cache_purge();                     /* read the slave's drawn plane pixels before the blit */
+}
+
 /* SATURN PERF: master frame ms, set once/sec by the platform fps_update
    (dg_saturn.cxx) and printed as the prefix of the slave's row-18 SLV line (the
    standalone MST row was dropped -- it only pointed at rows 19/20).  Defined
