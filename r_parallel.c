@@ -172,12 +172,10 @@ static unsigned short rp_frt(void);   /* fwd: slave self-timing in rp_slave_body
    are all gated on rp_active and go blank.  Phase marks sampled unconditionally; the slave
    plane-draw time is the slave's own FRT delta; p3_wait = master idle in RP_WaitPlanes. */
 static unsigned short p3_t_begin, p3_t_bsp, p3_t_planes;
-static unsigned short p3_slave_ticks, p3_wait_ticks;
-/* slave utilisation = busy / frame-period, BOTH in slave FRT so the (unknown, different from
-   the master's) slave-FRT rate CANCELS -> a meaningful %.  period = gap between the slave's two
-   consecutive plane dispatches (one game frame, since dispatched once per frame). */
-static unsigned short p3_slave_last;
-static unsigned int   p3_slave_util;
+static unsigned short p3_wait_ticks;   /* master idle in RP_WaitPlanes (master FRT, reliable) */
+/* NOTE: the slave's OWN FRT can't be used for a duration -- it's 16-bit and runs fast enough to
+   wrap several times per frame, so any slave busy/period read is garbage (>100%).  Slave slack
+   is derived from the master-FRT phase times instead: the slave works during P, idles in B+M. */
 #endif
 
 static void (*saved_col)(void);
@@ -853,19 +851,10 @@ static void rp_plane_run_on_stack(void)
 static void rp_plane_slave_body(void *param)
 {
     int packed = (int)(unsigned int)param;   /* (from<<16)|to -- avoids a shared coherency word */
-#if RP_PROF
-    unsigned short t0 = rp_frt();             /* slave FRT: time the slave's plane half */
-    unsigned short period = (unsigned short)(t0 - p3_slave_last);   /* = one frame (slave FRT) */
-    p3_slave_last = t0;
-#endif
     master_cache_purge();                    /* slave: read the master's fresh worklist + tables */
     rp_plane_from = (packed >> 16) & 0xffff;
     rp_plane_to   = packed & 0xffff;
     rp_plane_run_on_stack();                 /* draw on the dedicated stack */
-#if RP_PROF
-    p3_slave_ticks = (unsigned short)(rp_frt() - t0);
-    p3_slave_util  = period ? ((unsigned int)p3_slave_ticks * 100u / period) : 0u;
-#endif
     PLANE_DONE = 1;
 }
 
@@ -1289,15 +1278,17 @@ static void rp_p3_prof_show(void)
     unsigned int p10  = (unsigned short)(p3_t_planes - p3_t_bsp)    * 10u / 224u;
     unsigned int m10  = (unsigned short)(t_mask      - p3_t_planes) * 10u / 224u;
     unsigned int w10  = p3_wait_ticks  * 10u / 224u;   /* master FRT -> ms (reliable) */
+    unsigned int rend = b10 + p10 + m10;                /* render = B+P+M (tenths-ms) */
+    unsigned int idle = rend ? ((b10 + m10) * 100u / rend) : 0u;   /* slave idle = B+M / render */
     char p[44];
     snprintf(p, sizeof p, "B%u.%u P%u.%u M%u.%u       ",
              b10/10,b10%10, p10/10,p10%10, m10/10,m10%10);
     dbg_print(0, 20, p);
-    /* w = master idle waiting for the slave (master FRT, ms): w~0 => the slave keeps up / the
-       split is balanced.  SLV% = slave busy / frame (slave FRT, rate-independent): the share of
-       the frame the slave works -> 100-SLV% = its slack during B+M that masked/wall-prep can fill. */
-    snprintf(p, sizeof p, "MST%ums w%u.%u SLV%u%%     ",
-             rp_master_ms, w10/10, w10%10, p3_slave_util);
+    /* w = master idle waiting for the slave (master FRT): w~0 => the slave keeps up / balanced.
+       idle% = the slave's idle share of the render: it works in P, sits idle in B+M -> this is
+       the slack masked + wall-prep will fill (it should DROP as each phase is offloaded). */
+    snprintf(p, sizeof p, "MST%ums w%u.%u SLVidle%u%% ",
+             rp_master_ms, w10/10, w10%10, idle);
     dbg_print(0, 18, p);
 }
 #endif
