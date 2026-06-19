@@ -432,7 +432,15 @@ void R_RenderSegLoop (void)
 	    int yh1 = pixhigh >> HEIGHTBITS;
 	    int yh2 = (pixhigh + pixhighstep * n) >> HEIGHTBITS;
 	    int v0, v1; SAT_VROWS(rw_toptexturemid, yl1, yh1, v0, v1);
-	    sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, toptexture, u1, u2, v0, v1, cm);
+	    /* SATURN: same floor handling as the other tiers -- cull an upper (toptexture) wall
+	       entirely below the RBG0 floor line; hand a partially-below one to the CPU (clips to
+	       floorclip).  (Rare for a ceiling-side tier, but completes the set.) */
+	    if (sat_vdp2_floor && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
+		{ /* entirely below the floor -> cull */ }
+	    else if (sat_vdp2_floor && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
+		sat_sw_up = 1;   /* partially below -> CPU fallback (clipped to the floor line) */
+	    else
+		sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, toptexture, u1, u2, v0, v1, cm);
 	}
 	if (bottomtexture && sat_v1_lo)   /* bottom of the opening -> floor */
 	{

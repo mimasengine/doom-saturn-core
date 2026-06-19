@@ -636,9 +636,10 @@ void R_DrawPlanes (void)
 		 lastopening - openings);
 #endif
 
-    /* SATURN: RBG0 renders the player's CURRENT floor only.  Capture the view sector's
-       floor height + flat here; the floor-skip below leaves just those visplanes as
-       index 0 (other heights/flats keep drawing in software). */
+    /* SATURN: RBG0 renders the player's CURRENT floor.  Capture the view sector's floor
+       height + flat + light band here; the floor-skip below leaves just those visplanes as
+       index 0 (other heights/flats/bands keep drawing in software).  (A per-frame "dominant
+       floor" pick was tried and dropped -- it flickers when two floors trade the lead.) */
     if (sat_vdp2_floor)
     {
 	sector_t *vs = R_PointInSubsector(viewx, viewy)->sector;
