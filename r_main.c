@@ -911,6 +911,19 @@ int sat_xsplit = SAT_XSPLIT;
 extern int sat_view_x0, sat_view_x1;   /* x-range clip window (r_bsp.c R_ClearClipSegs) */
 extern int rp_disabled;                /* r_parallel.c serial latch */
 
+/* SATURN x-split (Step B3c): the DoomSRL platform (src/xsplit_slave.cxx) wires these to
+   dispatch/await the SLAVE SH-2 rendering its half via the dual-compiled slave_ renderer.
+   NULL on DoomJo and until the platform sets them -> the driver falls back to the A1 serial
+   2-pass.  dispatch(player, x0, x1): point the slave's clip range at [x0,x1) and slSlaveFunc. */
+void (*sat_xsplit_dispatch)(player_t *player, int x0, int x1) = 0;
+void (*sat_xsplit_wait)(void) = 0;
+/* 0 = SEQUENTIAL (slave half, wait, then master half -> only one CPU in the renderer at a
+   time -> NO concurrent allocator race; validates the slave renderer in isolation).
+   1 = PARALLEL (master half runs while the slave renders -> the real speedup, but needs the
+   B4 allocator pre-cache gate first, else concurrent R_GenerateComposite/Z_Malloc corrupt
+   the zone heap -- even on Ymir, it's a logical race not just a coherency one). */
+#define SAT_XSPLIT_PARALLEL 0
+
 /* SATURN x-split (Step B): in the slave dual-compile (RP_SLAVE_BUILD) the slave draws its
    half DIRECTLY (its colfunc/spanfunc are the direct R_Draw* set by its own
    R_ExecuteSetViewSize), so it must NOT touch the master's command-renderer brackets --
@@ -994,29 +1007,42 @@ void R_RenderPlayerView (player_t* player)
 
     if (sat_xsplit)
     {
-        /* STEP A serial scaffold: render [0,half) then [half,viewwidth), slave off.
-           validcount is bumped before pass 2 so R_AddSprites re-adds the sectors pass 1
-           already visited (it dedups a sector on sec->validcount == validcount, so without
-           the bump every sprite straddling/east of the seam would be dropped from pass 2).
-           sat_wall_skip forced to 0 so one-sided walls render in SOFTWARE (NBG1) here:
-           the VDP1 wall pipeline (begin/flush/kick + double-buffer + world-anchored quad
-           extrapolation) assumes ONE full-screen render per frame, so its per-view x-range
-           integration is Step B -- A1 only validates the software spatial partition. */
+        /* x-split: render the frame in two screen-x halves.  If the platform wired the slave
+           dispatch (B3c), the 2nd SH-2 renders the RIGHT half via the dual-compiled slave_
+           renderer CONCURRENTLY with the master's LEFT half (parallel-REC); else both halves
+           run on the master serially (A1 scaffold).  Either way the master draws DIRECTLY
+           (rp_disabled) and one-sided walls go to software (sat_wall_skip=0 -- the VDP1
+           per-view wall integration is later). */
         extern int sat_wall_skip;
         int saved_rp   = rp_disabled;
         int saved_skip = sat_wall_skip;
         int half = viewwidth / 2;
-        rp_disabled   = 1;               /* force serial: each pass draws directly */
-        sat_wall_skip = 0;               /* one-sided walls -> software (VDP1 = Step B) */
+        rp_disabled   = 1;
+        sat_wall_skip = 0;
 
-        sat_view_x0 = 0;    sat_view_x1 = half;
-        R_RenderViewPass (0);
+        if (sat_xsplit_dispatch)
+        {
+            /* slave renders the RIGHT half [half,viewwidth) on the 2nd SH-2. */
+            sat_xsplit_dispatch (player, half, viewwidth);   /* slave clip range + slSlaveFunc */
+            sat_view_x0 = 0; sat_view_x1 = half;
+#if SAT_XSPLIT_PARALLEL
+            R_RenderViewPass (1);     /* master's half CONCURRENTLY (needs the B4 gate) */
+            sat_xsplit_wait ();
+#else
+            sat_xsplit_wait ();       /* SEQUENTIAL: slave alone first -> no allocator race */
+            R_RenderViewPass (1);     /* then the master's half, alone */
+#endif
+        }
+        else
+        {
+            /* A1 serial fallback: both halves on the master.  validcount++ before pass 2 so
+               R_AddSprites re-adds sectors seen in pass 1 (straddling sprites kept). */
+            sat_view_x0 = 0;    sat_view_x1 = half;      R_RenderViewPass (0);
+            validcount++;
+            sat_view_x0 = half; sat_view_x1 = viewwidth; R_RenderViewPass (1);
+        }
 
-        validcount++;                    /* fresh traversal for pass 2's sprites */
-        sat_view_x0 = half; sat_view_x1 = viewwidth;
-        R_RenderViewPass (1);
-
-        sat_view_x0 = 0;    sat_view_x1 = 0;   /* restore full range for any other caller */
+        sat_view_x0 = 0; sat_view_x1 = 0;
         sat_wall_skip = saved_skip;
         rp_disabled   = saved_rp;
     }
@@ -1026,16 +1052,9 @@ void R_RenderPlayerView (player_t* player)
     }
 }
 
-#ifdef RP_SLAVE_BUILD
-/* SATURN x-split (Step B): the slave SH-2's per-frame entry, dispatched by the master.
-   The dual-compile renames it slave_R_SlaveRenderHalf; the master sets the slave's
-   sat_view_[x0,x1) to the right half, then dispatches this to render it concurrently with
-   the master's left half.  The slave's render state (slave_*) is wholly separate; it reads
-   the SHARED player_t / level / textures.  sat_view_x0/x1 here are the slave's own copies
-   (set by the master via extern before dispatch).  Draws DIRECTLY (RP_* no-op'd above). */
-void R_SlaveRenderHalf (player_t *player)
-{
-    R_SetupFrame (player);    /* populate slave_view* from the shared player_t */
-    R_RenderViewPass (1);     /* render the slave's x-range; no VDP1 kick (hook is NULL) */
-}
-#endif
+/* NOTE: the RP_SLAVE_BUILD dual-compile entries (R_SlaveRenderHalf / R_InitForSplit) were
+   removed -- the full per-CPU-duplicated slave renderer overflows the Saturn's 2MB.  The
+   sat_xsplit driver above keeps the x-range clip + serial scaffold + the sat_xsplit_dispatch/
+   wait hooks (NULL -> serial fallback) for reuse by the d32xr-style phase-split (the viable
+   parallel-REC path).  See docs/PARALLEL_REC_AUDIT.md.  The SAT_RP_* macros stay (= RP_* in a
+   normal build). */
