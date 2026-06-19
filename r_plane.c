@@ -733,6 +733,11 @@ void R_DrawPlaneWorklist (int from, int to)
    sky texture.  Default 0 => vanilla software sky (DoomJo, which has no VDP2 sky
    layer, links the same core and keeps drawing the sky). */
 int sat_vdp2_sky = 0;
+/* SATURN: set to 1 by R_DrawPlanes when ANY sky visplane is rendered this frame (an opening
+   to the sky is in view).  The platform drops the hardware sky layer (NBG0) when this is 0 ->
+   in fully-enclosed rooms the VDP1 walls' (torn) index-0 gaps show the dark backdrop instead
+   of the bright sky, so the tearing is far less visible.  DoomJo ignores it (software sky). */
+int sat_frame_has_sky = 0;
 /* SATURN: floor -> VDP2 RBG0 hardware Mode-7 plane.  When set by the platform,
    R_DrawPlanes leaves the FLOOR visplanes (a flat below the eye) as index 0 so the
    RBG0 floor composited behind the framebuffer shows through -- exactly like the sky
@@ -803,6 +808,7 @@ void R_DrawPlanes (void)
 		 lastopening - openings);
 #endif
 
+    sat_frame_has_sky = 0;   /* set below if any sky visplane is in view (platform drops NBG0 if not) */
 #if SAT_PLANE_LOCAL
     plane_worklist_n = 0;   /* P3: reset the regular-flat worklist for this frame */
 #endif
@@ -865,6 +871,7 @@ void R_DrawPlanes (void)
 	// sky flat
 	if (pl->picnum == skyflatnum)
 	{
+	    if (pl->minx <= pl->maxx) sat_frame_has_sky = 1;   /* SATURN: sky is in view this frame */
 	    // SATURN: sky -> VDP2.  Leave the sky region as index 0 (the VDP2
 	    // transparent code) instead of drawing it; the platform composites a
 	    // scrolling VDP2 sky layer behind the framebuffer.  Writing 0 directly
