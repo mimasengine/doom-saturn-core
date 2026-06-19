@@ -898,14 +898,43 @@ extern volatile int game_phase;
    NULL on DoomJo / when the VDP1 world renderer is off. */
 void (*sat_walls_done_hook)(void) = 0;
 
-void R_RenderPlayerView (player_t* player)
+/* SATURN x-split (parallel-REC / multiplayer foundation, docs/MULTIPLAYER_PLAN.md).
+   Render the frame in two screen-x halves so the second SH-2 can eventually render
+   one of them.  STEP A (this build): a SERIAL correctness scaffold -- both halves are
+   drawn on the master with the slave off (rp_disabled forced across the two passes), to
+   validate that the spatial partition composes a pixel-correct full frame (clean seam at
+   the midline, sprites straddling it drawn in both halves) BEFORE the parallel + per-CPU
+   render-state work (Step B).  sat_xsplit default 0 => one full-width pass == vanilla, so
+   DoomJo and the single-player shipping build are unaffected (pure C, runtime-gated). */
+#define SAT_XSPLIT 0
+int sat_xsplit = SAT_XSPLIT;
+extern int sat_view_x0, sat_view_x1;   /* x-range clip window (r_bsp.c R_ClearClipSegs) */
+extern int rp_disabled;                /* r_parallel.c serial latch */
+
+/* SATURN x-split (Step B): in the slave dual-compile (RP_SLAVE_BUILD) the slave draws its
+   half DIRECTLY (its colfunc/spanfunc are the direct R_Draw* set by its own
+   R_ExecuteSetViewSize), so it must NOT touch the master's command-renderer brackets --
+   they manage the SYNC mailbox and dispatch the slave (it would dispatch itself).  No-op
+   them for the slave; the master and DoomJo keep the real RP_* path unchanged (identical). */
+#ifdef RP_SLAVE_BUILD
+#define SAT_RP_BEGIN()    ((void)0)
+#define SAT_RP_BSPDONE()  ((void)0)
+#define SAT_RP_MASKED()   ((void)0)
+#define SAT_RP_END()      ((void)0)
+#else
+#define SAT_RP_BEGIN()    RP_BeginFrame()
+#define SAT_RP_BSPDONE()  RP_MarkBSPDone()
+#define SAT_RP_MASKED()   RP_BeginMasked()
+#define SAT_RP_END()      RP_EndFrame()
+#endif
+
+/* One render pass over the current sat_view_[x0,x1) screen-x range.  Identical to the old
+   R_RenderPlayerView body minus R_SetupFrame.  last_pass gates the VDP1 walls kick so it
+   fires EXACTLY once per frame (after the last pass's BSP -> all halves' walls accumulated).
+   In the slave build sat_walls_done_hook is its own NULL pointer (never assigned), so the
+   slave never kicks VDP1 -- correct (VDP1 walls are the master's / software in x-split). */
+static void R_RenderViewPass (int last_pass)
 {
-    V_Canary ("frame start");
-
-    game_phase = 4; /* R_RenderPlayerView (BSP + execute) */
-
-    R_SetupFrame (player);
-
     // Clear buffers.
     R_ClearClipSegs ();
     R_ClearDrawSegs ();
@@ -915,16 +944,17 @@ void R_RenderPlayerView (player_t* player)
     // check for new console commands.
     NetUpdate ();
 
-    RP_BeginFrame ();
+    SAT_RP_BEGIN ();
 
     // The head node is the last node output.
     R_RenderBSPNode (numnodes-1);
 
-    RP_MarkBSPDone ();   // SATURN: profiler BSP/planes boundary (row-20 B/P/M)
+    SAT_RP_BSPDONE ();   // SATURN: profiler BSP/planes boundary (row-20 B/P/M)
 
     /* SATURN: walls are accumulated -> kick VDP1 NOW so it draws in parallel with the CPU
-       floors/sprites below and presents the SAME frame (no 1-frame lag vs the framebuffer). */
-    if (sat_walls_done_hook) sat_walls_done_hook ();
+       floors/sprites below and presents the SAME frame (no 1-frame lag vs the framebuffer).
+       In x-split this fires only on the final pass so VDP1 is kicked once with every wall. */
+    if (last_pass && sat_walls_done_hook) sat_walls_done_hook ();
 
     V_Canary ("bsp");
 
@@ -938,7 +968,7 @@ void R_RenderPlayerView (player_t* player)
     // Check for new console commands.
     NetUpdate ();
 
-    RP_BeginMasked ();
+    SAT_RP_MASKED ();
 
     game_phase = 5; /* R_DrawMasked */
     R_DrawMasked ();
@@ -946,10 +976,66 @@ void R_RenderPlayerView (player_t* player)
     V_Canary ("masked");
 
     game_phase = 4; /* back to render (RP_EndFrame) */
-    RP_EndFrame ();
+    SAT_RP_END ();
 
     V_Canary ("endframe");
 
     // Check for new console commands.
     NetUpdate ();
 }
+
+void R_RenderPlayerView (player_t* player)
+{
+    V_Canary ("frame start");
+
+    game_phase = 4; /* R_RenderPlayerView (BSP + execute) */
+
+    R_SetupFrame (player);
+
+    if (sat_xsplit)
+    {
+        /* STEP A serial scaffold: render [0,half) then [half,viewwidth), slave off.
+           validcount is bumped before pass 2 so R_AddSprites re-adds the sectors pass 1
+           already visited (it dedups a sector on sec->validcount == validcount, so without
+           the bump every sprite straddling/east of the seam would be dropped from pass 2).
+           sat_wall_skip forced to 0 so one-sided walls render in SOFTWARE (NBG1) here:
+           the VDP1 wall pipeline (begin/flush/kick + double-buffer + world-anchored quad
+           extrapolation) assumes ONE full-screen render per frame, so its per-view x-range
+           integration is Step B -- A1 only validates the software spatial partition. */
+        extern int sat_wall_skip;
+        int saved_rp   = rp_disabled;
+        int saved_skip = sat_wall_skip;
+        int half = viewwidth / 2;
+        rp_disabled   = 1;               /* force serial: each pass draws directly */
+        sat_wall_skip = 0;               /* one-sided walls -> software (VDP1 = Step B) */
+
+        sat_view_x0 = 0;    sat_view_x1 = half;
+        R_RenderViewPass (0);
+
+        validcount++;                    /* fresh traversal for pass 2's sprites */
+        sat_view_x0 = half; sat_view_x1 = viewwidth;
+        R_RenderViewPass (1);
+
+        sat_view_x0 = 0;    sat_view_x1 = 0;   /* restore full range for any other caller */
+        sat_wall_skip = saved_skip;
+        rp_disabled   = saved_rp;
+    }
+    else
+    {
+        R_RenderViewPass (1);            /* single full-width pass (sat_view_* default to full) */
+    }
+}
+
+#ifdef RP_SLAVE_BUILD
+/* SATURN x-split (Step B): the slave SH-2's per-frame entry, dispatched by the master.
+   The dual-compile renames it slave_R_SlaveRenderHalf; the master sets the slave's
+   sat_view_[x0,x1) to the right half, then dispatches this to render it concurrently with
+   the master's left half.  The slave's render state (slave_*) is wholly separate; it reads
+   the SHARED player_t / level / textures.  sat_view_x0/x1 here are the slave's own copies
+   (set by the master via extern before dispatch).  Draws DIRECTLY (RP_* no-op'd above). */
+void R_SlaveRenderHalf (player_t *player)
+{
+    R_SetupFrame (player);    /* populate slave_view* from the shared player_t */
+    R_RenderViewPass (1);     /* render the slave's x-range; no VDP1 kick (hook is NULL) */
+}
+#endif

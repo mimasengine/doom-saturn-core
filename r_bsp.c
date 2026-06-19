@@ -238,11 +238,28 @@ R_ClipPassWallSegment
 //
 // R_ClearClipSegs
 //
+/* SATURN x-split foundation (parallel-REC / multiplayer, docs/MULTIPLAYER_PLAN.md).
+   Confine the WHOLE render to a screen-x sub-range [sat_view_x0, sat_view_x1) by
+   marking everything outside it as already-solid: the BSP walk and every downstream
+   clip (visplanes, walls, sprites) then emit ONLY inside the range, while the
+   full-width projection stays intact -- it is the left/right slice of the SAME view,
+   so the perspective is exactly right.  This single chokepoint confines the whole
+   pipeline; nothing else needs an x-range argument.
+   Default x0=0, x1<=0 -> full [0,viewwidth) == vanilla (byte-identical; DoomJo and
+   the single-pass 1p build never set these, so they are unaffected). */
+int sat_view_x0 = 0;
+int sat_view_x1 = 0;   /* <=0 or > viewwidth => viewwidth (full screen) */
+
 void R_ClearClipSegs (void)
 {
+    int x0 = sat_view_x0;
+    int x1 = sat_view_x1;
+    if (x0 < 0) x0 = 0;
+    if (x1 <= 0 || x1 > viewwidth) x1 = viewwidth;
+
     solidsegs[0].first = -0x7fffffff;
-    solidsegs[0].last = -1;
-    solidsegs[1].first = viewwidth;
+    solidsegs[0].last = x0 - 1;          /* [.., x0-1] = solid (off to the left)  */
+    solidsegs[1].first = x1;             /* [x1, ..]  = solid (off to the right)  */
     solidsegs[1].last = 0x7fffffff;
     newend = solidsegs+2;
 }
