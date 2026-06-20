@@ -759,6 +759,66 @@ void R_ExecuteSetViewSize (void)
     }
 }
 
+/* SATURN split-screen (docs/MULTIPLAYER_PLAN.md Iter 2, §3.5): set an explicit viewport
+   (origin wx,wy + size w,h) and recompute the size-dependent tables + the framebuffer
+   pointers for it.  Same work as R_ExecuteSetViewSize but with an arbitrary origin (not
+   centered) and an explicit w/h (not setblocks-coupled) -- so two views of half width can
+   be rendered side by side.  Both views share the size, so for the common case the size
+   tables are identical; only wx + columnofs/ylookup change between them. */
+void R_SetViewWindow (int wx, int wy, int w, int h)
+{
+    extern byte *ylookup[];
+    extern int   columnofs[];
+    extern byte *I_VideoBuffer;
+    fixed_t cosadj, dy;
+    int i, j, level, startmap;
+
+    viewwidth  = w;
+    viewheight = h;
+    centery = viewheight/2;
+    centerx = viewwidth/2;
+    centerxfrac = centerx<<FRACBITS;
+    centeryfrac = centery<<FRACBITS;
+    projection = centerxfrac;
+
+    R_InitTextureMapping ();                    /* xtoviewangle from centerx/viewwidth */
+
+    pspritescale  = FRACUNIT*viewwidth/SCREENWIDTH;
+    pspriteiscale = FRACUNIT*SCREENWIDTH/viewwidth;
+
+    for (i=0 ; i<viewwidth ; i++)
+	screenheightarray[i] = viewheight;
+    for (i=0 ; i<viewheight ; i++)
+    {
+	dy = ((i-viewheight/2)<<FRACBITS)+FRACUNIT/2;  dy = abs(dy);
+	yslope[i] = FixedDiv ( (viewwidth<<detailshift)/2*FRACUNIT, dy);
+    }
+    for (i=0 ; i<viewwidth ; i++)
+    {
+	cosadj = abs(finecosine[xtoviewangle[i]>>ANGLETOFINESHIFT]);
+	distscale[i] = FixedDiv (FRACUNIT,cosadj);
+    }
+    for (i=0 ; i< LIGHTLEVELS ; i++)
+    {
+	startmap = ((LIGHTLEVELS-1-i)*2)*NUMCOLORMAPS/LIGHTLEVELS;
+	for (j=0 ; j<MAXLIGHTSCALE ; j++)
+	{
+	    level = startmap - j*SCREENWIDTH/(viewwidth<<detailshift)/DISTMAP;
+	    if (level < 0) level = 0;
+	    if (level >= NUMCOLORMAPS) level = NUMCOLORMAPS-1;
+	    scalelight[i][j] = colormaps + level*256;
+	}
+    }
+
+    /* framebuffer pointers at the explicit origin */
+    viewwindowx = wx;
+    viewwindowy = wy;
+    for (i=0 ; i<viewwidth ; i++)
+	columnofs[i] = viewwindowx + i;
+    for (i=0 ; i<viewheight ; i++)
+	ylookup[i] = I_VideoBuffer + (i+viewwindowy)*SCREENWIDTH;
+}
+
 
 
 //
@@ -898,6 +958,11 @@ extern volatile int game_phase;
    NULL on DoomJo / when the VDP1 world renderer is off. */
 void (*sat_walls_done_hook)(void) = 0;
 
+/* SATURN split-screen (Iter 2): set while rendering the per-player half-views.  The VDP1
+   wall emit (r_segs.c) + the VDP1 kick are skipped (the VDP1/VDP2 hybrid is single-view),
+   so each half renders in pure software into its framebuffer region. */
+int sat_split_active = 0;
+
 /* SATURN x-split (parallel-REC / multiplayer foundation, docs/MULTIPLAYER_PLAN.md).
    Render the frame in two screen-x halves so the second SH-2 can eventually render
    one of them.  STEP A (this build): a SERIAL correctness scaffold -- both halves are
@@ -970,8 +1035,9 @@ static void R_RenderViewPass (int last_pass)
 
     /* SATURN: walls are accumulated -> kick VDP1 NOW so it draws in parallel with the CPU
        floors/sprites below and presents the SAME frame (no 1-frame lag vs the framebuffer).
-       In x-split this fires only on the final pass so VDP1 is kicked once with every wall. */
-    if (last_pass && sat_walls_done_hook) sat_walls_done_hook ();
+       In x-split this fires only on the final pass so VDP1 is kicked once with every wall.
+       In split-screen (sat_split_active) the VDP1 hybrid is off (it is single-view) -> no kick. */
+    if (last_pass && sat_walls_done_hook && !sat_split_active) sat_walls_done_hook ();
 
     V_Canary ("bsp");
 

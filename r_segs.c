@@ -222,6 +222,7 @@ void (*sat_wall_hook)(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
    VDP1 path buys back.  The ceiling/floor clip + visplane marking still run (floors,
    ceilings, sprite occlusion stay correct).  0 on DoomJo / when unused. */
 int sat_wall_skip = 0;
+extern int sat_split_active;   /* SATURN split-screen: VDP1 is single-view -> emit software only */
 /* SATURN: set when the floor is rendered on the VDP2 RBG0 hardware plane (r_plane.c).
    The RBG0 floor is transparent (index 0), so unlike the old opaque software floor it no
    longer occludes the walls behind it -> lower-area walls would show through the floor.
@@ -302,7 +303,7 @@ void R_RenderSegLoop (void)
        OR horizontal MAGNIFICATION (close/face-on, catches short DOOR bands the span test misses).
        Both one-sided mid and two-sided upper/lower get the per-seg 3-frame exit handoff (sat_seg_cpu)
        to cover the VDP1's multi-frame lag when a wall hands back to VDP1.  Else VDP1 owns it. */
-    if (sat_wall_hook && sat_wall_skip && rw_stopx > rw_x)
+    if (sat_wall_hook && !sat_split_active &&sat_wall_skip && rw_stopx > rw_x)
     {
 	int n = rw_stopx - 1 - rw_x;
 	/* MAGNIFICATION = screen px per texel of u (du = the seg's tex u-span over its visible columns,
@@ -378,7 +379,7 @@ void R_RenderSegLoop (void)
     /* SATURN VDP1 world renderer (Step 2): one-sided (solid) walls -> the platform as
        a quad.  The 4 screen corners come from the same topfrac/bottomfrac the loop
        below steps; midtexture = the full-height wall texture. */
-    if (sat_wall_hook && midtexture && !curline->backsector && rw_stopx > rw_x && sat_v1_mid)
+    if (sat_wall_hook && !sat_split_active &&midtexture && !curline->backsector && rw_stopx > rw_x && sat_v1_mid)
     {
 	int n   = rw_stopx - 1 - rw_x;
 	int yl1 = (topfrac + HEIGHTUNIT - 1) >> HEIGHTBITS;
@@ -415,7 +416,7 @@ void R_RenderSegLoop (void)
        (bottomtexture) quads into the SAME painter list as the one-sided walls, so a
        NEAR two-sided frame correctly draws over a FAR one-sided wall seen through the
        opening (the gap between upper/lower has no texture -> the far wall shows there). */
-    if (sat_wall_hook && curline->backsector && rw_stopx > rw_x)
+    if (sat_wall_hook && !sat_split_active &&curline->backsector && rw_stopx > rw_x)
     {
 	int n   = rw_stopx - 1 - rw_x;
 	int a1 = (rw_centerangle + xtoviewangle[rw_x])        >> ANGLETOFINESHIFT;

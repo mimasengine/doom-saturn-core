@@ -284,7 +284,27 @@ void D_Display (void)
 
     // draw the view directly
     if (gamestate == GS_LEVEL && !automapactive && gametic)
-    	R_RenderPlayerView (&players[displayplayer]);
+    {
+	extern int sat_split_active, sat_wall_skip, viewheight;
+	extern void R_SetViewWindow (int, int, int, int);
+	if (sat_local_players > 1)
+	{
+	    /* SATURN split-screen (docs/MULTIPLAYER_PLAN.md Iter 2, step 1): render each player
+	       into a half-width view, software-only (the VDP1/VDP2 hybrid is single-view).  Both
+	       views run sequentially on the master here; the parallel master/slave split is next. */
+	    int fh  = viewheight;
+	    int hw  = SCREENWIDTH / 2;
+	    int sws = sat_wall_skip;
+	    sat_split_active = 1;
+	    sat_wall_skip    = 0;                 /* draw walls in software */
+	    R_SetViewWindow (0,  0, hw, fh);  R_RenderPlayerView (&players[0]);
+	    R_SetViewWindow (hw, 0, hw, fh);  R_RenderPlayerView (&players[1]);
+	    sat_split_active = 0;
+	    sat_wall_skip    = sws;
+	}
+	else
+	    R_RenderPlayerView (&players[displayplayer]);
+    }
 #if DISPLAY_DEBUG
     dd_t2 = d_ms();  /* after R_RenderPlayerView */
 #endif
