@@ -685,6 +685,57 @@ void R_StoreWallRange(int start, int stop)
     RP_WallPrepLeave();
 }
 
+/* ============================================================================
+ * SATURN parallel-REC -- wall-prep producer/consumer (d32xr-style).  The master
+ * walks the BSP + clips (Bw, updating solidsegs) and QUEUES each visible wall range
+ * here instead of running the wall-prep (R_StoreWallRange) inline.  RP_FlushWalls
+ * then runs them all in BSP order, so the floorclip/ceilingclip occlusion chain is
+ * identical.  STEP 1 (now): a master-only defer == byte-identical render, the
+ * validation harness for the STEP 2 slave consumer.  Gated on sat_wallprep_defer
+ * (0 = inline => DoomJo + the baseline are unchanged). */
+typedef struct {
+    seg_t      *curline;
+    sector_t   *frontsector, *backsector;
+    angle_t     rw_angle1;
+    visplane_t *floorplane, *ceilingplane;
+    int         start, stop;
+} walljob_t;
+static walljob_t walljobs[MAXDRAWSEGS];
+int  walljob_n = 0;
+int  sat_wallprep_defer = 0;
+
+void RP_QueueWall(int start, int stop)
+{
+    walljob_t *w;
+    if (!sat_wallprep_defer || walljob_n >= MAXDRAWSEGS)
+        { R_StoreWallRange(start, stop); return; }
+    w = &walljobs[walljob_n++];
+    w->curline      = curline;
+    w->frontsector  = frontsector;
+    w->backsector   = backsector;
+    w->rw_angle1    = rw_angle1;
+    w->floorplane   = floorplane;
+    w->ceilingplane = ceilingplane;
+    w->start = start; w->stop = stop;
+}
+
+void RP_FlushWalls(void)
+{
+    int i;
+    for (i = 0; i < walljob_n; i++)
+    {
+        walljob_t *w = &walljobs[i];
+        curline      = w->curline;
+        frontsector  = w->frontsector;
+        backsector   = w->backsector;
+        rw_angle1    = w->rw_angle1;
+        floorplane   = w->floorplane;
+        ceilingplane = w->ceilingplane;
+        R_StoreWallRange(w->start, w->stop);
+    }
+    walljob_n = 0;
+}
+
 static void
 R_StoreWallRange_impl
 ( int	start,

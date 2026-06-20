@@ -55,6 +55,11 @@ R_StoreWallRange
 ( int	start,
   int	stop );
 
+/* SATURN parallel-REC: the clip functions queue wall ranges instead of running the
+   wall-prep inline; RP_FlushWalls runs them after the BSP walk (r_segs.c). */
+void RP_QueueWall (int start, int stop);
+void RP_FlushWalls (void);
+
 
 
 
@@ -116,7 +121,7 @@ R_ClipSolidWallSegment
 	{
 	    // Post is entirely visible (above start),
 	    //  so insert a new clippost.
-	    R_StoreWallRange (first, last);
+	    RP_QueueWall (first, last);
 	    next = newend;
 	    newend++;
 	    
@@ -131,7 +136,7 @@ R_ClipSolidWallSegment
 	}
 		
 	// There is a fragment above *start.
-	R_StoreWallRange (first, start->first - 1);
+	RP_QueueWall (first, start->first - 1);
 	// Now adjust the clip size.
 	start->first = first;	
     }
@@ -144,7 +149,7 @@ R_ClipSolidWallSegment
     while (last >= (next+1)->first-1)
     {
 	// There is a fragment between two posts.
-	R_StoreWallRange (next->last + 1, (next+1)->first - 1);
+	RP_QueueWall (next->last + 1, (next+1)->first - 1);
 	next++;
 	
 	if (last <= next->last)
@@ -157,7 +162,7 @@ R_ClipSolidWallSegment
     }
 	
     // There is a fragment after *next.
-    R_StoreWallRange (next->last + 1, last);
+    RP_QueueWall (next->last + 1, last);
     // Adjust the clip size.
     start->last = last;
 	
@@ -207,12 +212,12 @@ R_ClipPassWallSegment
 	if (last < start->first-1)
 	{
 	    // Post is entirely visible (above start).
-	    R_StoreWallRange (first, last);
+	    RP_QueueWall (first, last);
 	    return;
 	}
 		
 	// There is a fragment above *start.
-	R_StoreWallRange (first, start->first - 1);
+	RP_QueueWall (first, start->first - 1);
     }
 
     // Bottom contained in start?
@@ -222,7 +227,7 @@ R_ClipPassWallSegment
     while (last >= (start+1)->first-1)
     {
 	// There is a fragment between two posts.
-	R_StoreWallRange (start->last + 1, (start+1)->first - 1);
+	RP_QueueWall (start->last + 1, (start+1)->first - 1);
 	start++;
 	
 	if (last <= start->last)
@@ -230,7 +235,7 @@ R_ClipPassWallSegment
     }
 	
     // There is a fragment after *next.
-    R_StoreWallRange (start->last + 1, last);
+    RP_QueueWall (start->last + 1, last);
 }
 
 

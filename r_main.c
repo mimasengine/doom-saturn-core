@@ -962,6 +962,10 @@ static void R_RenderViewPass (int last_pass)
     // The head node is the last node output.
     R_RenderBSPNode (numnodes-1);
 
+    /* SATURN parallel-REC: run the deferred wall-prep (R_StoreWallRange queued during the
+       BSP walk).  No-op when sat_wallprep_defer is 0 (the walls ran inline already). */
+    { extern void RP_FlushWalls(void); RP_FlushWalls(); }
+
     SAT_RP_BSPDONE ();   // SATURN: profiler BSP/planes boundary (row-20 B/P/M)
 
     /* SATURN: walls are accumulated -> kick VDP1 NOW so it draws in parallel with the CPU
