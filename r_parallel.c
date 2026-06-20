@@ -830,11 +830,11 @@ static void rp_plane_worklist_noarg(void)
 }
 
 /* SH-2 trampoline: save r14 on the old stack, keep the old SP in r14 (callee-saved, so the
-   call preserves it), switch r15 to the dedicated stack, call the no-arg draw, restore. */
-static void rp_plane_run_on_stack(void)
+   call preserves it), switch r15 to the dedicated stack, call fn, restore.  Shared by the plane
+   AND masked slave dispatch (they run in different frame phases, never concurrently). */
+static void rp_run_on_stack(void (*fn)(void))
 {
     void *newsp = rp_plane_slave_stack + sizeof(rp_plane_slave_stack);
-    void (*fn)(void) = rp_plane_worklist_noarg;
     __asm__ volatile (
         "mov.l  r14, @-r15\n\t"   /* save r14 on the OLD stack */
         "mov    r15, r14\n\t"     /* r14 = old SP (survives the call) */
@@ -854,7 +854,7 @@ static void rp_plane_slave_body(void *param)
     master_cache_purge();                    /* slave: read the master's fresh worklist + tables */
     rp_plane_from = (packed >> 16) & 0xffff;
     rp_plane_to   = packed & 0xffff;
-    rp_plane_run_on_stack();                 /* draw on the dedicated stack */
+    rp_run_on_stack(rp_plane_worklist_noarg);/* draw on the dedicated stack */
     PLANE_DONE = 1;
 }
 
@@ -876,6 +876,43 @@ void RP_WaitPlanes(void)
     p3_wait_ticks = (unsigned short)(rp_frt() - t0);
 #endif
     master_cache_purge();                     /* read the slave's drawn plane pixels before the blit */
+}
+
+/* ------------------------------------------------------------------------------------------ *
+ * SATURN masked-by-half (Option B): the slave draws the RIGHT-half vissprites (r_things.c        *
+ * R_SlaveDrawMasked) while the master draws the LEFT half, during the masked phase.  Same        *
+ * dedicated stack + GBR-creep guard as the plane dispatch; runs in a different phase so there    *
+ * is no overlap.  The slave's masked column state is its own (s_* in r_things.c).                *
+ * ------------------------------------------------------------------------------------------ */
+extern void R_SlaveDrawMasked(int x0, int x1);
+static volatile int rp_mask_done = 1;
+#define MASK_DONE (*(volatile int *)((unsigned int)&rp_mask_done | 0x20000000u))
+static int rp_mask_x0, rp_mask_x1;
+
+static void rp_masked_noarg(void) { R_SlaveDrawMasked(rp_mask_x0, rp_mask_x1); }
+
+static void rp_masked_slave_body(void *param)
+{
+    int packed = (int)(unsigned int)param;
+    master_cache_purge();                    /* slave: read the master's fresh vissprites + drawsegs */
+    rp_mask_x0 = (packed >> 16) & 0xffff;
+    rp_mask_x1 = packed & 0xffff;
+    rp_run_on_stack(rp_masked_noarg);
+    MASK_DONE = 1;
+}
+
+void RP_DispatchMasked(int x0, int x1)
+{
+    MASK_DONE = 0;
+    rp_sgl_workptr_reset();
+    slSlaveFunc(rp_masked_slave_body, (void *)(unsigned int)(((x0 & 0xffff) << 16) | (x1 & 0xffff)));
+}
+
+void RP_WaitMasked(void)
+{
+    volatile int guard = 30000000;
+    while (!MASK_DONE && guard-- > 0) { }
+    master_cache_purge();                     /* read the slave's drawn sprite pixels before the blit */
 }
 
 /* SATURN PERF: master frame ms, set once/sec by the platform fps_update
@@ -1278,8 +1315,12 @@ static void rp_p3_prof_show(void)
     unsigned int p10  = (unsigned short)(p3_t_planes - p3_t_bsp)    * 10u / 224u;
     unsigned int m10  = (unsigned short)(t_mask      - p3_t_planes) * 10u / 224u;
     unsigned int w10  = p3_wait_ticks  * 10u / 224u;   /* master FRT -> ms (reliable) */
+    extern int sat_masked_parallel;
     unsigned int rend = b10 + p10 + m10;                /* render = B+P+M (tenths-ms) */
-    unsigned int idle = rend ? ((b10 + m10) * 100u / rend) : 0u;   /* slave idle = B+M / render */
+    /* the slave is busy during P, and during M too once masked-by-half is on -> it idles only in
+       B+M (planes only) or B (planes+masked).  idle% DROPS as each phase is offloaded. */
+    unsigned int sidle = b10 + (sat_masked_parallel ? 0u : m10);
+    unsigned int idle = rend ? (sidle * 100u / rend) : 0u;
     char p[44];
     snprintf(p, sizeof p, "B%u.%u P%u.%u M%u.%u       ",
              b10/10,b10%10, p10/10,p10%10, m10/10,m10%10);

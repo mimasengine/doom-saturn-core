@@ -431,9 +431,12 @@ R_DrawVisSprite
     frac = vis->startfrac;
     spryscale = vis->scale;
     sprtopscreen = centeryfrac - FixedMul(dc_texturemid,spryscale);
-	
+
+    {
+    extern int g_mask_x1;   /* SATURN masked-by-half: the master draws sprite columns [0,x1) */
     for (dc_x=vis->x1 ; dc_x<=vis->x2 ; dc_x++, frac += vis->xiscale)
     {
+	if (dc_x >= g_mask_x1) break;
 	texturecolumn = frac>>FRACBITS;
 	/* SATURN: frac can go ±1 step past the patch boundary due to fixed-point
 	   rounding in the FixedDiv/scale path.  Skip (continue) rather than
@@ -447,6 +450,7 @@ R_DrawVisSprite
 			       LONG(patch->columnofs[texturecolumn]));
 	R_DrawMaskedColumn (column);
     }
+    }   /* end g_mask_x1 block */
 
     colfunc = basecolfunc;
 }
@@ -981,22 +985,184 @@ void R_DrawSprite (vissprite_t* spr)
 //
 // R_DrawMasked
 //
+/* ============================================================================
+ * SATURN parallel-REC (Option B / masked-by-half): the slave SH-2 draws the
+ * vissprites in the RIGHT screen-x half while the master draws the LEFT half,
+ * during the masked phase (M).  Self-contained -- its column state is a SEPARATE
+ * static set (s_*) drawn on a dedicated stack (DoomSRL has no GBR-TLS, GBR is
+ * SGL's), so it races nothing with the master.  Both iterate the SAME sorted
+ * vissprites (z-order preserved); each clips its columns to its half -> disjoint
+ * pixels.  Sprite CLIPPING against the shared drawsegs is replicated; masked WALLS
+ * stay on the master full-width (rare in shareware; a grate behind a slave-half
+ * sprite can race -- a known limit, fixed next).  Translated columns (player
+ * colours, never in 1p) fall back to the base draw. */
+int sat_masked_parallel = 0;          /* gate, set by the platform (src/main.cxx) */
+int g_mask_x1 = 32767;                 /* master vissprite right clip [0,x1); reset to viewwidth each use */
+
+static int      s_dc_x, s_dc_yl, s_dc_yh, s_fuzzpos, s_x0, s_x1, s_coltype;
+static fixed_t  s_dc_iscale, s_dc_texturemid, s_spryscale, s_sprtopscreen;
+static byte    *s_dc_source;
+static lighttable_t *s_dc_colormap;
+static short   *s_mfloorclip, *s_mceilingclip;
+static short    s_clipbot[SCREENWIDTH], s_cliptop[SCREENWIDTH];
+
+/* r_draw.c globals used by the self-contained slave column draw (not in r_things.c's headers) */
+extern byte *ylookup[];
+extern int   columnofs[];
+extern int   fuzzoffset[];
+#ifndef FUZZTABLE
+#define FUZZTABLE 50
+#endif
+
+static void R_SlaveDrawColumn (void)
+{
+    int count = s_dc_yh - s_dc_yl + 1;
+    byte *source = s_dc_source, *colormap = (byte *)s_dc_colormap;
+    byte *dest = ylookup[s_dc_yl] + columnofs[s_dc_x];
+    unsigned fracstep = s_dc_iscale<<9;
+    unsigned frac = (s_dc_texturemid + (s_dc_yl-centery)*s_dc_iscale)<<9;
+    while (count-- > 0) { *dest = colormap[source[frac>>25]]; dest += SCREENWIDTH; frac += fracstep; }
+}
+
+static void R_SlaveFuzzColumn (void)
+{
+    int count; byte *dest;
+    if (!s_dc_yl) s_dc_yl = 1;
+    if (s_dc_yh == viewheight-1) s_dc_yh = viewheight - 2;
+    count = s_dc_yh - s_dc_yl;
+    if (count < 0) return;
+    dest = ylookup[s_dc_yl] + columnofs[s_dc_x];
+    do {
+        *dest = colormaps[6*256+dest[fuzzoffset[s_fuzzpos]]];
+        if (++s_fuzzpos == FUZZTABLE) s_fuzzpos = 0;
+        dest += SCREENWIDTH;
+    } while (count--);
+}
+
+static void R_SlaveDrawMaskedColumn (column_t* column)
+{
+    int topscreen, bottomscreen;
+    fixed_t basetexturemid = s_dc_texturemid;
+    for ( ; column->topdelta != 0xff ; )
+    {
+        topscreen = s_sprtopscreen + s_spryscale*column->topdelta;
+        bottomscreen = topscreen + s_spryscale*column->length;
+        s_dc_yl = (topscreen+FRACUNIT-1)>>FRACBITS;
+        s_dc_yh = (bottomscreen-1)>>FRACBITS;
+        if (s_dc_yh >= s_mfloorclip[s_dc_x]) s_dc_yh = s_mfloorclip[s_dc_x]-1;
+        if (s_dc_yl <= s_mceilingclip[s_dc_x]) s_dc_yl = s_mceilingclip[s_dc_x]+1;
+        if (s_dc_yl <= s_dc_yh)
+        {
+            s_dc_source = (byte *)column + 3;
+            s_dc_texturemid = basetexturemid - (column->topdelta<<FRACBITS);
+            if (s_coltype == 1) R_SlaveFuzzColumn(); else R_SlaveDrawColumn();
+        }
+        column = (column_t *)((byte *)column + column->length + 4);
+    }
+    s_dc_texturemid = basetexturemid;
+}
+
+static void R_SlaveDrawVisSprite (vissprite_t* vis)
+{
+    column_t *column; int texturecolumn; fixed_t frac; patch_t *patch;
+    patch = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
+    s_dc_colormap = vis->colormap;
+    s_coltype = s_dc_colormap ? 0 : 1;        /* NULL colormap = fuzz/shadow */
+    s_dc_iscale = abs(vis->xiscale)>>detailshift;
+    s_dc_texturemid = vis->texturemid;
+    frac = vis->startfrac;
+    s_spryscale = vis->scale;
+    s_sprtopscreen = centeryfrac - FixedMul(s_dc_texturemid,s_spryscale);
+    for (s_dc_x=vis->x1 ; s_dc_x<=vis->x2 ; s_dc_x++, frac += vis->xiscale)
+    {
+        if (s_dc_x < s_x0 || s_dc_x >= s_x1) continue;    /* this CPU's x-half only */
+        texturecolumn = frac>>FRACBITS;
+        if ((unsigned)texturecolumn >= (unsigned)SHORT(patch->width)) continue;
+        column = (column_t *) ((byte *)patch + LONG(patch->columnofs[texturecolumn]));
+        R_SlaveDrawMaskedColumn (column);
+    }
+}
+
+static void R_SlaveDrawSprite (vissprite_t* spr)
+{
+    drawseg_t *ds; int x, r1, r2; fixed_t scale, lowscale; int silhouette;
+    int lo = spr->x1 < s_x0 ? s_x0 : spr->x1;     /* only this half's columns */
+    int hi = spr->x2 >= s_x1 ? s_x1-1 : spr->x2;
+    if (lo > hi) return;                          /* sprite entirely outside this half */
+    for (x = lo ; x<=hi ; x++) s_clipbot[x] = s_cliptop[x] = -2;
+    for (ds=ds_p-1 ; ds >= drawsegs ; ds--)
+    {
+        if (ds->x1 > spr->x2 || ds->x2 < spr->x1 || (!ds->silhouette && !ds->maskedtexturecol)) continue;
+        r1 = ds->x1 < spr->x1 ? spr->x1 : ds->x1;
+        r2 = ds->x2 > spr->x2 ? spr->x2 : ds->x2;
+        if (r1 < lo) r1 = lo;
+        if (r2 > hi) r2 = hi;
+        if (r1 > r2) continue;                    /* seg doesn't touch this half */
+        if (ds->scale1 > ds->scale2) { lowscale = ds->scale2; scale = ds->scale1; }
+        else { lowscale = ds->scale1; scale = ds->scale2; }
+        if (scale < spr->scale || (lowscale < spr->scale
+            && !R_PointOnSegSide (spr->gx, spr->gy, ds->curline)))
+            continue;                             /* seg behind sprite: master draws its wall */
+        silhouette = ds->silhouette;
+        if (spr->gz >= ds->bsilheight) silhouette &= ~SIL_BOTTOM;
+        if (spr->gzt <= ds->tsilheight) silhouette &= ~SIL_TOP;
+        if (silhouette == 1) { for (x=r1;x<=r2;x++) if (s_clipbot[x]==-2) s_clipbot[x]=ds->sprbottomclip[x]; }
+        else if (silhouette == 2) { for (x=r1;x<=r2;x++) if (s_cliptop[x]==-2) s_cliptop[x]=ds->sprtopclip[x]; }
+        else if (silhouette == 3) { for (x=r1;x<=r2;x++) { if (s_clipbot[x]==-2) s_clipbot[x]=ds->sprbottomclip[x]; if (s_cliptop[x]==-2) s_cliptop[x]=ds->sprtopclip[x]; } }
+    }
+    for (x = lo ; x<=hi ; x++) { if (s_clipbot[x]==-2) s_clipbot[x]=viewheight; if (s_cliptop[x]==-2) s_cliptop[x]=-1; }
+    s_mfloorclip = s_clipbot; s_mceilingclip = s_cliptop;
+    R_SlaveDrawVisSprite (spr);
+}
+
+/* slave entry (r_parallel.c dispatches it): draw the sorted vissprites in [x0,x1). */
+void R_SlaveDrawMasked (int x0, int x1)
+{
+    vissprite_t *spr;
+    s_x0 = x0; s_x1 = x1;
+    for (spr = vsprsortedhead.next ; spr != &vsprsortedhead ; spr=spr->next)
+        R_SlaveDrawSprite (spr);
+}
+
 void R_DrawMasked (void)
 {
     vissprite_t*	spr;
     drawseg_t*		ds;
-	
+    extern void RP_DispatchMasked(int x0, int x1);
+    extern void RP_WaitMasked(void);
+    int masked_split = 0;
+
     R_SortVisSprites ();
 
     if (vissprite_p > vissprites)
     {
+	/* SATURN masked-by-half: dispatch the slave to draw the RIGHT-half vissprites while the
+	   master draws the LEFT half (g_mask_x1).  Masked walls + psprites stay on the master,
+	   full width, after the wait. */
+	if (sat_masked_parallel)
+	{
+	    int half = viewwidth >> 1;
+	    /* pre-cache every sprite patch on the master so the slave's W_CacheLumpNum only ever
+	       finds them already cached -> no concurrent zone alloc (which would race the heap
+	       off-cart / CD-streaming).  Cheap: a cached lump is just a pointer return. */
+	    for (spr = vsprsortedhead.next ; spr != &vsprsortedhead ; spr=spr->next)
+		W_CacheLumpNum (spr->patch+firstspritelump, PU_CACHE);
+	    masked_split = 1;
+	    RP_DispatchMasked (half, viewwidth);   /* slave: vissprites in [half, viewwidth) */
+	    g_mask_x1 = half;                       /* master: vissprites in [0, half)       */
+	}
 	// draw all vissprites back to front
 	for (spr = vsprsortedhead.next ;
 	     spr != &vsprsortedhead ;
 	     spr=spr->next)
 	{
-	    
+
 	    R_DrawSprite (spr);
+	}
+	if (masked_split)
+	{
+	    g_mask_x1 = 32767;       /* reset to full width for the walls + psprites */
+	    RP_WaitMasked ();        /* the slave's right half is done */
 	}
     }
     
