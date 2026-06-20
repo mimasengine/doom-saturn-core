@@ -1251,6 +1251,7 @@ void RP_BeginFrame(void)
     if (rp_disabled) { rp_active=0;
 #if RP_PROF
         p3_t_begin = rp_frt();   /* P3 profiler: frame start (parity rows are off here) */
+        prof_wallprep = 0;       /* Bp accumulator (R_StoreWallRange); the parity reset is skipped here */
 #endif
         return; }
 #if RP_DEBUG
@@ -1321,9 +1322,13 @@ static void rp_p3_prof_show(void)
        B+M (planes only) or B (planes+masked).  idle% DROPS as each phase is offloaded. */
     unsigned int sidle = b10 + (sat_masked_parallel ? 0u : m10);
     unsigned int idle = rend ? (sidle * 100u / rend) : 0u;
+    /* split B: Bp = wall-prep (R_StoreWallRange, the part the slave could take, d32xr-style);
+       Bw = the BSP walk + clip + sprite projection (inherently serial). */
+    unsigned int bp10 = prof_wallprep * 10u / 224u;
+    unsigned int bw10 = (b10 > bp10) ? (b10 - bp10) : 0u;
     char p[44];
-    snprintf(p, sizeof p, "B%u.%u P%u.%u M%u.%u       ",
-             b10/10,b10%10, p10/10,p10%10, m10/10,m10%10);
+    snprintf(p, sizeof p, "Bw%u.%u Bp%u.%u P%u.%u M%u.%u",
+             bw10/10,bw10%10, bp10/10,bp10%10, p10/10,p10%10, m10/10,m10%10);
     dbg_print(0, 20, p);
     /* w = master idle waiting for the slave (master FRT): w~0 => the slave keeps up / balanced.
        idle% = the slave's idle share of the render: it works in P, sits idle in B+M -> this is
