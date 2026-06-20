@@ -107,6 +107,11 @@ extern  boolean	netgame;
 // 0=Cooperative; 1=Deathmatch; 2=Altdeath
 extern int deathmatch;
 
+// SATURN local multiplayer (docs/MULTIPLAYER_PLAN.md): 1 = single player (default).
+extern int  sat_local_players;
+extern int  sat_deathmatch;
+extern void (*sat_build_local_ticcmd)(ticcmd_t *, int);
+
 // -------------------------
 // Internal parameters for sound rendering.
 // These have been taken from the DOS version,

@@ -188,6 +188,26 @@ static boolean BuildNewTic(void)
     ticdata[maketic % BACKUPTICS].cmds[localplayer] = cmd;
     ticdata[maketic % BACKUPTICS].ingame[localplayer] = true;
 
+    /* SATURN local multiplayer (docs/MULTIPLAYER_PLAN.md Iter 1): also build the extra local
+       players' ticcmds straight from their pads (the platform hook).  No-op for 1p / DoomJo. */
+    {
+        extern int sat_local_players;
+        extern void (*sat_build_local_ticcmd)(ticcmd_t *, int);
+        if (sat_local_players > 1 && sat_build_local_ticcmd)
+        {
+            int pl;
+            for (pl = 0; pl < sat_local_players; pl++)
+            {
+                ticcmd_t mc;
+                if (pl == localplayer) continue;
+                memset(&mc, 0, sizeof(ticcmd_t));
+                sat_build_local_ticcmd(&mc, pl);
+                ticdata[maketic % BACKUPTICS].cmds[pl] = mc;
+                ticdata[maketic % BACKUPTICS].ingame[pl] = true;
+            }
+        }
+    }
+
     ++maketic;
 
     return true;
@@ -437,8 +457,11 @@ void D_StartNetGame(net_gamesettings_t *settings,
     //    printf("Syncing netgames like Vanilla Doom.\n");
     //}
 #else
+    {
+    extern int sat_local_players;   /* SATURN local multiplayer (default 1) */
+    int sp = sat_local_players < 1 ? 1 : sat_local_players;
     settings->consoleplayer = 0;
-	settings->num_players = 1;
+	settings->num_players = sp;
 	settings->player_classes[0] = player_class;
 	settings->new_sync = 0;
 	settings->extratics = 1;
@@ -446,6 +469,9 @@ void D_StartNetGame(net_gamesettings_t *settings,
 
 	ticdup = settings->ticdup;
 	new_sync = settings->new_sync;
+	localplayer = 0;
+	{ int i; for (i = 0; i < NET_MAXPLAYERS; ++i) local_playeringame[i] = i < sp; }
+    }
 #endif
 }
 
@@ -689,10 +715,11 @@ static void TicdupSquash(ticcmd_set_t *set)
 static void SinglePlayerClear(ticcmd_set_t *set)
 {
     unsigned int i;
+    extern int sat_local_players;   /* SATURN: keep the extra local players in-game */
 
     for (i = 0; i < NET_MAXPLAYERS; ++i)
     {
-        if (i != localplayer)
+        if (i != (unsigned int)localplayer && (int)i >= sat_local_players)
         {
             set->ingame[i] = false;
         }

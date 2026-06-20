@@ -945,12 +945,13 @@ void G_Ticker (void)
 
 	    if (netgame && !netdemo && !(gametic%ticdup) ) 
 	    { 
-		if (gametic > BACKUPTICS 
-		    && consistancy[i][buf] != cmd->consistancy) 
-		{ 
+		if (gametic > BACKUPTICS
+		    && consistancy[i][buf] != cmd->consistancy
+		    && sat_local_players <= 1)   /* SATURN: local MP is deterministic (no net) -> no desync */
+		{
 		    I_Error ("consistency failure (%i should be %i)",
-			     cmd->consistancy, consistancy[i][buf]); 
-		} 
+			     cmd->consistancy, consistancy[i][buf]);
+		}
 		if (players[i].mo) 
 		    consistancy[i][buf] = players[i].mo->x; 
 		else 
@@ -1707,20 +1708,29 @@ G_DeferedInitNew
 } 
 
 
-void G_DoNewGame (void) 
+/* SATURN local multiplayer (docs/MULTIPLAYER_PLAN.md, Iter 1).  Default = single player, so
+   DoomJo + the 1p shipping build are behaviourally identical.  The platform sets these:
+   sat_local_players (2..4) + sat_build_local_ticcmd (reads pad p -> ticcmd for players 1..N-1). */
+int  sat_local_players = 1;
+int  sat_deathmatch    = 0;                            /* 0 = coop, 1/2 = deathmatch */
+void (*sat_build_local_ticcmd)(ticcmd_t *, int) = 0;   /* platform hook, NULL on DoomJo/1p */
+
+void G_DoNewGame (void)
 {
-    demoplayback = false; 
+    demoplayback = false;
     netdemo = false;
-    netgame = false;
-    deathmatch = false;
-    playeringame[1] = playeringame[2] = playeringame[3] = 0;
+    netgame    = (sat_local_players > 1);              /* SATURN: local MP -> treat as a netgame */
+    deathmatch = (sat_local_players > 1) ? sat_deathmatch : false;
+    playeringame[1] = (sat_local_players > 1);
+    playeringame[2] = (sat_local_players > 2);
+    playeringame[3] = (sat_local_players > 3);
     respawnparm = false;
     fastparm = false;
     nomonsters = false;
     consoleplayer = 0;
-    G_InitNew (d_skill, d_episode, d_map); 
-    gameaction = ga_nothing; 
-} 
+    G_InitNew (d_skill, d_episode, d_map);
+    gameaction = ga_nothing;
+}
 
 
 void

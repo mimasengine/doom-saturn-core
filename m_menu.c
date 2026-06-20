@@ -907,7 +907,7 @@ void M_DrawNewGame(void)
 
 void M_NewGame(int choice)
 {
-    if (netgame && !demoplayback)
+    if (netgame && !demoplayback && sat_local_players <= 1)   /* SATURN: allow restart in local MP */
     {
 	M_StartMessage(DEH_String(NEWGAME),NULL,false);
 	return;
