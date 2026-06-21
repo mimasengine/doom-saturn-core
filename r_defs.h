@@ -419,7 +419,20 @@ typedef struct
 
 //
 // Now what is a visplane, anyway?
-// 
+//
+
+/* SATURN #1 (visplane span pooling, d32xr layout): default 0 == inline arrays ==
+   vanilla == byte-identical (DoomJo unaffected).  When 1, top/bottom point into a
+   shared per-frame bump pool (r_plane.c) so the struct shrinks ~664B -> ~28B: the
+   hash/sort/header walk touches ~24x fewer cache lines, and a future 2nd split-view
+   can share ONE arena.  Each pooled slice is (SCREENWIDTH+2) bytes with the pointer
+   at base+1, reproducing the pad1/pad2/pad3/pad4 [-1..SCREENWIDTH] sentinel slots
+   EXACTLY (so every `pl->top[x]` access site is unchanged).  Pixel output is
+   Ymir-validatable (flat memory -> byte-identical).  See docs / memory. */
+#ifndef SAT_VISPLANE_POOL
+#define SAT_VISPLANE_POOL 0
+#endif
+
 typedef struct
 {
   fixed_t		height;
@@ -427,9 +440,15 @@ typedef struct
   int			lightlevel;
   int			minx;
   int			maxx;
-  
+
+#if SAT_VISPLANE_POOL
+  // pooled: point into the shared span arena; each slice has the [-1] and
+  // [SCREENWIDTH] pad slots (base+1) so the sentinel accesses stay in-bounds.
+  byte		*top;
+  byte		*bottom;
+#else
   // leave pads for [minx-1]/[maxx+1]
-  
+
   byte		pad1;
   // Here lies the rub for all
   //  dynamic resize/change of resolution.
@@ -439,6 +458,7 @@ typedef struct
   // See above.
   byte		bottom[SCREENWIDTH];
   byte		pad4;
+#endif
 
 } visplane_t;
 

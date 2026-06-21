@@ -667,6 +667,13 @@ R_SetViewSize
 //
 // R_ExecuteSetViewSize
 //
+/* SATURN split perf: R_SetViewWindow's size-dependent tables (R_InitTextureMapping +
+   yslope/distscale/scalelight = ~74ms PER CALL on HW -- measured as the SPL `sw` term,
+   the dominant 2-player cost) are cached on (w,h,detailshift) so the two SAME-size
+   half-views don't recompute them twice every frame.  R_ExecuteSetViewSize (the 1p path)
+   overwrites the same shared tables, so it invalidates this cache below. */
+static int satvw_w = -1, satvw_h = -1, satvw_ds = -1;
+
 void R_ExecuteSetViewSize (void)
 {
     fixed_t	cosadj;
@@ -674,9 +681,10 @@ void R_ExecuteSetViewSize (void)
     int		i;
     int		j;
     int		level;
-    int		startmap; 	
+    int		startmap;
 
     setsizeneeded = false;
+    satvw_w = -1;   /* invalidate R_SetViewWindow's cache: we overwrite the size tables */
 
     if (setblocks == 11)
     {
@@ -775,42 +783,52 @@ void R_SetViewWindow (int wx, int wy, int w, int h)
 
     viewwidth  = w;
     viewheight = h;
-    centery = viewheight/2;
-    centerx = viewwidth/2;
-    centerxfrac = centerx<<FRACBITS;
-    centeryfrac = centery<<FRACBITS;
-    projection = centerxfrac;
 
-    R_InitTextureMapping ();                    /* xtoviewangle from centerx/viewwidth */
+    /* SATURN split perf: recompute the SIZE-dependent tables ONLY when (w,h,detailshift)
+       changes.  Both half-views share the size, so this fires once (not 2x/frame) -- it
+       was the ~148ms `sw` term that pinned the 2p split at ~5fps.  The per-view origin
+       (columnofs/ylookup below) is always redone (cheap). */
+    if (w != satvw_w || h != satvw_h || detailshift != satvw_ds)
+    {
+	satvw_w = w; satvw_h = h; satvw_ds = detailshift;
 
-    pspritescale  = FRACUNIT*viewwidth/SCREENWIDTH;
-    pspriteiscale = FRACUNIT*SCREENWIDTH/viewwidth;
+	centery = viewheight/2;
+	centerx = viewwidth/2;
+	centerxfrac = centerx<<FRACBITS;
+	centeryfrac = centery<<FRACBITS;
+	projection = centerxfrac;
 
-    for (i=0 ; i<viewwidth ; i++)
-	screenheightarray[i] = viewheight;
-    for (i=0 ; i<viewheight ; i++)
-    {
-	dy = ((i-viewheight/2)<<FRACBITS)+FRACUNIT/2;  dy = abs(dy);
-	yslope[i] = FixedDiv ( (viewwidth<<detailshift)/2*FRACUNIT, dy);
-    }
-    for (i=0 ; i<viewwidth ; i++)
-    {
-	cosadj = abs(finecosine[xtoviewangle[i]>>ANGLETOFINESHIFT]);
-	distscale[i] = FixedDiv (FRACUNIT,cosadj);
-    }
-    for (i=0 ; i< LIGHTLEVELS ; i++)
-    {
-	startmap = ((LIGHTLEVELS-1-i)*2)*NUMCOLORMAPS/LIGHTLEVELS;
-	for (j=0 ; j<MAXLIGHTSCALE ; j++)
+	R_InitTextureMapping ();                    /* xtoviewangle from centerx/viewwidth */
+
+	pspritescale  = FRACUNIT*viewwidth/SCREENWIDTH;
+	pspriteiscale = FRACUNIT*SCREENWIDTH/viewwidth;
+
+	for (i=0 ; i<viewwidth ; i++)
+	    screenheightarray[i] = viewheight;
+	for (i=0 ; i<viewheight ; i++)
 	{
-	    level = startmap - j*SCREENWIDTH/(viewwidth<<detailshift)/DISTMAP;
-	    if (level < 0) level = 0;
-	    if (level >= NUMCOLORMAPS) level = NUMCOLORMAPS-1;
-	    scalelight[i][j] = colormaps + level*256;
+	    dy = ((i-viewheight/2)<<FRACBITS)+FRACUNIT/2;  dy = abs(dy);
+	    yslope[i] = FixedDiv ( (viewwidth<<detailshift)/2*FRACUNIT, dy);
+	}
+	for (i=0 ; i<viewwidth ; i++)
+	{
+	    cosadj = abs(finecosine[xtoviewangle[i]>>ANGLETOFINESHIFT]);
+	    distscale[i] = FixedDiv (FRACUNIT,cosadj);
+	}
+	for (i=0 ; i< LIGHTLEVELS ; i++)
+	{
+	    startmap = ((LIGHTLEVELS-1-i)*2)*NUMCOLORMAPS/LIGHTLEVELS;
+	    for (j=0 ; j<MAXLIGHTSCALE ; j++)
+	    {
+		level = startmap - j*SCREENWIDTH/(viewwidth<<detailshift)/DISTMAP;
+		if (level < 0) level = 0;
+		if (level >= NUMCOLORMAPS) level = NUMCOLORMAPS-1;
+		scalelight[i][j] = colormaps + level*256;
+	    }
 	}
     }
 
-    /* framebuffer pointers at the explicit origin */
+    /* framebuffer pointers at the explicit origin -- ALWAYS (cheap, per-view) */
     viewwindowx = wx;
     viewwindowy = wy;
     for (i=0 ; i<viewwidth ; i++)
@@ -962,6 +980,13 @@ void (*sat_walls_done_hook)(void) = 0;
    wall emit (r_segs.c) + the VDP1 kick are skipped (the VDP1/VDP2 hybrid is single-view),
    so each half renders in pure software into its framebuffer region. */
 int sat_split_active = 0;
+
+/* SATURN split-screen Step 3 (docs/MULTIPLAYER_PLAN.md): when set, the per-player half-views
+   keep their walls on VDP1 (the platform offsets each quad by viewwindowx + clips to the view's
+   x-range; the walls are accumulated across BOTH views and kicked ONCE per frame from d_main.c).
+   0 = the software-only split baseline (the A/B reference).  Default 0 -> DoomJo/1p unaffected;
+   the platform sets it (and a live pad chord toggles it for hardware A/B). */
+int sat_split_vdp1 = 0;
 
 /* SATURN x-split (parallel-REC / multiplayer foundation, docs/MULTIPLAYER_PLAN.md).
    Render the frame in two screen-x halves so the second SH-2 can eventually render

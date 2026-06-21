@@ -55,9 +55,44 @@ planefunction_t		ceilingfunc;
 static visplane_t	*visplanes;
 /* SATURN: peak visplane count per frame, exposed for the debug overlay. */
 int r_visplane_peak = 0;
+/* SATURN VALIDATION (#1 sizing): peak SUM of live-plane column-spans per frame =
+   the top-bytes a TIGHT pooled arena would need (x2 for bottom).  Tells us, on Ymir
+   (deterministic, identical to HW), exactly how much a span pool could save WITHOUT
+   committing to the invasive layout.  Cheap per-frame loop (~n planes), both ports. */
+int r_visplane_coverage_peak = 0;
+/* high-water BYTES of the #1 span pool (0 when SAT_VISPLANE_POOL is off) */
+int r_visplane_pool_peak = 0;
 visplane_t*		lastvisplane;
 visplane_t*		floorplane;
 visplane_t*		ceilingplane;
+
+#if SAT_VISPLANE_POOL
+/* SATURN #1: the shared per-frame visplane span pool (bump-allocated, reset each
+   frame in R_ClearPlanes).  Holds VP_POOL_PLANES plane-pairs of (top+bottom) slices,
+   each slice (SCREENWIDTH+2) bytes; the returned pointer is base+1 so [-1..SCREENWIDTH]
+   (the old pad slots) stay in-bounds.  Default cap == MAXVISPLANES => never overflows
+   (one pair per plane, plane count <= MAXVISPLANES) and gives NO memory saving yet
+   (correctness A/B only).  Lower VP_POOL_PLANES, gated on r_visplane_peak telemetry,
+   to realise the saving (overflow => I_Error, same hard-limit semantics as the pool). */
+#define VP_POOL_PLANES   MAXVISPLANES
+#define VP_SLICE_BYTES   (SCREENWIDTH + 2)
+static byte	*plane_pool;
+static byte	*plane_pool_ptr;
+static byte	*plane_pool_end;
+
+static byte *R_PoolSlice (void)
+{
+    byte *p = plane_pool_ptr;
+    int   used;
+    if (p + VP_SLICE_BYTES > plane_pool_end)
+	I_Error ("R_PoolSlice: visplane span pool exhausted");
+    plane_pool_ptr += VP_SLICE_BYTES;
+    used = (int)(plane_pool_ptr - plane_pool);
+    if (used > r_visplane_pool_peak)
+	r_visplane_pool_peak = used;
+    return p + 1;   /* base+1: the [-1] pad slot is p[0], [SCREENWIDTH] is p[SCREENWIDTH+1] */
+}
+#endif
 
 /* SATURN PERF L1: visplane hash (d32xr-style).  Vanilla R_FindPlane is a linear
    O(n) scan over visplanes, called per subsector for floor AND ceiling => O(n^2)
@@ -183,6 +218,13 @@ void R_InitPlanes (void)
        the 1MB limit.  Z_Init runs before R_Init so the heap is ready. */
     visplanes = Z_Malloc(MAXVISPLANES * sizeof(visplane_t), PU_STATIC, 0);
     r_visplane_peak = 0;
+#if SAT_VISPLANE_POOL
+    /* one (top+bottom) slice-pair per plane, capped at VP_POOL_PLANES */
+    plane_pool     = Z_Malloc(VP_POOL_PLANES * 2 * VP_SLICE_BYTES, PU_STATIC, 0);
+    plane_pool_ptr = plane_pool;
+    plane_pool_end = plane_pool + VP_POOL_PLANES * 2 * VP_SLICE_BYTES;
+    r_visplane_pool_peak = 0;
+#endif
 }
 
 
@@ -334,16 +376,27 @@ void R_ClearPlanes (void)
 	ceilingclip[i] = -1;
     }
 
-    /* SATURN: record peak visplane usage for the debug overlay. */
+    /* SATURN: record peak visplane usage + span coverage for the debug overlay
+       (sizes #2 MAXVISPLANES and #1 the pooled arena -- both deterministic, so
+       Ymir's reading == hardware's). */
     {
         int n = (int)(lastvisplane - visplanes);
+        visplane_t *p;
+        int cov = 0;
         if (n > r_visplane_peak) r_visplane_peak = n;
+        for (p = visplanes; p < lastvisplane; p++)
+            if (p->maxx >= p->minx)
+                cov += p->maxx - p->minx + 1;
+        if (cov > r_visplane_coverage_peak) r_visplane_coverage_peak = cov;
     }
 #if VP_DIAG
     vp_in_bad = vp_draw_bad = vp_map_bad = 0;   /* per-frame reset */
 #endif
     lastvisplane = visplanes;
     lastopening = openings;
+#if SAT_VISPLANE_POOL
+    plane_pool_ptr = plane_pool;   /* bump-reset the span pool for the new frame */
+#endif
 
 #if SAT_VISPLANE_HASH
     /* SATURN PERF L1: empty every hash bucket for the new frame (0xff -> -1).
@@ -427,7 +480,14 @@ R_FindPlane
     check->minx = SCREENWIDTH;
     check->maxx = -1;
 
-    memset (check->top,0xff,sizeof(check->top));
+#if SAT_VISPLANE_POOL
+    check->top    = R_PoolSlice ();   /* fresh top+bottom slices from the frame pool */
+    check->bottom = R_PoolSlice ();
+#endif
+    /* SATURN: explicit length (was sizeof(top)) -- correct for BOTH the inline array
+       (==SCREENWIDTH, byte-identical) and the pooled pointer (sizeof would be 4!).
+       Covers top[0..SCREENWIDTH-1]; the [minx-1]/[maxx+1] sentinels are set at draw. */
+    memset (check->top,0xff,SCREENWIDTH);
 
 #if SAT_VISPLANE_HASH
     R_HashInsert (bucket, (int)(check - visplanes));
@@ -512,7 +572,11 @@ R_CheckPlane
     pl->minx = start;
     pl->maxx = stop;
 
-    memset (pl->top,0xff,sizeof(pl->top));
+#if SAT_VISPLANE_POOL
+    pl->top    = R_PoolSlice ();   /* the split plane gets its own slices */
+    pl->bottom = R_PoolSlice ();
+#endif
+    memset (pl->top,0xff,SCREENWIDTH);   /* explicit length (see R_FindPlane note) */
 
 #if SAT_VISPLANE_HASH
     /* SATURN PERF L1: a split plane is scanned by vanilla R_FindPlane too, so it
