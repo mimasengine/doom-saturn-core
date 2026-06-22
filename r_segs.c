@@ -381,6 +381,21 @@ void R_RenderSegLoop (void)
 	}
     }
 
+    /* SATURN: pot2-fl -- a plain (non-special) wall draws as a CLAMPED flat VDP1 quad, which
+       cannot swim/explode, so the close-wall CPU fallback above is pointless (Romain: "désactive
+       le fallback cpu en pot2, vu qu'ils sont flats").  Force VDP1, no software, for every tier.
+       SPECIAL walls (sat_wall_textured) stay TEXTURED -> they CAN swim, so keep their fallback. */
+    if (sat_potato_walls && !sat_wall_textured && SAT_WALL_VDP1_OK && sat_wall_skip && rw_stopx > rw_x)
+    {
+	sat_sw_mid = sat_sw_up = sat_sw_lo = 0;
+	if (midtexture && !curline->backsector) sat_v1_mid = 1;
+	if (curline->backsector)
+	{
+	    sat_v1_up = toptexture    ? 1 : 0;
+	    sat_v1_lo = bottomtexture ? 1 : 0;
+	}
+    }
+
     /* SATURN VDP1 world renderer (Step 2): one-sided (solid) walls -> the platform as
        a quad.  The 4 screen corners come from the same topfrac/bottomfrac the loop
        below steps; midtexture = the full-height wall texture. */

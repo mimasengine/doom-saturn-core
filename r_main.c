@@ -781,7 +781,7 @@ void R_SetViewWindow (int wx, int wy, int w, int h)
     fixed_t cosadj, dy;
     int i, j, level, startmap;
 
-    viewwidth  = w;
+    viewwidth  = w >> detailshift;   /* low-detail: half the internal columns (screen span stays w) */
     viewheight = h;
 
     /* SATURN split perf: recompute the SIZE-dependent tables ONLY when (w,h,detailshift)
@@ -826,12 +826,32 @@ void R_SetViewWindow (int wx, int wy, int w, int h)
 		scalelight[i][j] = colormaps + level*256;
 	    }
 	}
+
+	/* SATURN: select the draw funcs for the detail level (mirrors R_ExecuteSetViewSize) so
+	   the split low-detail path gets R_Draw*Low; self-corrects back to high when detailshift
+	   returns to 0 (the cache keys on detailshift).  detailshift=0 == the existing defaults. */
+	if (!detailshift)
+	{
+	    colfunc = basecolfunc = R_DrawColumn;
+	    fuzzcolfunc = R_DrawFuzzColumn;
+	    transcolfunc = R_DrawTranslatedColumn;
+	    spanfunc = R_DrawSpan;
+	}
+	else
+	{
+	    colfunc = basecolfunc = R_DrawColumnLow;
+	    fuzzcolfunc = R_DrawFuzzColumnLow;
+	    transcolfunc = R_DrawTranslatedColumnLow;
+	    spanfunc = R_DrawSpanLow;
+	}
     }
 
-    /* framebuffer pointers at the explicit origin -- ALWAYS (cheap, per-view) */
+    /* framebuffer pointers at the explicit origin -- ALWAYS (cheap, per-view).  columnofs is
+       indexed by SCREEN x (full width w = viewwidth<<detailshift); R_DrawColumnLow writes
+       columnofs[dc_x<<1] and [dc_x<<1 +1].  At detailshift=0, w==viewwidth -> identical loop. */
     viewwindowx = wx;
     viewwindowy = wy;
-    for (i=0 ; i<viewwidth ; i++)
+    for (i=0 ; i<w ; i++)
 	columnofs[i] = viewwindowx + i;
     for (i=0 ; i<viewheight ; i++)
 	ylookup[i] = I_VideoBuffer + (i+viewwindowy)*SCREENWIDTH;
@@ -987,6 +1007,10 @@ int sat_split_active = 0;
    0 = the software-only split baseline (the A/B reference).  Default 0 -> DoomJo/1p unaffected;
    the platform sets it (and a live pad chord toggles it for hardware A/B). */
 int sat_split_vdp1 = 0;
+/* SATURN: low-detail (detailshift=1) in the split -- the platform sets it per the Z cycle; the
+   d_main.c split block applies it as detailshift around the two views.  Default 0 -> 1p/DoomJo
+   never low-detail (no split), and detailshift=0 makes every dependent change a no-op. */
+int sat_split_lowdetail = 0;
 
 /* SATURN x-split (parallel-REC / multiplayer foundation, docs/MULTIPLAYER_PLAN.md).
    Render the frame in two screen-x halves so the second SH-2 can eventually render

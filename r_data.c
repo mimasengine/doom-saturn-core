@@ -404,11 +404,80 @@ R_GetColumn
 }
 
 
-/* SATURN Potato walls: the texture's DOMINANT palette index (most frequent texel),
-   cached per texture, used as the wall's single "continuous" colour (one hue for
-   the whole wall, then light-shaded per column by the colormap).  Subsampled (step
-   2) for cheapness; computed lazily on first use and cached.  sat_wall_color is the
-   global the wall recorder reads (set per wall section in r_segs.c). */
+/* SATURN Potato representative-colour mode: 0 = DOMINANT (most-frequent texel; the default
+   Romain chose) ; 1 = AVERAGE (histogram-weighted RGB mean -> nearest palette index).  Both
+   modes apply to floors AND walls (R_FlatPotatoColor / R_WallPotatoColor).  Flip to 1 to A/B
+   the average in-game later.  (Future idea to test: blend the top 2-3 dominant texels.) */
+#ifndef SAT_POTATO_AVG
+#define SAT_POTATO_AVG 0
+#endif
+
+/* From a 256-bucket texel histogram, return the representative PLAYPAL index: the DOMINANT
+   (most-frequent) index, or -- if SAT_POTATO_AVG -- the histogram-weighted RGB average snapped
+   to the nearest palette index (PLAYPAL palette 0; lighting is applied later via the colormap,
+   so this is the unlit base colour). */
+static int R_PotatoRepColor (const int *hist)
+{
+#if SAT_POTATO_AVG
+    static byte *pal = NULL;
+    long rs = 0, gs = 0, bs = 0, n = 0, bestd = 0x7fffffffL;
+    int  i, r, g, b, best = 0;
+    if (!pal) pal = W_CacheLumpName ("PLAYPAL", PU_STATIC);
+    for (i = 0; i < 256; i++)
+	if (hist[i])
+	{
+	    rs += (long)pal[i*3+0]*hist[i]; gs += (long)pal[i*3+1]*hist[i];
+	    bs += (long)pal[i*3+2]*hist[i]; n  += hist[i];
+	}
+    if (!n) return 0;
+    r = (int)(rs/n); g = (int)(gs/n); b = (int)(bs/n);
+    for (i = 0; i < 256; i++)
+    {
+	int  dr = r-pal[i*3+0], dg = g-pal[i*3+1], db = b-pal[i*3+2];
+	long d  = (long)dr*dr + (long)dg*dg + (long)db*db;
+	if (d < bestd) { bestd = d; best = i; }
+    }
+    return best;
+#else
+    int i, best = 0, bestn = -1;
+    for (i = 0; i < 256; i++) if (hist[i] > bestn) { bestn = hist[i]; best = i; }
+    return best;
+#endif
+}
+
+/* SATURN Potato floors: a flat's representative colour as a PLAYPAL index, cached per flat lump.
+   Doom flats are always 64x64 = 4096 raw indices; histogram them (subsampled step 2) and pick
+   the dominant/average via R_PotatoRepColor -- far truer to the surface than the old arbitrary
+   centre texel (2080).  Master-only (R_DrawPlanes) -> the slave reads the cached short, no
+   cross-CPU compute.  Pure C, DoomJo-safe. */
+int R_FlatPotatoColor (int lumpnum)
+{
+    static short *cache = NULL;
+    static int    base = 0, count = 0;
+    int   hist[256];
+    byte *src;
+    int   i, fi;
+    if (!cache)
+    {
+	base = firstflat; count = numflats;
+	cache = Z_Malloc (count * (int)sizeof(short), PU_STATIC, 0);
+	for (i = 0; i < count; i++) cache[i] = -1;
+    }
+    fi = lumpnum - base;
+    if (fi < 0 || fi >= count) return 0;
+    if (cache[fi] >= 0) return cache[fi];
+    src = W_CacheLumpNum (lumpnum, PU_STATIC);
+    memset (hist, 0, sizeof hist);
+    for (i = 0; i < 4096; i += 2) hist[src[i]]++;
+    cache[fi] = (short) R_PotatoRepColor (hist);
+    return cache[fi];
+}
+
+/* SATURN Potato walls: the texture's representative palette index (DOMINANT by default, or
+   AVERAGE if SAT_POTATO_AVG, via R_PotatoRepColor), cached per texture, used as the wall's
+   single "continuous" colour (one hue for the whole wall, then light-shaded per column by the
+   colormap).  Subsampled (step 2) for cheapness; computed lazily on first use and cached.
+   sat_wall_color is the global the wall recorder reads (set per wall section in r_segs.c). */
 int sat_wall_color = 0;
 /* SATURN Potato walls: set per seg in r_segs.c = (the seg's linedef has a special).
    Interactive surfaces (doors, switches, ...) are special lines; keep them TEXTURED
@@ -418,7 +487,7 @@ int sat_wall_textured = 0;
 int R_WallPotatoColor (int tex)
 {
     static short *cache = NULL;
-    int   w, h, col, y, i, best, bestn;
+    int   w, h, col, y, i;
     int   hist[256];
     byte *p;
 
@@ -430,7 +499,7 @@ int R_WallPotatoColor (int tex)
     }
     if (cache[tex] >= 0) return cache[tex];
 
-    memset(hist, 0, sizeof hist);
+    memset (hist, 0, sizeof hist);
     w = texturewidthmask[tex] + 1;
     h = textureheight[tex] >> FRACBITS;
     for (col = 0; col < w; col += 2)
@@ -438,10 +507,8 @@ int R_WallPotatoColor (int tex)
 	p = R_GetColumn(tex, col);
 	for (y = 0; y < h; y += 2) hist[p[y]]++;
     }
-    best = 0; bestn = -1;
-    for (i = 0; i < 256; i++) if (hist[i] > bestn) { bestn = hist[i]; best = i; }
-    cache[tex] = (short)best;
-    return best;
+    cache[tex] = (short) R_PotatoRepColor (hist);
+    return cache[tex];
 }
 
 

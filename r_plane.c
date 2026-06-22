@@ -203,6 +203,10 @@ static int vp_map_bad,  vp_map_x1,  vp_map_x2, vp_map_y;
 /* SATURN: forward declaration -- the definition lives just above R_DrawPlanes,
    but R_MapPlane (which uses it for the step-2 generation skip) comes first. */
 extern int sat_potato_floors;
+/* SATURN Potato floors: the current flat's dominant/average colour (R_FlatPotatoColor,
+   r_data.c), set per-visplane in R_DrawPlanes; replaces the old centre-texel sample. */
+int sat_floor_color = 0;
+extern int R_FlatPotatoColor (int lumpnum);
 /* SATURN: framebuffer row/column lookup -- also externed below for R_DrawPlanes;
    hoisted here so R_MapPlane's inline Potato span memset can reach them. */
 extern byte *ylookup[];
@@ -335,7 +339,7 @@ R_MapPlane
 #define R_POTATO_TEXEL 2080   /* centre texel of a 64x64 flat (v32,u32); == r_parallel.c POTATO_TEXEL */
     if (sat_potato_floors)
     {
-	byte  c = ds_colormap[ds_source[R_POTATO_TEXEL]];
+	byte  c = ds_colormap[sat_floor_color];   /* flat dominant/average (R_FlatPotatoColor) */
 	byte *d;
 	if (detailshift)
 	{
@@ -637,7 +641,7 @@ R_MakeSpans
 #define SAT_PLANE_LOCAL 1
 #if SAT_PLANE_LOCAL
 static inline void R_PotatoSpan (int y, int x1, int x2, fixed_t plheight,
-                                 lighttable_t **plzlight, byte *src)
+                                 lighttable_t **plzlight, int color)
 {
     fixed_t       distance;
     unsigned      index;
@@ -658,7 +662,7 @@ static inline void R_PotatoSpan (int y, int x1, int x2, fixed_t plheight,
         cmap = plzlight[index];
     }
 
-    c = cmap[src[R_POTATO_TEXEL]];
+    c = cmap[color];   /* the flat's dominant/average colour (R_FlatPotatoColor), distance-shaded */
     if (detailshift)
     {
         d = ylookup[y] + columnofs[x1 << 1];
@@ -671,7 +675,7 @@ static inline void R_PotatoSpan (int y, int x1, int x2, fixed_t plheight,
     }
 }
 
-static void R_DrawVisplanePotato (visplane_t *pl, byte *src,
+static void R_DrawVisplanePotato (visplane_t *pl, int color,
                                   lighttable_t **plzlight, fixed_t plheight)
 {
     int spanstart_l[SCREENHEIGHT];   /* per-CPU, on the stack */
@@ -684,8 +688,8 @@ static void R_DrawVisplanePotato (visplane_t *pl, byte *src,
         int t1 = pl->top[x-1], b1 = pl->bottom[x-1];
         int t2 = pl->top[x],   b2 = pl->bottom[x];
 
-        while (t1 < t2 && t1 <= b1) { R_PotatoSpan (t1, spanstart_l[t1], x-1, plheight, plzlight, src); t1++; }
-        while (b1 > b2 && b1 >= t1) { R_PotatoSpan (b1, spanstart_l[b1], x-1, plheight, plzlight, src); b1--; }
+        while (t1 < t2 && t1 <= b1) { R_PotatoSpan (t1, spanstart_l[t1], x-1, plheight, plzlight, color); t1++; }
+        while (b1 > b2 && b1 >= t1) { R_PotatoSpan (b1, spanstart_l[b1], x-1, plheight, plzlight, color); b1--; }
         while (t2 < t1 && t2 <= b2) { spanstart_l[t2] = x; t2++; }
         while (b2 > b1 && b2 >= t2) { spanstart_l[b2] = x; b2--; }
     }
@@ -766,7 +770,7 @@ static void R_DrawVisplaneTextured (visplane_t *pl, byte *src,
    stack: there is no BSP recursion here).  Disjoint visplanes -> disjoint framebuffer (Doom
    has no plane overdraw), so the two halves are race-free. */
 typedef struct { visplane_t *pl; byte *src; lighttable_t **plzlight;
-                 fixed_t plheight; int potato, lumpnum; } planework_t;
+                 fixed_t plheight; int potato, lumpnum, color; } planework_t;
 planework_t plane_worklist[MAXVISPLANES];
 int         plane_worklist_n;
 /* master gate: 0 = old global record/parity path (DoomJo + the working baseline, byte-
@@ -783,7 +787,7 @@ void R_DrawPlaneWorklist (int from, int to)
     {
         planework_t *w = &plane_worklist[i];
         if (w->potato)
-            R_DrawVisplanePotato   (w->pl, w->src, w->plzlight, w->plheight);
+            R_DrawVisplanePotato   (w->pl, w->color, w->plzlight, w->plheight);
         else
             R_DrawVisplaneTextured (w->pl, w->src, w->plzlight, w->plheight);
     }
@@ -1028,6 +1032,7 @@ void R_DrawPlanes (void)
 
 	// regular flat
         lumpnum = firstflat + flattranslation[pl->picnum];
+	if (sat_potato_floors) sat_floor_color = R_FlatPotatoColor(lumpnum);  /* dominant/avg, cached */
 	RP_FlatCacheEnter();   /* SATURN PERF Phase-0a: per-visplane flat allocator cost (c P) */
 	ds_source = W_CacheLumpNum(lumpnum, PU_STATIC);
 	RP_FlatCacheLeave();
@@ -1062,6 +1067,7 @@ void R_DrawPlanes (void)
 	    planework_t *w = &plane_worklist[plane_worklist_n++];
 	    w->pl = pl; w->src = ds_source; w->plzlight = planezlight;
 	    w->plheight = planeheight; w->potato = sat_potato_floors; w->lumpnum = lumpnum;
+	    w->color = sat_floor_color;
 	    continue;
 	}
 #endif

@@ -290,6 +290,7 @@ void D_Display (void)
     if (gamestate == GS_LEVEL && !automapactive && gametic)
     {
 	extern int sat_split_active, sat_split_vdp1, sat_wall_skip, viewheight;
+	extern int detailshift, sat_split_lowdetail;
 	extern void R_SetViewWindow (int, int, int, int);
 	extern void (*sat_walls_done_hook)(void);
 	if (sat_local_players > 1)
@@ -304,8 +305,10 @@ void D_Display (void)
 	    int fh  = viewheight;
 	    int hw  = SCREENWIDTH / 2;
 	    int sws = sat_wall_skip;
+	    int sds = detailshift;                    /* low-detail (+ld modes) applies for both views */
 	    uint32_t ta, tb, tc, td, te, tf;   /* SATURN: split-block breakdown timers */
 	    sat_split_active = 1;
+	    detailshift = sat_split_lowdetail;        /* 0 = hi-detail (byte-identical); 1 = half-res */
 	    if (!sat_split_vdp1) sat_wall_skip = 0;   /* software walls (baseline); else keep on VDP1 */
 	    ta = d_ms();
 	    R_SetViewWindow (0,  0, hw, fh);  tb = d_ms();
@@ -316,6 +319,7 @@ void D_Display (void)
 	    tf = d_ms();
 	    sat_split_active = 0;
 	    sat_wall_skip    = sws;
+	    detailshift      = sds;
 	    sat_spl_sw   = (tb - ta) + (td - tc);   /* both R_SetViewWindow (size-table recompute) */
 	    sat_spl_v0   = tc - tb;                 /* R_RenderPlayerView view 0 */
 	    sat_spl_v1   = te - td;                 /* R_RenderPlayerView view 1 */
