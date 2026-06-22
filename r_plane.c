@@ -104,9 +104,11 @@ static byte *R_PoolSlice (void)
    the set vanilla scans.  Chain links are SHORT indices in BSS (fast high-WRAM),
    so the walk never pointer-chases the slow visplane struct except to compare the
    three key fields.  Gated for a hardware A/B (set 0 = original linear scan).
-   Pure C, DoomJo-safe, no new cross-CPU coherency surface (master-only generation). */
-#define SAT_VISPLANE_HASH 1
-#if SAT_VISPLANE_HASH
+   Pure C, DoomJo-safe, no new cross-CPU coherency surface (master-only generation).
+   SATURN PERF: a runtime int (was a compile-time #define) so DoomSRL can A/B the
+   hash vs the vanilla linear scan live on hardware via pad Y; DoomJo never toggles
+   it -> stays 1 -> byte-identical.  The hash machinery below is now always compiled. */
+int sat_visplane_hash = 1;
 #define VISPLANE_HASH_SIZE 128			/* power of two */
 #define VISPLANE_HASH_MASK (VISPLANE_HASH_SIZE-1)
 static short	visplane_hashhead[VISPLANE_HASH_SIZE];	/* first index in bucket, -1 = empty */
@@ -132,7 +134,6 @@ static void R_HashInsert (int bucket, int idx)
 	visplane_hashnext[visplane_hashtail[bucket]] = (short)idx;
     visplane_hashtail[bucket] = (short)idx;
 }
-#endif
 
 // ?
 #define MAXOPENINGS	SCREENWIDTH*64
@@ -402,11 +403,10 @@ void R_ClearPlanes (void)
     plane_pool_ptr = plane_pool;   /* bump-reset the span pool for the new frame */
 #endif
 
-#if SAT_VISPLANE_HASH
     /* SATURN PERF L1: empty every hash bucket for the new frame (0xff -> -1).
-       Only heads need clearing; a tail is read only once its head is set. */
+       Only heads need clearing; a tail is read only once its head is set.
+       Unconditional: a cheap 256-byte memset, harmless when the hash is toggled off. */
     memset (visplane_hashhead, 0xff, sizeof(visplane_hashhead));
-#endif
 
     // texture calculation
     memset (cachedheight, 0, sizeof(cachedheight));
@@ -432,10 +432,8 @@ R_FindPlane
   int		lightlevel )
 {
     visplane_t*	check;
-#if SAT_VISPLANE_HASH
-    int		bucket;
+    int		bucket = 0;   /* SATURN PERF L1: set in the hash path, read by its insert */
     int		idx;
-#endif
 
     if (picnum == skyflatnum)
     {
@@ -443,7 +441,8 @@ R_FindPlane
 	lightlevel = 0;
     }
 
-#if SAT_VISPLANE_HASH
+    if (sat_visplane_hash)
+    {
     /* SATURN PERF L1: scan only the planes of this key's bucket (FIFO chain ==
        array order, so the first match is vanilla's first match). */
     bucket = R_PlaneHash (height, picnum, lightlevel);
@@ -457,7 +456,9 @@ R_FindPlane
 	    return check;
 	}
     }
-#else
+    }
+    else
+    {
     for (check=visplanes; check<lastvisplane; check++)
     {
 	if (height == check->height
@@ -470,7 +471,7 @@ R_FindPlane
 
     if (check < lastvisplane)
 	return check;
-#endif
+    }
 
     if (lastvisplane - visplanes == MAXVISPLANES)
 	I_Error ("R_FindPlane: no more visplanes");
@@ -493,9 +494,8 @@ R_FindPlane
        Covers top[0..SCREENWIDTH-1]; the [minx-1]/[maxx+1] sentinels are set at draw. */
     memset (check->top,0xff,SCREENWIDTH);
 
-#if SAT_VISPLANE_HASH
-    R_HashInsert (bucket, (int)(check - visplanes));
-#endif
+    if (sat_visplane_hash)
+        R_HashInsert (bucket, (int)(check - visplanes));
 
     return check;
 }
@@ -582,12 +582,13 @@ R_CheckPlane
 #endif
     memset (pl->top,0xff,SCREENWIDTH);   /* explicit length (see R_FindPlane note) */
 
-#if SAT_VISPLANE_HASH
+    if (sat_visplane_hash)
+    {
     /* SATURN PERF L1: a split plane is scanned by vanilla R_FindPlane too, so it
        must join the hash (FIFO -> preserves first-match order). */
     R_HashInsert (R_PlaneHash (pl->height, pl->picnum, pl->lightlevel),
 		  (int)(pl - visplanes));
-#endif
+    }
 
     return pl;
 }
