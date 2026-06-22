@@ -1018,10 +1018,21 @@ static void R_SlaveDrawColumn (void)
 {
     int count = s_dc_yh - s_dc_yl + 1;
     byte *source = s_dc_source, *colormap = (byte *)s_dc_colormap;
-    byte *dest = ylookup[s_dc_yl] + columnofs[s_dc_x];
     unsigned fracstep = s_dc_iscale<<9;
     unsigned frac = (s_dc_texturemid + (s_dc_yl-centery)*s_dc_iscale)<<9;
-    while (count-- > 0) { *dest = colormap[source[frac>>25]]; dest += SCREENWIDTH; frac += fracstep; }
+    if (detailshift)   /* low-detail: s_dc_x is the HALVED column -> pixel-double into 2 screen px */
+    {
+	int sx = s_dc_x << 1;
+	byte *d0 = ylookup[s_dc_yl] + columnofs[sx];
+	byte *d1 = ylookup[s_dc_yl] + columnofs[sx+1];
+	while (count-- > 0) { byte c = colormap[source[frac>>25]]; *d0 = c; *d1 = c;
+			      d0 += SCREENWIDTH; d1 += SCREENWIDTH; frac += fracstep; }
+    }
+    else
+    {
+	byte *dest = ylookup[s_dc_yl] + columnofs[s_dc_x];
+	while (count-- > 0) { *dest = colormap[source[frac>>25]]; dest += SCREENWIDTH; frac += fracstep; }
+    }
 }
 
 static void R_SlaveFuzzColumn (void)
@@ -1031,6 +1042,19 @@ static void R_SlaveFuzzColumn (void)
     if (s_dc_yh == viewheight-1) s_dc_yh = viewheight - 2;
     count = s_dc_yh - s_dc_yl;
     if (count < 0) return;
+    if (detailshift)   /* low-detail: pixel-double the fuzz into the 2 screen columns */
+    {
+	int sx = s_dc_x << 1;
+	byte *d0 = ylookup[s_dc_yl] + columnofs[sx];
+	byte *d1 = ylookup[s_dc_yl] + columnofs[sx+1];
+	do {
+	    *d0 = colormaps[6*256+d0[fuzzoffset[s_fuzzpos]]];
+	    *d1 = colormaps[6*256+d1[fuzzoffset[s_fuzzpos]]];
+	    if (++s_fuzzpos == FUZZTABLE) s_fuzzpos = 0;
+	    d0 += SCREENWIDTH; d1 += SCREENWIDTH;
+	} while (count--);
+	return;
+    }
     dest = ylookup[s_dc_yl] + columnofs[s_dc_x];
     do {
         *dest = colormaps[6*256+dest[fuzzoffset[s_fuzzpos]]];
