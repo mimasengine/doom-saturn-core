@@ -45,6 +45,15 @@ void ST_Ticker (void);
 // Called by main loop.
 void ST_Drawer (boolean fullscreen, boolean refresh);
 
+// SATURN 2-player split: draw one player's compact HUD widgets at block
+// origin (ox,oy).  Called by the platform per viewport (see hud2p_layout.h).
+void ST_DrawCompactWidgets (int pnum, int ox, int oy);
+
+// SATURN 2-player split: PLAYPAL flash index for players[pnum] (0 = none;
+// red 1..8; gold 9..12; radiation 13).  The platform applies it as a per-half
+// software wash (the shared hardware palette can't flash one viewport alone).
+int ST_PlayerPaletteIndex (int pnum);
+
 // Called when the console player is spawned on each level.
 void ST_Start (void);
 

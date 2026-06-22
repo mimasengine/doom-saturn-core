@@ -71,6 +71,12 @@ typedef struct
 fixed_t		pspritescale;
 fixed_t		pspriteiscale;
 
+/* SATURN 2-player split: shift the player weapon DOWN by this many screen pixels
+   (the half-size split gun is anchored to the 200-line BASEYCENTER and otherwise
+   floats high above the shortened view).  0 = no shift (1p / DoomJo unchanged);
+   the split path sets it so the gun bottom sits on the view bottom (row 160). */
+int		sat_psprite_yoff = 0;
+
 /* SATURN: platform hooks to draw the player sprites (weapon / muzzle flash) on
    VDP1 instead of the software framebuffer.  NULL on DoomJo and when unused ->
    the normal R_DrawVisSprite software path runs.  sat_psprite_begin is called
@@ -707,9 +713,12 @@ void R_DrawPSprite (pspdef_t* psp)
     vis->mobjflags = 0;
     vis->texturemid = (BASEYCENTER<<FRACBITS)+FRACUNIT/2-(psp->sy-spritetopoffset[lump]);
     vis->x1 = x1 < 0 ? 0 : x1;
-    vis->x2 = x2 >= viewwidth ? viewwidth-1 : x2;	
+    vis->x2 = x2 >= viewwidth ? viewwidth-1 : x2;
     vis->scale = pspritescale<<detailshift;
-    
+    /* SATURN: drop the weapon by sat_psprite_yoff screen px (2-player split). */
+    if (sat_psprite_yoff)
+	vis->texturemid -= FixedDiv(sat_psprite_yoff << FRACBITS, vis->scale);
+
     if (flip)
     {
 	vis->xiscale = -pspriteiscale;

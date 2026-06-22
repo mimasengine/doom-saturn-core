@@ -54,6 +54,9 @@
 // State.
 #include "doomstat.h"
 
+#include "i_swap.h"        // SHORT() -- big-endian patch fields
+#include "hud2p_layout.h"  // SATURN 2-player compact-HUD field anchors (generated)
+
 // Data.
 #include "dstrings.h"
 #include "sounds.h"
@@ -945,6 +948,20 @@ void ST_doPaletteStuff(void)
     int		cnt;
     int		bzc;
 
+    // SATURN 2-player: the hardware palette is shared by both viewports, so the
+    // per-player damage/pickup flash is a per-half SOFTWARE wash done by the
+    // platform (ST_PlayerPaletteIndex).  Keep the shared palette at base here.
+    if (sat_local_players > 1)
+    {
+	if (st_palette != 0)
+	{
+	    st_palette = 0;
+	    pal = (byte *) W_CacheLumpNum (lu_palette, PU_CACHE);
+	    I_SetPalette (pal);
+	}
+	return;
+    }
+
     cnt = plyr->damagecount;
 
     if (plyr->powers[pw_strength])
@@ -1002,6 +1019,39 @@ void ST_doPaletteStuff(void)
 
 }
 
+// SATURN 2-player: the PLAYPAL flash index (0 = none; red 1..8; gold 9..12;
+// radiation 13) for players[pnum] -- identical logic to ST_doPaletteStuff but
+// per-player.  The platform turns this into a per-half software wash so each
+// viewport flashes independently (the shared hardware palette stays at base).
+int ST_PlayerPaletteIndex(int pnum)
+{
+    player_t*	p = &players[pnum];
+    int		cnt = p->damagecount;
+    int		palette;
+
+    if (p->powers[pw_strength])
+    {
+	int bzc = 12 - (p->powers[pw_strength]>>6);
+	if (bzc > cnt) cnt = bzc;
+    }
+
+    if (cnt)
+    {
+	palette = (cnt+7)>>3;
+	if (palette >= NUMREDPALS) palette = NUMREDPALS-1;
+	return palette + STARTREDPALS;
+    }
+    if (p->bonuscount)
+    {
+	palette = (p->bonuscount+7)>>3;
+	if (palette >= NUMBONUSPALS) palette = NUMBONUSPALS-1;
+	return palette + STARTBONUSPALS;
+    }
+    if (p->powers[pw_ironfeet] > 4*32 || (p->powers[pw_ironfeet]&8))
+	return RADIATIONPAL;
+    return 0;
+}
+
 void ST_drawWidgets(boolean refresh)
 {
     int		i;
@@ -1056,14 +1106,107 @@ void ST_diffDraw(void)
     ST_drawWidgets(false);
 }
 
+// -----------------------------------------------------------------------
+// SATURN 2-player split-screen: compact per-viewport HUD.
+// Draws one player's widgets at block origin (ox,oy) using the loaded patch
+// tables + V_DrawPatch directly -- NO backing-screen/diff (the platform
+// repaints the 160x64 panel under it every frame) and NO single-instance
+// global state, so it is safe to call once per player.  Anchors come from the
+// generated hud2p_layout.h.  Default-unused: only the DoomSRL split path calls
+// it, so DoomJo and 1-player are unaffected.
+// -----------------------------------------------------------------------
+
+// right-justified number at (x,y): x is the RIGHT edge, digits drawn leftward;
+// always draws at least the units digit (0 -> "0").
+static void hud2p_num(int x, int y, int num, int maxdigits, patch_t **font)
+{
+    int w = SHORT(font[0]->width);
+    if (num < 0) num = 0;
+    do
+    {
+        x -= w;
+        V_DrawPatch(x, y, font[num % 10]);
+        num /= 10;
+    } while (num && --maxdigits > 0);
+}
+
+// percent: digits right-justified ending at x, '%' glyph drawn at x.
+static void hud2p_percent(int x, int y, int num)
+{
+    V_DrawPatch(x, y, tallpercent);
+    hud2p_num(x, y, num, 3, tallnum);
+}
+
+// health-based face (no animation): more hurt -> more pained; 0 hp -> dead.
+static int hud2p_face(player_t *p)
+{
+    int h, painlevel;
+    if (p->health <= 0)
+        return ST_DEADFACE;
+    h = p->health;
+    if (h > 100) h = 100;
+    painlevel = ((100 - h) * ST_NUMPAINFACES) / 101;
+    if (painlevel >= ST_NUMPAINFACES) painlevel = ST_NUMPAINFACES - 1;
+    return painlevel * ST_FACESTRIDE + 1;   // +1 = neutral straight-ahead face
+}
+
+void ST_DrawCompactWidgets(int pnum, int ox, int oy)
+{
+    static const int ammorow[4] = { am_clip, am_shell, am_misl, am_cell }; // BULL/SHEL/RCKT/CELL
+    player_t *p = &players[pnum];
+    int i;
+
+    // ready-weapon ammo (skip fist/chainsaw: no ammo)
+    if (weaponinfo[p->readyweapon].ammo != am_noammo)
+        hud2p_num(ox + HUD2P_AMMO_X, oy + HUD2P_AMMO_Y,
+                  p->ammo[weaponinfo[p->readyweapon].ammo], 3, tallnum);
+
+    // health + armor
+    hud2p_percent(ox + HUD2P_HEALTH_X, oy + HUD2P_HEALTH_Y, p->health);
+    hud2p_percent(ox + HUD2P_ARMOR_X,  oy + HUD2P_ARMOR_Y,  p->armorpoints);
+
+    // face
+    V_DrawPatch(ox + HUD2P_FACE_X, oy + HUD2P_FACE_Y, faces[hud2p_face(p)]);
+
+    // weapons owned (arms 2x3 grid; weapons 2..7 = weaponowned index 1..6)
+    for (i = 0; i < 6; i++)
+        V_DrawPatch(ox + HUD2P_ARMS_X + (i % 3) * 12,
+                    oy + HUD2P_ARMS_Y + (i / 3) * 10,
+                    arms[i][p->weaponowned[i + 1] ? 1 : 0]);
+
+    // keys / cards (3 stacked; skull overrides the same-colour card)
+    for (i = 0; i < 3; i++)
+    {
+        int k = -1;
+        if (p->cards[i])     k = i;
+        if (p->cards[i + 3]) k = i + 3;
+        if (k >= 0)
+            V_DrawPatch(ox + HUD2P_CARDS_X, oy + HUD2P_CARDS_Y + i * 10, keys[k]);
+    }
+
+    // per-weapon ammo: current | maximum, 4 rows (BULL/SHEL/RCKT/CELL)
+    for (i = 0; i < 4; i++)
+    {
+        int at = ammorow[i];
+        int y  = oy + HUD2P_AMMOROW0_Y + i * 6;
+        hud2p_num(ox + HUD2P_AMMOCUR_X, y, p->ammo[at],    3, shortnum);
+        hud2p_num(ox + HUD2P_AMMOMAX_X, y, p->maxammo[at], 3, shortnum);
+    }
+}
+
 void ST_Drawer (boolean fullscreen, boolean refresh)
 {
   
     st_statusbaron = (!fullscreen) || automapactive;
     st_firsttime = st_firsttime || refresh;
 
-    // Do red-/gold-shifts from damage/items
+    // Do red-/gold-shifts from damage/items (forces base palette in 2-player)
     ST_doPaletteStuff();
+
+    // SATURN 2-player: the per-viewport compact HUD is drawn by the platform
+    // (ST_DrawCompactWidgets); the single 320-wide bar would be wrong here.
+    if (sat_local_players > 1)
+	return;
 
     // If just after ST_Start(), refresh all
     if (st_firsttime) ST_doRefresh();
