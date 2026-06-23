@@ -50,8 +50,15 @@ planefunction_t		ceilingfunc;
    R_InitPlanes (zone heap, low WRAM) so it doesn't count against the 1MB
    high WRAM BSS limit.  512 * 664B = 332KB of the 864KB zone heap; ~532KB
    remains for the game — sufficient for E1 shareware maps.
-   vpsort[] stays in BSS (512 * 4B = 2KB, harmless).                      */
+   vpsort[] stays in BSS (512 * 4B = 2KB, harmless).
+   SATURN streaming: DoomSRL overrides this to 256 via -DMAXVISPLANES in its
+   Makefile to reclaim ~166KB of the zone for big-WAD (Doom II) streaming, where
+   the per-level PU_STATIC floor + geometry must fit the 884KB zone with no cart.
+   256 is still 2x vanilla's 128; overflow -> clean I_Error (r_plane.c:476/567),
+   not corruption.  Core default stays 512 (DoomJo unchanged).               */
+#ifndef MAXVISPLANES
 #define MAXVISPLANES	512
+#endif
 static visplane_t	*visplanes;
 /* SATURN: peak visplane count per frame, exposed for the debug overlay. */
 int r_visplane_peak = 0;
@@ -74,7 +81,9 @@ visplane_t*		ceilingplane;
    (one pair per plane, plane count <= MAXVISPLANES) and gives NO memory saving yet
    (correctness A/B only).  Lower VP_POOL_PLANES, gated on r_visplane_peak telemetry,
    to realise the saving (overflow => I_Error, same hard-limit semantics as the pool). */
-#define VP_POOL_PLANES   MAXVISPLANES
+#ifndef VP_POOL_PLANES
+#define VP_POOL_PLANES   MAXVISPLANES   /* core default = no saving (safe). DoomSRL overrides via -DVP_POOL_PLANES=N in its Makefile to reclaim zone for big WADs; size to r_visplane_peak + margin. */
+#endif
 #define VP_SLICE_BYTES   (SCREENWIDTH + 2)
 static byte	*plane_pool;
 static byte	*plane_pool_ptr;
@@ -153,8 +162,12 @@ short			ceilingclip[SCREENWIDTH];
 // spanstart holds the start of a plane span
 // initialized to 0 at start
 //
-int			spanstart[SCREENHEIGHT];
-int			spanstop[SCREENHEIGHT];
+/* SATURN BUGFIX: [256] not [SCREENHEIGHT] -- indexed by pl->top/bottom (BYTE 0..255:
+   0xff sentinel + bottom==viewheight).  At [SCREENHEIGHT(224)] R_MakeSpans overran
+   these into adjacent BSS; the stack-local twins in R_DrawVisplane* smashed the
+   return address.  Sizing to the full byte range makes every index in-bounds. */
+int			spanstart[256];
+int			spanstop[256];
 
 //
 // texture mapping
@@ -679,7 +692,13 @@ static inline void R_PotatoSpan (int y, int x1, int x2, fixed_t plheight,
 static void R_DrawVisplanePotato (visplane_t *pl, int color,
                                   lighttable_t **plzlight, fixed_t plheight)
 {
-    int spanstart_l[SCREENHEIGHT];   /* per-CPU, on the stack */
+    int spanstart_l[256];   /* per-CPU, on the stack.  SATURN BUGFIX: [256] not
+                               [SCREENHEIGHT(224)] -- this is indexed by pl->top[x]/
+                               bottom[x] which are BYTE (0..255): the 0xff column
+                               sentinel and bottom==viewheight wrote past a [224]
+                               STACK array, smashing the saved return address ->
+                               master CPU exception on RETURN from the render (the
+                               Doom II MAP01 freeze).  256 covers the full byte range. */
     int x, stop = pl->maxx + 1;
 
     /* the R_MakeSpans walk, inline-drawing each completed span via R_PotatoSpan.
@@ -749,7 +768,13 @@ static inline void R_TexturedSpan (int y, int x1, int x2, fixed_t plheight,
 static void R_DrawVisplaneTextured (visplane_t *pl, byte *src,
                                     lighttable_t **plzlight, fixed_t plheight)
 {
-    int spanstart_l[SCREENHEIGHT];   /* per-CPU, on the stack */
+    int spanstart_l[256];   /* per-CPU, on the stack.  SATURN BUGFIX: [256] not
+                               [SCREENHEIGHT(224)] -- this is indexed by pl->top[x]/
+                               bottom[x] which are BYTE (0..255): the 0xff column
+                               sentinel and bottom==viewheight wrote past a [224]
+                               STACK array, smashing the saved return address ->
+                               master CPU exception on RETURN from the render (the
+                               Doom II MAP01 freeze).  256 covers the full byte range. */
     int x, stop = pl->maxx + 1;
 
     for (x = pl->minx; x <= stop; x++)

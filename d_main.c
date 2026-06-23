@@ -295,42 +295,48 @@ void D_Display (void)
 	extern void (*sat_walls_done_hook)(void);
 	if (sat_local_players > 1)
 	{
-	    /* SATURN split-screen (docs/MULTIPLAYER_PLAN.md): render each player into a half-width
-	       view.  sat_split_vdp1==0 => software-only walls (the A/B baseline); ==1 => walls stay
-	       on VDP1, accumulated across BOTH views and kicked ONCE here (the per-view kick in
-	       r_main.c is gated off by sat_split_active, so the platform offsets each quad by
-	       viewwindowx and clips to the view's x-range, then this single kick draws them all).
-	       Both views run sequentially on the master (a 2nd concurrent view overflows 2MB --
-	       docs/PARALLEL_REC_AUDIT.md); the slave still phase-splits each view. */
-	    /* SATURN 2p: the 3D view is 160px tall; the bottom 64px hold the two
-	       compact HUD blocks (160x64 each, docs/MULTIPLAYER_PLAN.md). */
-	    int fh  = SCREENHEIGHT - 64;
-	    int hw  = SCREENWIDTH / 2;
+	    /* SATURN split-screen (docs/MULTIPLAYER_PLAN.md): render each player into its own
+	       viewport.  2p = two 160x160 vertical halves with the compact HUD in the bottom 64px;
+	       3-4p = 160x112 quadrants (no HUD yet -- the 4p HUD is a later iteration).  Views render
+	       SEQUENTIALLY on the master (a concurrent 2nd renderer overflows 2MB -- docs/
+	       PARALLEL_REC_AUDIT.md); the slave still phase-splits each view.  VDP1 walls are kept for
+	       2p (accumulated across both views, kicked ONCE here); 3/4p force software walls. */
+	    int n    = sat_local_players; if (n > 4) n = 4;
+	    int twop = (n == 2);
+	    int hw   = SCREENWIDTH / 2;                                /* 160 */
+	    int fh   = twop ? (SCREENHEIGHT - 64) : (SCREENHEIGHT / 2);/* 2p:160  3/4p:112 */
+	    static const short vpx[4] = { 0, 160, 0,   160 };
+	    static const short vpy[4] = { 0, 0,   112, 112 };          /* y only used for 3/4p quadrants */
 	    int sws = sat_wall_skip;
-	    int sds = detailshift;                    /* low-detail (+ld modes) applies for both views */
-	    int sky_save = sat_vdp2_sky;              /* SATURN 2p: NBG0 can't serve two viewangles */
-	    uint32_t ta, tb, tc, td, te, tf;   /* SATURN: split-block breakdown timers */
+	    int sds = detailshift;                    /* low-detail (+ld modes) applies for all views */
+	    int sky_save = sat_vdp2_sky;              /* NBG0 can't serve N viewangles -> software sky */
+	    int vdp1 = twop && sat_split_vdp1;        /* VDP1 walls only in 2p for now; 3/4p = software */
+	    uint32_t ta = 0, tb = 0, tc = 0, td = 0;  /* split-block breakdown timers */
+	    int i;
 	    sat_split_active = 1;
 	    detailshift = sat_split_lowdetail;        /* 0 = hi-detail (byte-identical); 1 = half-res */
-	    sat_psprite_yoff = 30;                    /* drop the half-size gun to the view bottom (row 160); tune on HW */
+	    sat_psprite_yoff = fh / 2 - 50;           /* drop the half-size gun to the view bottom */
 	    sat_vdp2_sky = 0;                         /* force the SOFTWARE sky (each view draws its own) */
-	    if (!sat_split_vdp1) sat_wall_skip = 0;   /* software walls (baseline); else keep on VDP1 */
+	    if (!vdp1) sat_wall_skip = 0;             /* software walls (3/4p, or the 2p A/B baseline) */
 	    ta = d_ms();
-	    R_SetViewWindow (0,  0, hw, fh);  tb = d_ms();
-	    R_RenderPlayerView (&players[0]); tc = d_ms();
-	    R_SetViewWindow (hw, 0, hw, fh);  td = d_ms();
-	    R_RenderPlayerView (&players[1]); te = d_ms();
-	    if (sat_split_vdp1 && sat_walls_done_hook) sat_walls_done_hook (); /* single kick, both views */
-	    tf = d_ms();
+	    for (i = 0; i < n; i++)
+	    {
+		R_SetViewWindow (vpx[i], twop ? 0 : vpy[i], hw, fh);
+		R_RenderPlayerView (&players[i]);
+		if (i == 0) tb = d_ms();
+		else if (i == 1) tc = d_ms();
+	    }
+	    if (vdp1 && sat_walls_done_hook) sat_walls_done_hook (); /* single kick, both 2p views */
+	    td = d_ms();
 	    sat_split_active = 0;
 	    sat_wall_skip    = sws;
 	    detailshift      = sds;
 	    sat_psprite_yoff = 0;
 	    sat_vdp2_sky     = sky_save;
-	    sat_spl_sw   = (tb - ta) + (td - tc);   /* both R_SetViewWindow (size-table recompute) */
-	    sat_spl_v0   = tc - tb;                 /* R_RenderPlayerView view 0 */
-	    sat_spl_v1   = te - td;                 /* R_RenderPlayerView view 1 */
-	    sat_spl_kick = tf - te;                 /* the single VDP1 kick      */
+	    sat_spl_sw   = 0;
+	    sat_spl_v0   = tb - ta;        /* view 0 (incl. its R_SetViewWindow)         */
+	    sat_spl_v1   = tc - tb;        /* view 1 (2p: the right half; 4p: top-right)  */
+	    sat_spl_kick = td - tc;        /* remaining views + the VDP1 kick             */
 	}
 	else
 	    R_RenderPlayerView (&players[displayplayer]);

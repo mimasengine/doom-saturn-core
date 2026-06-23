@@ -1118,7 +1118,7 @@ R_StoreWallRange_impl
     {
 	memcpy (lastopening, floorclip+start, 2*(rw_stopx-start));
 	ds_p->sprbottomclip = lastopening - start;
-	lastopening += rw_stopx - start;	
+	lastopening += rw_stopx - start;
     }
 
     if (maskedtexture && !(ds_p->silhouette&SIL_TOP))

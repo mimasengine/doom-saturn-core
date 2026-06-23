@@ -737,6 +737,15 @@ static void P_LoadReject(int lumpnum)
     }
 }
 
+// SATURN streaming: set to 1 by the platform layer (dg_saturn.cxx) when the
+// IWAD is too big for the optional 4MB cart and is streamed from CD instead of
+// mapped.  In that mode every cached lump is COPIED into the 884KB LWRAM zone,
+// so we MUST NOT front-load all of a level's graphics via R_PrecacheLevel --
+// they stream lazily as self-purging PU_CACHE instead (the model shareware
+// already proves fits 884KB).  Defined here in the shared core so both ports
+// link (DoomJo leaves it 0 -> precache stays on, unchanged behaviour).
+int sat_streaming_mode = 0;
+
 //
 // P_SetupLevel
 //
@@ -832,7 +841,10 @@ P_SetupLevel
     //	UNUSED P_ConnectSubsectors ();
 
     // preload graphics
-    if (precache)
+    // SATURN: skip the up-front precache in CD-streaming mode -- it would copy
+    // ALL of a level's flats/patches/sprites into the small LWRAM zone at once
+    // (overflow).  Lazy on-demand PU_CACHE streaming is used instead.
+    if (precache && !sat_streaming_mode)
 	R_PrecacheLevel ();
 
     //printf ("free memory: 0x%x\n", Z_FreeMemory());
