@@ -72,6 +72,7 @@ extern unsigned int W_LumpNameHash(const char *s);
 
 void    W_ReleaseLumpNum(int lump);
 void    W_ReleaseLumpName(char *name);
+boolean W_PtrIsMapped(const void *p);   // SATURN: p is a memory-mapped (cart) lump?
 
 void W_CheckCorrectIWAD(GameMission_t mission);
 

@@ -824,10 +824,19 @@ P_SetupLevel
     }
 
     lumpnum = W_GetNumForName (lumpname);
-	
+
     leveltime = 0;
-	
-    // note: most of this ordering is important	
+
+#ifdef SAT_REPACK
+    // SATURN per-level repack (STREAMING_ANALYSIS.md §7.4/7.9-7.11): point the .DRP
+    // loader at this map's blob BEFORE its lumps page in (no-op without a valid .DRP).
+    {
+        extern void sat_drp_select_map(const char *lumpname);
+        sat_drp_select_map (lumpname);
+    }
+#endif
+
+    // note: most of this ordering is important
     P_LoadBlockMap (lumpnum+ML_BLOCKMAP);
     P_LoadVertexes (lumpnum+ML_VERTEXES);
     P_LoadSectors (lumpnum+ML_SECTORS);

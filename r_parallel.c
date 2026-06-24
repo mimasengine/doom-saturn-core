@@ -1393,6 +1393,62 @@ void RP_BeginMasked(void)
     SYNC->masked_at=rec_count;
 }
 
+/* SATURN PERF (2026-06-24): windowed REC min/avg/max + the CONTEXT of the worst
+   frame, so a single overlay photo is meaningful no matter when it is snapped (the
+   instantaneous Bw/Bp/P/M flicker every frame -> impossible to catch the peak).  All
+   REC fields are tenths-of-ms; map/x/y/ang/t = the player's render pose at the REC max
+   (= where/when to walk back to).  The platform resets the window (RP_ProfReset) when
+   the config under test changes (map / potato / hash / blit).  Defined unconditionally
+   so the platform extern links with RP_PROF off (they then stay 0). */
+/* Windowed REC distribution via a bucketed histogram (-> p50/p95, robust to the single-
+   outlier max and to an arbitrary threshold) + per-PHASE independent peaks (each phase's
+   own worst across the window -- Bp and P do NOT peak on the same frame, so this is the
+   right basis to size an offload) + the REC-max LOCATOR (map/x/y/ang/leveltime).  All
+   defined unconditionally so the platform links them with RP_PROF off (then 0). */
+#define RP_HBUCKETS  64
+#define RP_HBWIDTH   20            /* tenths-ms per bucket = 2.0 ms; histogram covers 0..128 ms */
+#define RP_REC_SANE  3000          /* tenths-ms (300 ms): frames above this = transition/glitch
+                                      (a stale FRT phase mark -> wrapped delta -> bogus 400-650ms
+                                      REC with an impossible M + out-of-bounds MX); dropped. */
+int sat_prof_rec_max=0;            /* window max (= p100), tenths-ms */
+int sat_prof_dropped=0;            /* glitch/transition frames excluded from the window */
+int sat_prof_pk_bw=0, sat_prof_pk_bp=0, sat_prof_pk_p=0, sat_prof_pk_m=0;  /* per-phase peaks */
+int sat_prof_mx_map=0, sat_prof_mx_x=0, sat_prof_mx_y=0, sat_prof_mx_ang=0, sat_prof_mx_t=0;
+int sat_prof_dom_pct=0, sat_prof_plane_n=0;   /* RBG0-floor sizer: dominant-flat pixel share + visplane count */
+#if RP_PROF
+static unsigned int prof_w_recmax=0, prof_w_recn=0;
+static unsigned int prof_hist[RP_HBUCKETS];
+extern fixed_t viewx, viewy;
+extern angle_t viewangle;
+extern int     gamemap, leveltime;
+#endif
+/* Reset the windowed stats (the platform calls it when the variable under test changes).
+   Unconditional body so DoomSRL links it even with RP_PROF off. */
+void RP_ProfReset(void)
+{
+#if RP_PROF
+    int i; prof_w_recmax=0; prof_w_recn=0;
+    for (i=0;i<RP_HBUCKETS;i++) prof_hist[i]=0;
+#endif
+    sat_prof_rec_max=sat_prof_pk_bw=sat_prof_pk_bp=sat_prof_pk_p=sat_prof_pk_m=0;
+    sat_prof_mx_map=sat_prof_mx_x=sat_prof_mx_y=sat_prof_mx_ang=sat_prof_mx_t=0;
+    sat_prof_dom_pct=sat_prof_plane_n=0;
+    sat_prof_dropped=0;
+}
+/* Windowed REC percentile (pct 0..100) in tenths-ms, walked from the histogram (<=64
+   buckets, called 1/s by the platform -> cheap).  Returns 0 with RP_PROF off. */
+int RP_ProfPercentile(int pct)
+{
+#if RP_PROF
+    unsigned int target = prof_w_recn * (unsigned)pct / 100u, cum = 0; int i;
+    if (!prof_w_recn) return 0;
+    for (i = 0; i < RP_HBUCKETS; i++) { cum += prof_hist[i]; if (cum >= target) return i * RP_HBWIDTH; }
+    return (RP_HBUCKETS - 1) * RP_HBWIDTH;
+#else
+    (void)pct; return 0;
+#endif
+}
+
 #if RP_PROF
 /* P3 profiler readout (rows 18/20), used when the parity renderer is OFF (rp_disabled, the
    sat_plane_parallel config).  B = full BSP walk, P = plane phase (master half + the wait for
@@ -1417,9 +1473,38 @@ static void rp_p3_prof_show(void)
     unsigned int bp10 = prof_wallprep * 10u / 224u;
     unsigned int bw10 = (b10 > bp10) ? (b10 - bp10) : 0u;
     char p[44];
-    snprintf(p, sizeof p, "Bw%u.%u Bp%u.%u P%u.%u M%u.%u",
+    snprintf(p, sizeof p, "Bw%u.%u Bp%u.%u P%u.%u M%u.%u        ",
              bw10/10,bw10%10, bp10/10,bp10%10, p10/10,p10%10, m10/10,m10%10);
     dbg_print(0, 5, p);
+    /* SATURN PERF (2026-06-24): fold this frame into the window.  Per-PHASE peaks are
+       tracked INDEPENDENTLY (Bp and P do not peak on the same frame -> the right basis
+       to size each offload); the REC histogram feeds p50/p95 (RP_ProfPercentile); the
+       REC max also snapshots WHERE it happened (the MX locator).  All read on the
+       platform's 1/s overlay tick so the photo is stable.  GLITCH GUARD: a frame whose
+       FRT phase mark went stale (rp_active path / rp_disabled flip) yields a wrapped
+       delta -> a bogus >300ms REC (impossible M, out-of-bounds MX); drop it so the
+       peaks/max/histogram are not poisoned (Ymir shareware proved these are NOT CD
+       stalls -- they survive into resident mode -> a profiler artifact, now excluded). */
+    if (rend <= RP_REC_SANE) {
+        if (bw10 > (unsigned)sat_prof_pk_bw) sat_prof_pk_bw = (int)bw10;
+        if (bp10 > (unsigned)sat_prof_pk_bp) sat_prof_pk_bp = (int)bp10;
+        if (p10  > (unsigned)sat_prof_pk_p)  sat_prof_pk_p  = (int)p10;
+        if (m10  > (unsigned)sat_prof_pk_m)  sat_prof_pk_m  = (int)m10;
+        if (rend > prof_w_recmax) {
+            prof_w_recmax = rend;
+            sat_prof_mx_map=gamemap;
+            sat_prof_mx_x=(int)(viewx>>16); sat_prof_mx_y=(int)(viewy>>16);
+            sat_prof_mx_ang=(int)(viewangle>>24); sat_prof_mx_t=leveltime;
+        }
+        {
+            unsigned int bi = rend / RP_HBWIDTH;
+            if (bi >= RP_HBUCKETS) bi = RP_HBUCKETS - 1;
+            prof_hist[bi]++; prof_w_recn++;
+        }
+        sat_prof_rec_max = (int)prof_w_recmax;
+    } else {
+        sat_prof_dropped++;
+    }
     /* w = master idle waiting for the slave (master FRT): w~0 => the slave keeps up / balanced.
        idle% = the slave's idle share of the render: it works in P, sits idle in B+M -> this is
        the slack masked + wall-prep will fill (it should DROP as each phase is offloaded). */
@@ -1439,9 +1524,16 @@ static void rp_p3_prof_show(void)
         if (prof_floor_vq_int > prof_floor_vq_int_peak) prof_floor_vq_int_peak = prof_floor_vq_int;
         sat_floor_vq_cur  = (int)vsec;
         sat_floor_vq_peak = (int)prof_floor_vq_peak;
+        /* RBG0-floor sizer: the dominant single-flat share of plane pixels + visplane
+           count (sweet spot = high dom% + low n => one flat owns the floor -> RBG0). */
+        {
+            unsigned int dom = (prof_pp_cur_sum > prof_plane_dom) ? prof_pp_cur_sum : prof_plane_dom;
+            sat_prof_dom_pct = prof_plane_pix ? (int)(dom * 100u / prof_plane_pix) : 0;
+            sat_prof_plane_n = (int)prof_plane_n;
+        }
         snprintf(p, sizeof p, "FLAT Vs%u Vp%u Vi%u      ",
                  vsec, prof_floor_vq_peak, prof_floor_vq_int_peak);
-        (void)p;   /* FLAT (parked VDP1-floor telemetry) cut from overlay -- VDP1_FLOOR_PLAN.md */
+        (void)p;   /* FLAT string parked; Vs/Vp + dom%/n now surfaced by the platform (row 17) */
     }
 }
 #endif

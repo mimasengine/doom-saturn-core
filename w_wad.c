@@ -364,6 +364,16 @@ void W_ReadLump(unsigned int lump, void *dest)
         return;
     }
 
+#ifdef SAT_REPACK
+    /* SATURN per-level repack (STREAMING_ANALYSIS.md §7.4/7.9-7.11): if this lump is
+       in the current map's DOOMRP.DRP blob, read + LZSS-decode it from there.  Returns
+       1 = served; 0 = not in subset / no .DRP -> fall through to the full-WAD read. */
+    {
+        extern int sat_drp_read_lump(unsigned int lump, void *dest, int size);
+        if (sat_drp_read_lump(lump, dest, l->size)) { I_EndRead(); return; }
+    }
+#endif
+
     c = W_Read(l->wad_file, l->position, dest, l->size);
 
     if (c < l->size)
@@ -476,6 +486,29 @@ void W_ReleaseLumpNum(int lumpnum)
 void W_ReleaseLumpName(char *name)
 {
     W_ReleaseLumpNum(W_GetNumForName(name));
+}
+
+//
+// W_PtrIsMapped
+// True if `p` points inside a memory-mapped (cart) WAD region.  In SATURN cart mode
+// W_CacheLumpNum returns mapped cart pointers, NOT zone blocks, so they must never be
+// Z_Free'd (W_ReleaseLumpNum already no-ops them).  Z_Free uses this to turn a stray
+// free of a cached lump -- harmless in CD-streaming (the lump is a zone block) but a
+// "Z_Free without ZONEID" crash in cart mode -- into the correct no-op.  Inert when
+// nothing is mapped (CD-streaming, or a port that buffers the WAD).
+//
+boolean W_PtrIsMapped(const void *p)
+{
+    wad_file_t *wf;
+    const byte *m;
+
+    if (numlumps == 0 || p == NULL)
+        return false;
+    wf = lumpinfo[0].wad_file;
+    if (wf == NULL || wf->mapped == NULL)
+        return false;
+    m = (const byte *)wf->mapped;
+    return (const byte *)p >= m && (const byte *)p < m + wf->length;
 }
 
 #if 0

@@ -21,6 +21,11 @@
 #include "i_system.h"
 #include "doomtype.h"
 
+// SATURN: in cart mode W_CacheLumpNum returns memory-mapped (cart) lump pointers,
+// which are NOT zone blocks.  Z_Free/Z_Free2 use this to no-op a stray free of such
+// a lump instead of crashing ("Z_Free without ZONEID").  Inert when nothing mapped.
+extern boolean W_PtrIsMapped(const void *p);
+
 
 //
 // ZONE MEMORY ALLOCATION
@@ -127,12 +132,27 @@ void Z_Free (void* ptr)
 {
     memblock_t*		block;
     memblock_t*		other;
-	
+
+    // libc-style: Z_Free(NULL) is a no-op.  In SATURN cart mode W_CacheLumpNum returns
+    // a mapped pointer WITHOUT setting lump->cache, so lump->cache stays NULL -- a path
+    // that frees it (a real zone block in CD-streaming) must not crash on the NULL.
+    if (ptr == NULL)
+	return;
+
     block = (memblock_t *) ( (byte *)ptr - sizeof(memblock_t));
 
     if (block->id != ZONEID)
-	I_Error ("Z_Free: freed a pointer without ZONEID");
-		
+    {
+	// SATURN cart mode: a memory-mapped cart lump is not a zone block -- freeing
+	// it is a no-op (as W_ReleaseLumpNum already does for mapped lumps).
+	if (W_PtrIsMapped(ptr))
+	    return;
+	// DIAGNOSTIC: p=freed ptr, ra=caller return addr (-> build/DoomSRL.map),
+	// id/tag = block state (id=0 tag=0 => double-free; garbage id => non-zone ptr).
+	I_Error ("Z_Free bad p=%p ra=%p id=%08x tag=%d", ptr,
+	         __builtin_return_address(0), (unsigned)block->id, block->tag);
+    }
+
     if (block->tag != PU_FREE && block->user != NULL)
     {
     	// clear the user's mark
@@ -204,6 +224,12 @@ Z_Malloc
     // account for size of block header
     size += sizeof(memblock_t);
 
+    // SATURN DIAGNOSTIC: a bogus (negative / >zone) request size means a corrupt caller
+    // computation (e.g. the cart-launch "req -134218728").  Catch it AT THE SOURCE with
+    // the caller's return address (-> build/DoomSRL.map) instead of a confusing scan halt.
+    if (size <= 0 || (unsigned int)size > (unsigned int)mainzone->size)
+        I_Error ("Z_Malloc bad size=%i ra=%p", size, __builtin_return_address(0));
+
     int z_emergency = 0;   // SATURN: allow ONE re-anchored retry before declaring OOM
  z_retry_scan:
     // if there is a free block behind the rover,
@@ -251,7 +277,24 @@ Z_Malloc
                      size, Z_FreeMemory()>>10, Z_LargestAllocatable()>>10,
                      st>>10, lv>>10);
         }
-	
+
+        // SATURN: addr-0 is a readable cached mirror on SH-2, so a NULL / out-of-zone
+        // scan pointer is NOT trapped -- the loop would read ROM garbage as a purgeable
+        // tag and Z_Free(rover+0x18) (the "Z_Free bad p=0x18" crash).  Catch a wild rover
+        // BEFORE dereferencing rover->tag: re-anchor at the list head and rescan ONCE
+        // (recovers a transient walk-off), else halt cleanly instead of wild-freeing.
+        if ((byte *)rover < (byte *)mainzone ||
+            (byte *)rover >= (byte *)mainzone + mainzone->size)
+        {
+            if (!z_emergency)
+            {
+                z_emergency = 1;
+                mainzone->rover = mainzone->blocklist.next;
+                goto z_retry_scan;
+            }
+            I_Error ("Z_Malloc: corrupt zone scan rover=%p (req %i)", rover, size);
+        }
+
         if (rover->tag != PU_FREE)
         {
             if (rover->tag < PU_PURGELEVEL)
@@ -652,10 +695,18 @@ void Z_Free2 (void *zoneptr, void *ptr)
     memzone_t  *zone = (memzone_t *)zoneptr;
     memblock_t *block, *other;
 
+    if (ptr == NULL)            // libc-style no-op (see Z_Free)
+        return;
+
     block = (memblock_t *)((byte *)ptr - sizeof(memblock_t));
 
     if (block->id != ZONEID)
-        I_Error ("Z_Free2: freed a pointer without ZONEID");
+    {
+        if (W_PtrIsMapped(ptr))     // SATURN: mapped cart lump, not a zone block -> no-op
+            return;
+        I_Error ("Z_Free2 bad p=%p ra=%p id=%08x tag=%d", ptr,
+                 __builtin_return_address(0), (unsigned)block->id, block->tag);
+    }
 
     if (block->tag != PU_FREE && block->user != NULL)
         *block->user = 0;
