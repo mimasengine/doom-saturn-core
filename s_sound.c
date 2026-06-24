@@ -38,6 +38,19 @@
 #include "w_wad.h"
 #include "z_zone.h"
 
+// SATURN: music backend selector, set by the platform I_InitSound at boot.
+//   1 = CDDA (Red Book audio): only when the WAD is fully resident (cart/small WAD,
+//       so the CD drive is free during play) AND the disc has audio tracks.
+//   0 = MUS/SCSP software synth (the fallback): needs no CD, so it plays during
+//       big-WAD CD streaming where the drive is busy.
+// Mirrors the sat_streaming_mode platform-global pattern; defined here in shared
+// core so both ports link it (DoomJo leaves it 0 = MUS).
+// NOTE: the music->data lump (below) stays PU_STATIC for BOTH backends -- the synth
+// reads it every frame (must be resident), and CDDA only runs with the WAD already
+// resident so freeing ~22-65K there is pointless AND PU_CACHE would risk a purge-vs-
+// W_ReleaseLumpNum crash.  So the once-considered "free MUS in CDDA mode" is moot.
+int sat_music_use_cdda = 0;
+
 // when to clip out sounds
 // Does not fit the large outdoor areas.
 
@@ -388,6 +401,41 @@ static int S_AdjustSoundParams(mobj_t *listener, mobj_t *source,
     return (*vol > 0);
 }
 
+// SATURN: local split-screen has 2-4 listeners, but vanilla positions every sound
+// against ONE (players[consoleplayer]) -> sounds near player 2/3/4 but far from
+// player 1 attenuate to silence.  Evaluate the source against EVERY local player
+// (players[0..sat_local_players-1]) and keep the LOUDEST result, so a sound audible
+// to ANY viewport is heard (at that viewport's volume/pan).  Returns 0 if inaudible
+// to all local players.  Only called when sat_local_players>1 (single-player keeps
+// the exact vanilla single-listener path, so 1p / DoomJo are byte-identical).
+static int S_AdjustSoundParamsLocal(mobj_t *source, int *vol, int *sep)
+{
+    int n = sat_local_players;
+    int p, best_vol = -1, best_sep = NORM_SEP;
+
+    if (n > MAXPLAYERS) n = MAXPLAYERS;
+    for (p = 0; p < n; p++)
+    {
+        mobj_t *lis;
+        int v, s;
+        if (!playeringame[p] || players[p].mo == NULL) continue;
+        lis = players[p].mo;
+        if (source == lis)               // the sound is ON this player -> full, centred
+        {
+            v = snd_SfxVolume; s = NORM_SEP;
+        }
+        else if (!S_AdjustSoundParams(lis, source, &v, &s))
+        {
+            continue;                    // inaudible to this player
+        }
+        if (v > best_vol) { best_vol = v; best_sep = s; }
+    }
+    if (best_vol < 0) return 0;          // inaudible to every local player
+    *vol = best_vol;
+    *sep = best_sep;
+    return 1;
+}
+
 void S_StartSound(void *origin_p, int sfx_id)
 {
     sfxinfo_t *sfx;
@@ -427,7 +475,15 @@ void S_StartSound(void *origin_p, int sfx_id)
 
     // Check to see if it is audible,
     //  and if not, modify the params
-    if (origin && origin != players[consoleplayer].mo)
+    if (sat_local_players > 1 && origin)
+    {
+        // SATURN split-screen: hear a sound near ANY local player (loudest wins).
+        if (!S_AdjustSoundParamsLocal(origin, &volume, &sep))
+        {
+            return;
+        }
+    }
+    else if (origin && origin != players[consoleplayer].mo)
     {
         rc = S_AdjustSoundParams(players[consoleplayer].mo,
                                  origin,
@@ -436,7 +492,7 @@ void S_StartSound(void *origin_p, int sfx_id)
 
         if (origin->x == players[consoleplayer].mo->x
          && origin->y == players[consoleplayer].mo->y)
-        {        
+        {
             sep = NORM_SEP;
         }
 
@@ -444,7 +500,7 @@ void S_StartSound(void *origin_p, int sfx_id)
         {
             return;
         }
-    }        
+    }
     else
     {
         sep = NORM_SEP;
@@ -541,13 +597,18 @@ void S_UpdateSounds(mobj_t *listener)
 
                 // check non-local sounds for distance clipping
                 //  or modify their params
-                if (c->origin && listener != c->origin)
+                if (c->origin && (sat_local_players > 1 || listener != c->origin))
                 {
-                    audible = S_AdjustSoundParams(listener,
-                                                  c->origin,
-                                                  &volume,
-                                                  &sep);
-                    
+                    // SATURN split-screen: re-evaluate against every local player
+                    // (loudest), not just the single passed listener.
+                    if (sat_local_players > 1)
+                        audible = S_AdjustSoundParamsLocal(c->origin, &volume, &sep);
+                    else
+                        audible = S_AdjustSoundParams(listener,
+                                                      c->origin,
+                                                      &volume,
+                                                      &sep);
+
                     if (!audible)
                     {
                         S_StopChannel(cnum);

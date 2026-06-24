@@ -203,7 +203,9 @@ Z_Malloc
 
     // account for size of block header
     size += sizeof(memblock_t);
-    
+
+    int z_emergency = 0;   // SATURN: allow ONE re-anchored retry before declaring OOM
+ z_retry_scan:
     // if there is a free block behind the rover,
     //  back up over them
     base = mainzone->rover;
@@ -218,6 +220,20 @@ Z_Malloc
     {
         if (rover == start)
         {
+            // SATURN: the rover anchor (mainzone->rover) can sit INSIDE the largest
+            // free run, so the scan reaches its own start sentinel before spanning
+            // that run -- a contiguous run that straddles the anchor is wrongly
+            // reported as OOM (the lg>=size paradox).  The first full scan also
+            // already purged every PU_CACHE block it walked and coalesced the frees,
+            // so re-anchoring at the list head and rescanning ONCE recovers a run the
+            // straddle hid.  Only a genuine exhaustion (no inter-wall free run >=
+            // size anywhere) falls through to the halt below.
+            if (!z_emergency)
+            {
+                z_emergency = 1;
+                mainzone->rover = mainzone->blocklist.next;
+                goto z_retry_scan;
+            }
             // Scanned the whole list with no fit.  Report the zone state in the
             // halt message itself (the overlay row is overwritten by the halt):
             //   fr = total reclaimable (free + purgeable)

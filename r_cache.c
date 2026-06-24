@@ -31,6 +31,15 @@
 #ifndef TEXCACHE_MIN
 #define TEXCACHE_MIN    (24*1024)    // below this the pool is not worth carving -> run cacheless
 #endif
+#ifndef TEXCACHE_FIXED
+#define TEXCACHE_FIXED  (96*1024)    // FIXED slab size (2p/4p).  Carving leftover-minus-MARGIN
+#endif                               //   grabbed almost all spare and left only a MARGIN-sized
+                                     //   free-tail, which the big ~35K sky/face patches + the
+                                     //   mid-play MUS lump fragmented below 35K -> contiguous-OOM.
+                                     //   A small FIXED slab leaves (leftover - FIXED) as ONE large
+                                     //   contiguous tail for those allocations (the boot-carve's
+                                     //   essential property, realizable per-level since the player
+                                     //   count is only known at level load, not at boot).
 
 #define TEXCACHE_MAGIC  0x7A436163   /* 'zCac' -- marks a managed cache block */
 
@@ -86,28 +95,33 @@ void R_SetupTextureCaches (void)
 
     R_ClearTextureCaches ();          // drop any prior pool (no-op the first time)
 
-    // CD-streaming only (the cache helps the big-WAD streaming working set).  Now
-    // ALSO active in local split-screen: with the visplane pool freeing the floor,
-    // the contiguous slab is what FIXES the 2p composite-fragmentation OOM and
-    // amortizes the CD reads behind the room-change stutters.  Per-view aging is
-    // fine at 2 views (a composite seen by EITHER player is re-touched and
-    // survives); 3-4p would want once-per-frame aging.  The alloc path still gates
-    // on sat_xsplit so the slave never mutates the zone during a parallel pass.
-    if (!sat_streaming_mode)
+    // CD-streaming, SPLIT-SCREEN ONLY (2p/4p).  The slab is a ~150K PU_STATIC
+    // reservation AND a mid-zone wall: in 1p it STARVES the general PU_CACHE
+    // (sprites/flats stream lazily) and fragments the zone -> measured WORSE than
+    // cacheless (zone-change stutter + the 35K sky/face-patch contiguous-OOM).  So
+    // 1p streaming runs cacheless (the proven-playable baseline; composites are the
+    // cheaper, not the binding, working set in 1p).  Split-screen genuinely needs
+    // it: 2-4 viewports reference disjoint texture sets whose interleaved purgeable
+    // composites fragment the heap -> the contiguous slab segregates them and FIXES
+    // the 2p composite-fragmentation OOM.  Per-view aging is fine at 2 views (a
+    // composite seen by EITHER player is re-touched); 3-4p would want once-per-frame
+    // aging.  The alloc path still gates on sat_xsplit.  DoomJo (sat_streaming_mode
+    // == 0) is unaffected.
+    if (!sat_streaming_mode || sat_local_players <= 1)
         return;
 
-    // Size the slab against the largest run Z_Malloc could actually hand out -- free
-    // PLUS purgeable (Z_Malloc purges PU_CACHE to make room).  NOT Z_LargestFreeBlock,
-    // which counts only PU_FREE: at level-start the zone is full of just-loaded
-    // PU_CACHE graphics, so it read ~10K (overlay lf10K) and the carve ALWAYS bailed,
-    // even though ~232K (overlay ZON mx) was reclaimable.  This is what kept TXC a0.
+    // FIXED-size slab.  `largest` = the run Z_Malloc could hand out after purging
+    // PU_CACHE (Z_LargestAllocatable, not Z_LargestFreeBlock which counts only the
+    // tiny PU_FREE runs at level start and kept TXC a0).  Carve a small FIXED slab
+    // ONLY IF a >=MARGIN contiguous tail still remains after it -- that tail is what
+    // serves the big ~35K sky/face patches + the mid-play MUS lump; sizing the slab to
+    // leftover-minus-MARGIN shrank that tail to MARGIN and fragmented it below 35K
+    // (the contiguous-run OOM).  Below the threshold the tightest maps run cacheless.
     largest = Z_LargestAllocatable ();
     sat_texcache_carve_lf = largest >> 10;   // diag: the run the carve saw (overlay TXC lf)
-    sz = largest - TEXCACHE_MARGIN;   // leave headroom for runtime PU_CACHE allocations
-    if (sz < TEXCACHE_MIN)
-        return;                       // too little spare -> run cacheless (classic behaviour)
-    if (sz > TEXCACHE_MAX)
-        sz = TEXCACHE_MAX;
+    sz = TEXCACHE_FIXED;
+    if (largest < sz + TEXCACHE_MARGIN)
+        return;                       // can't keep both the slab and a play tail -> cacheless
 
     texcache_slab = Z_Malloc (sz, PU_STATIC, NULL);  // non-purgable; we own its lifetime
     texcache_zone = Z_InitZone (texcache_slab, sz);

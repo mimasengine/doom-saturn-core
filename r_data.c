@@ -851,6 +851,10 @@ void R_InitColormaps (void)
         memcpy(saturn_cmap, colormaps, sz);
         colormaps = saturn_cmap;
     }
+    /* SATURN: the lump was copied to high-WRAM BSS above and `colormaps` now points
+       there, so the original PU_STATIC zone copy is dead.  Release it (-> PU_CACHE,
+       reclaimable) instead of leaking ~8.7K pinned for the whole session. */
+    W_ReleaseLumpNum(lump);
 }
 
 
