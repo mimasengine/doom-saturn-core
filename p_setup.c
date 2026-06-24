@@ -39,6 +39,7 @@
 #include "s_sound.h"
 
 #include "doomstat.h"
+#include "r_cache.h"
 
 
 void	P_SpawnMapThing (mapthing_t*	mthing);
@@ -709,10 +710,30 @@ static void PadRejectArray(byte *array, unsigned int len)
     }
 }
 
+extern int sat_streaming_mode;   // defined below; CD-streaming (big-WAD) path
+
 static void P_LoadReject(int lumpnum)
 {
     int minlength;
     int lumplen;
+
+#ifndef SAT_KEEP_REJECT
+    /* SATURN streaming (DEFAULT; build with -DSAT_KEEP_REJECT=1 to force-keep):
+       the REJECT matrix is numsectors^2/8 bytes -- 45-125 KB of PU_LEVEL on big
+       Doom II maps, the largest LATE level-load alloc (a fragmentation-OOM magnet,
+       e.g. the "Z_Malloc fail 68192" freeze).  It is PURELY a P_CheckSight early-
+       out optimization: a NULL rejectmatrix just makes sight checks do the full
+       LOS test (a bit more CPU, imperceptible at Saturn frame rates -- see the
+       NULL guard in p_sight.c P_CheckSight).  In the tight CD-streaming zone that
+       45-125 KB matters far more than the sight-check speedup, so skip it.  Non-
+       streaming (shareware/cart; DoomJo always has sat_streaming_mode==0) keeps
+       the matrix unchanged. */
+    if (sat_streaming_mode)
+    {
+        rejectmatrix = NULL;
+        return;
+    }
+#endif
 
     // Calculate the size that the REJECT lump *should* be.
 
@@ -776,6 +797,11 @@ P_SetupLevel
     S_Start ();			
 
     Z_FreeTags (PU_LEVEL, PU_PURGELEVEL-1);
+
+    // SATURN: free the previous level's bounded texture-cache pool (a PU_STATIC
+    // slab that survives Z_FreeTags) and drop its composite back-pointers BEFORE
+    // this level's geometry loads, so geometry gets the full free zone.
+    R_ClearTextureCaches ();
 
     // UNUSED W_Profile ();
     P_InitThinkers ();
@@ -846,6 +872,11 @@ P_SetupLevel
     // (overflow).  Lazy on-demand PU_CACHE streaming is used instead.
     if (precache && !sat_streaming_mode)
 	R_PrecacheLevel ();
+
+    // SATURN: carve the bounded streaming texture-cache pool from whatever
+    // contiguous zone RAM is left after this level's geometry (no-op unless
+    // sat_streaming_mode).  Done last so geometry never competes with the pool.
+    R_SetupTextureCaches ();
 
     //printf ("free memory: 0x%x\n", Z_FreeMemory());
 

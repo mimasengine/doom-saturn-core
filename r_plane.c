@@ -69,6 +69,10 @@ int r_visplane_peak = 0;
 int r_visplane_coverage_peak = 0;
 /* high-water BYTES of the #1 span pool (0 when SAT_VISPLANE_POOL is off) */
 int r_visplane_pool_peak = 0;
+/* SATURN: planes that overflowed VP_POOL_PLANES this frame -> handed a SHARED
+   fallback slice (harmless span glitch, NOT a crash).  If this is ever non-zero
+   on a scene you care about, raise VP_POOL_PLANES.  (On the overlay.) */
+int r_visplane_pool_ovf = 0;
 visplane_t*		lastvisplane;
 visplane_t*		floorplane;
 visplane_t*		ceilingplane;
@@ -89,12 +93,21 @@ static byte	*plane_pool;
 static byte	*plane_pool_ptr;
 static byte	*plane_pool_end;
 
+static byte vp_fallback[VP_SLICE_BYTES];   /* shared slice handed out on overflow */
 static byte *R_PoolSlice (void)
 {
     byte *p = plane_pool_ptr;
     int   used;
     if (p + VP_SLICE_BYTES > plane_pool_end)
-	I_Error ("R_PoolSlice: visplane span pool exhausted");
+    {
+	/* SATURN: graceful overflow.  Hand out a shared fallback slice instead of
+	   halting; overflowing planes then share one (top+bottom) slice -> their
+	   spans glitch visually but the renderer never crashes.  Sized so this
+	   essentially never trips at normal visplane counts; bump VP_POOL_PLANES
+	   if r_visplane_pool_ovf shows up. */
+	r_visplane_pool_ovf++;
+	return vp_fallback + 1;
+    }
     plane_pool_ptr += VP_SLICE_BYTES;
     used = (int)(plane_pool_ptr - plane_pool);
     if (used > r_visplane_pool_peak)
@@ -217,6 +230,10 @@ static int vp_map_bad,  vp_map_x1,  vp_map_x2, vp_map_y;
 /* SATURN: forward declaration -- the definition lives just above R_DrawPlanes,
    but R_MapPlane (which uses it for the step-2 generation skip) comes first. */
 extern int sat_potato_floors;
+/* SATURN pot0.5: low-detail TEXTURED floors -- the textured span fill samples 1 texel
+   per 2 screen px (full screen width, walls untouched, UNLIKE global detailshift which
+   halves the whole render geometry).  Set by the platform (pot0.5 mode); 0 = full-rate. */
+extern int sat_floor_ld;
 /* SATURN Potato floors: the current flat's dominant/average colour (R_FlatPotatoColor,
    r_data.c), set per-visplane in R_DrawPlanes; replaces the old centre-texel sample. */
 int sat_floor_color = 0;
@@ -414,6 +431,7 @@ void R_ClearPlanes (void)
     lastopening = openings;
 #if SAT_VISPLANE_POOL
     plane_pool_ptr = plane_pool;   /* bump-reset the span pool for the new frame */
+    r_visplane_pool_ovf = 0;
 #endif
 
     /* SATURN PERF L1: empty every hash bucket for the new frame (0xff -> -1).
@@ -756,6 +774,23 @@ static inline void R_TexturedSpan (int y, int x1, int x2, fixed_t plheight,
     step     = ((xstep << 10) & 0xffff0000) | ((ystep >> 6) & 0x0000ffff);
     dest = ylookup[y] + columnofs[x1];
     count = x2 - x1;
+
+    if (sat_floor_ld)   /* pot0.5: low-detail floors -- 1 texel fetch per 2 screen px */
+    {
+        step <<= 1;     /* advance two source steps between fetches */
+        do {
+            byte t;
+            ytemp = (position >> 4) & 0x0fc0;
+            xtemp = (position >> 26);
+            spot  = xtemp | ytemp;
+            t = cmap[src[spot]];
+            *dest++ = t;
+            if (count) { *dest++ = t; count--; }   /* paired px, guarding the odd tail */
+            position += step;
+        } while (count-- > 0);
+        return;
+    }
+
     do {
         ytemp = (position >> 4) & 0x0fc0;
         xtemp = (position >> 26);
@@ -838,6 +873,17 @@ int sat_frame_has_sky = 0;
    skip.  Ceilings (above the eye) still draw in software.  Default 0 => DoomJo and the
    normal build draw floors normally. */
 int sat_vdp2_floor = 0;
+
+/* SATURN (VDP1 floor, inc-1): deport SECONDARY floors/ceilings (every visplane reaching the
+   regular-flat path -- i.e. NOT sky, NOT the RBG0 dominant) to the VDP1 affine-strip layer.
+   When sat_vdp1_floor is set AND the platform hook claims a visplane (returns 1), R_DrawPlanes
+   leaves it index 0 (the VDP1 strips fill it below NBG1, like the walls) and skips the software
+   span draw.  Hook NULL / flag 0 on DoomJo + the normal build => unchanged software floors. */
+int sat_vdp1_floor = 0;
+int (*sat_floor_vdp1_hook)(int picnum, int height, int minx, int maxx,
+                           const unsigned char *top, const unsigned char *bottom,
+                           int lightlevel) = NULL;
+
 /* SATURN: the player's CURRENT floor (height + flat) -- the single floor RBG0 renders.
    Set each frame in R_DrawPlanes from the view sector.  The floor-skip leaves ONLY the
    visplanes matching BOTH (so coplanar same-flat floors are covered, other heights/flats
@@ -867,6 +913,7 @@ unsigned char *sat_vdp2_floor_data(void)
    colour instead of texture-mapping them (big EX/fillrate win).  Set by the
    platform; default 0 (vanilla textured floors, incl. DoomJo). */
 int sat_potato_floors = 0;
+int sat_floor_ld = 0;   /* pot0.5: half-rate textured-floor fill (forward-declared above) */
 /* SATURN: Potato walls -- opaque wall columns drawn as a single distance-shaded
    colour (a fixed texel), in rp_exec_col.  Sprites (masked RP_COL) stay textured.
    Default 0.  Aimed at the future 2/4-player split-screen builds (more views,
@@ -1082,6 +1129,39 @@ void R_DrawPlanes (void)
 	/* SATURN PERF (RBG0 candidate sizing, profiler): no-op unless RP_PROF. */
 	RP_PlanePixels(pl->picnum, (int)pl->height, pl->minx, pl->maxx,
 		       pl->top, pl->bottom);
+
+	/* SATURN (VDP1 floor, inc-1): the platform owns this secondary floor/ceiling on the VDP1
+	   affine-strip layer -> leave it index 0 (the strips fill it below NBG1, like the walls)
+	   and SKIP the software span draw.  Placed AFTER RP_PlanePixels so the inc-0 profiler still
+	   counts it; releases the flat lock it would otherwise leak.  Hook NULL / flag 0 on
+	   DoomJo + the normal build => unchanged. */
+	if (sat_vdp1_floor && sat_floor_vdp1_hook
+	    && sat_floor_vdp1_hook(pl->picnum, (int)pl->height, pl->minx, pl->maxx,
+				   pl->top, pl->bottom, pl->lightlevel))
+	{
+	    for (x = pl->minx ; x <= pl->maxx ; x++)
+	    {
+		int yl = pl->top[x];
+		int yh = pl->bottom[x];
+		int n;
+		if (yl > yh) continue;
+		n = yh - yl + 1;
+		if (detailshift)
+		{
+		    int sx = x << 1;
+		    byte *d0 = ylookup[yl] + columnofs[sx];
+		    byte *d1 = ylookup[yl] + columnofs[sx + 1];
+		    do { *d0 = 0; *d1 = 0; d0 += SCREENWIDTH; d1 += SCREENWIDTH; } while (--n);
+		}
+		else
+		{
+		    byte *d = ylookup[yl] + columnofs[x];
+		    do { *d = 0; d += SCREENWIDTH; } while (--n);
+		}
+	    }
+	    W_ReleaseLumpNum(lumpnum);   /* we cached it above but skip the draw -> release the lock */
+	    continue;
+	}
 
 #if SAT_PLANE_LOCAL
 	/* P3: QUEUE this regular flat (potato or textured high-detail) for the master+slave

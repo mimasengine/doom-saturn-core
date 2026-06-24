@@ -382,6 +382,14 @@ void R_DrawMaskedColumn (column_t* column)
 	if (dc_yl <= mceilingclip[dc_x])
 	    dc_yl = mceilingclip[dc_x]+1;
 
+	// SATURN: clamp to the (split-)viewport.  In 2p split a stale/garbage clip
+	// value (mfloorclip > viewheight) can drive dc_yh up to 255, which trips the
+	// master R_DrawColumn RANGECHECK -> I_Error (and the unguarded slave drawer
+	// writes OOB).  Skip-not-crash; byte-identical when the clips are valid
+	// (dc_yh < viewheight already, so the clamp never fires).
+	if (dc_yh >= viewheight) dc_yh = viewheight - 1;
+	if (dc_yl < 0)           dc_yl = 0;
+
 	if (dc_yl <= dc_yh)
 	{
 	    dc_source = (byte *)column + 3;
@@ -1084,6 +1092,8 @@ static void R_SlaveDrawMaskedColumn (column_t* column)
         s_dc_yh = (bottomscreen-1)>>FRACBITS;
         if (s_dc_yh >= s_mfloorclip[s_dc_x]) s_dc_yh = s_mfloorclip[s_dc_x]-1;
         if (s_dc_yl <= s_mceilingclip[s_dc_x]) s_dc_yl = s_mceilingclip[s_dc_x]+1;
+        if (s_dc_yh >= viewheight) s_dc_yh = viewheight - 1;  /* SATURN: clamp to viewport (see R_DrawMaskedColumn); slave drawer is unguarded */
+        if (s_dc_yl < 0)           s_dc_yl = 0;
         if (s_dc_yl <= s_dc_yh)
         {
             s_dc_source = (byte *)column + 3;

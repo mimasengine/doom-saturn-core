@@ -218,8 +218,22 @@ Z_Malloc
     {
         if (rover == start)
         {
-            // scanned all the way around the list
-            I_Error ("Z_Malloc: failed on allocation of %i bytes", size);
+            // Scanned the whole list with no fit.  Report the zone state in the
+            // halt message itself (the overlay row is overwritten by the halt):
+            //   fr = total reclaimable (free + purgeable)
+            //   lg = largest CONTIGUOUS run after purging  -> lg<size & fr>>size = FRAGMENTATION
+            //   st = unpurgeable PU_STATIC bytes, lv = PU_LEVEL bytes (the floor)  -> fr<size = EXHAUSTION
+            memblock_t* b;
+            int st = 0, lv = 0;
+            for (b = mainzone->blocklist.next ; b != &mainzone->blocklist ; b = b->next)
+            {
+                if (b->tag == PU_FREE || b->tag >= PU_PURGELEVEL)   continue;
+                else if (b->tag == PU_LEVEL || b->tag == PU_LEVSPEC) lv += b->size;
+                else                                                 st += b->size;
+            }
+            I_Error ("Z_Malloc fail %i (fr%dK lg%dK st%dK lv%dK)",
+                     size, Z_FreeMemory()>>10, Z_LargestAllocatable()>>10,
+                     st>>10, lv>>10);
         }
 	
         if (rover->tag != PU_FREE)
@@ -484,5 +498,217 @@ int Z_FreeMemory (void)
 unsigned int Z_ZoneSize(void)
 {
     return mainzone->size;
+}
+
+
+//
+// Z_LargestAllocatable
+// Largest CONTIGUOUS run the allocator could hand out right now if it purged
+// everything purgeable -- i.e. treats PU_FREE and tag>=PU_PURGELEVEL as
+// available, and an unpurgeable (PU_STATIC/PU_LEVEL) block as a wall that breaks
+// the run.  This is the real "could Z_Malloc(N) succeed" number: compare it to
+// the failing size to tell FRAGMENTATION (this is < N but Z_FreeMemory >> N)
+// from true EXHAUSTION (Z_FreeMemory itself < N).  O(blocks); call sparingly
+// (overlay rate), not on the hot path.
+//
+int Z_LargestAllocatable (void)
+{
+    memblock_t*	block;
+    int		run = 0;
+    int		largest = 0;
+
+    for (block = mainzone->blocklist.next ;
+         block != &mainzone->blocklist ;
+         block = block->next)
+    {
+        if (block->tag == PU_FREE || block->tag >= PU_PURGELEVEL)
+        {
+            run += block->size;
+            if (run > largest)
+                largest = run;
+        }
+        else
+            run = 0;   // unpurgeable block breaks the contiguous run
+    }
+
+    return largest;
+}
+
+
+//
+// SATURN multi-zone extensions
+// ----------------------------
+// A second, self-contained zone (same memblock_t/memzone_t layout) laid over a
+// caller-owned buffer.  Used by the bounded texture cache (core/r_cache.c) to
+// cap and recency-evict the streaming graphics working set.  These never touch
+// mainzone's allocator, so the normal Z_Malloc path is unchanged.
+//
+
+void *Z_MainZone (void)
+{
+    return (void *)mainzone;
+}
+
+//
+// Z_InitZone -- lay one empty free block over base[0..size).  Returns the handle.
+//
+void *Z_InitZone (void *base, int size)
+{
+    memzone_t  *zone = (memzone_t *)base;
+    memblock_t *block;
+
+    zone->size = size;
+    zone->blocklist.next =
+    zone->blocklist.prev =
+        block = (memblock_t *)((byte *)zone + sizeof(memzone_t));
+    zone->blocklist.user = (void *)zone;
+    zone->blocklist.tag  = PU_STATIC;
+    zone->rover = block;
+
+    block->prev = block->next = &zone->blocklist;
+    block->user = NULL;
+    block->id   = 0;
+    block->tag  = PU_FREE;
+    block->size = size - sizeof(memzone_t);
+
+    return (void *)zone;
+}
+
+//
+// Z_Malloc2 -- first-fit from an explicit zone, NO purging, NULL on OOM.
+// (The cache layer manages eviction itself via Z_Free2, so this never purges;
+//  returning NULL lets the caller evict-and-retry instead of I_Error'ing.)
+//
+void *Z_Malloc2 (void *zoneptr, int size, int tag)
+{
+    memzone_t  *zone = (memzone_t *)zoneptr;
+    int         extra;
+    memblock_t *start, *rover, *base, *newblock;
+
+    size = (size + MEM_ALIGN - 1) & ~(MEM_ALIGN - 1);
+    size += sizeof(memblock_t);
+
+    base = zone->rover;
+    if (base->prev->tag == PU_FREE)
+        base = base->prev;
+
+    rover = base;
+    start = base->prev;
+
+    do
+    {
+        if (rover == start)
+            return NULL;                  // wrapped the whole zone: no room
+
+        if (rover->tag != PU_FREE)
+            base = rover = rover->next;   // skip allocated block (no purge here)
+        else
+            rover = rover->next;
+    } while (base->tag != PU_FREE || base->size < size);
+
+    extra = base->size - size;
+    if (extra > MINFRAGMENT)
+    {
+        newblock = (memblock_t *)((byte *)base + size);
+        newblock->size = extra;
+        newblock->tag  = PU_FREE;
+        newblock->user = NULL;
+        newblock->prev = base;
+        newblock->next = base->next;
+        newblock->next->prev = newblock;
+        base->next = newblock;
+        base->size = size;
+    }
+
+    base->user = NULL;
+    base->tag  = tag;
+    base->id   = ZONEID;
+    zone->rover = base->next;
+
+    return (void *)((byte *)base + sizeof(memblock_t));
+}
+
+//
+// Z_Free2 -- free a block in an explicit zone (parameterized Z_Free).
+//
+void Z_Free2 (void *zoneptr, void *ptr)
+{
+    memzone_t  *zone = (memzone_t *)zoneptr;
+    memblock_t *block, *other;
+
+    block = (memblock_t *)((byte *)ptr - sizeof(memblock_t));
+
+    if (block->id != ZONEID)
+        I_Error ("Z_Free2: freed a pointer without ZONEID");
+
+    if (block->tag != PU_FREE && block->user != NULL)
+        *block->user = 0;
+
+    block->tag  = PU_FREE;
+    block->user = NULL;
+    block->id   = 0;
+
+    other = block->prev;
+    if (other->tag == PU_FREE)
+    {
+        other->size += block->size;
+        other->next  = block->next;
+        other->next->prev = other;
+        if (block == zone->rover)
+            zone->rover = other;
+        block = other;
+    }
+
+    other = block->next;
+    if (other->tag == PU_FREE)
+    {
+        block->size += other->size;
+        block->next  = other->next;
+        block->next->prev = block;
+        if (other == zone->rover)
+            zone->rover = block;
+    }
+}
+
+//
+// Z_LargestFreeBlock -- size (incl header) of the biggest free block in a zone.
+//
+int Z_LargestFreeBlock (void *zoneptr)
+{
+    memzone_t  *zone = (memzone_t *)zoneptr;
+    memblock_t *block;
+    int         largest = 0;
+
+    for (block = zone->blocklist.next ;
+         block != &zone->blocklist ;
+         block = block->next)
+    {
+        if (block->tag == PU_FREE && block->size > largest)
+            largest = block->size;
+    }
+    return largest;
+}
+
+//
+// Z_ForEachBlock -- invoke cb(payload, userp) for every ALLOCATED block.
+// `next` is captured before the callback so cb may Z_Free2 the CURRENT block.
+// Safe only because cb frees at most the current block: if that free forward-
+// coalesces the captured `next` away, `next`'s header bytes are left intact and
+// its tag stays PU_FREE (so the cb is skipped) with a still-valid forward link.
+// cb must NOT allocate from this zone during the walk (that could reuse a header).
+//
+void Z_ForEachBlock (void *zoneptr, Z_BlockIter cb, void *userp)
+{
+    memzone_t  *zone = (memzone_t *)zoneptr;
+    memblock_t *block, *next;
+
+    for (block = zone->blocklist.next ;
+         block != &zone->blocklist ;
+         block = next)
+    {
+        next = block->next;
+        if (block->tag != PU_FREE)
+            cb ((void *)((byte *)block + sizeof(memblock_t)), userp);
+    }
 }
 

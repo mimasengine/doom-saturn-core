@@ -921,6 +921,14 @@ void RP_WaitMasked(void)
    unconditionally so the platform's extern links even when RP_PROF is off. */
 unsigned int rp_master_ms = 0;
 
+/* SATURN (VDP1-floor inc-0): the floor-quad estimate surfaced to a VISIBLE overlay row.
+   Row 13 (FLAT) sits in the split-screen viewport band = unreadable, so the platform
+   also prints these on row 2.  cur = this frame's VDP1 candidate cost (Vs); peak =
+   monotonic worst case (the go/no-go number).  Defined unconditionally so the platform
+   extern links even when RP_PROF is off (they then stay 0). */
+int sat_floor_vq_cur  = 0;
+int sat_floor_vq_peak = 0;
+
 #if RP_PROF
 /* Read the SH-2 free-running timer (FRC @ 0xFFFFFE12/13).  Read H then L so the
    low byte is latched coherently. */
@@ -960,6 +968,26 @@ static unsigned int   prof_plane_n;
 static unsigned int   prof_pp_cur_sum;
 static int            prof_pp_cur_pic;
 static int            prof_pp_cur_h;
+/* SATURN (VDP1-floor inc-0): for each non-sky regular flat (= the surfaces that would
+   be deported to VDP1 affine strips -- other-height floors + ceilings; the RBG0 view-
+   sector floor is already `continue`d before RP_PlanePixels, so it is excluded), estimate
+   the would-be VDP1 DISTORSP command count.  Model = bbox-clamped horizontal strips
+   (the "overspill, masked by NBG1" approach): split the visplane's screen-y extent into
+   FLOOR_HBAND-row bands; each band's flat (64x64) wraps every 64 texels across the bbox
+   width -> tiles = u-span/64 + 1 quads.  vq = total; vq_dom = the pixel-dominant group's
+   quads (RBG0's, subtracted when sat_vdp2_floor is off); vq_peak = monotonic worst case
+   = the go/no-go number.  All compiled out unless RP_PROF. */
+static unsigned int   prof_pp_cur_vq;     /* current (picnum,height) group's VDP1-quad estimate */
+static unsigned int   prof_floor_vq;      /* this frame: total VDP1 floor/ceiling quad estimate */
+static unsigned int   prof_floor_vq_dom;  /* the pixel-dominant group's quads (RBG0 would take it) */
+static unsigned int   prof_floor_vq_peak; /* monotonic peak of the VDP1 candidate cost (go/no-go) */
+/* Q2 probe: quads for INTERIOR surfaces only -- those NOT touching their near screen edge (bottom
+   for a floor, top for a ceiling).  These are the bounded-depth patches (cheap + low-swim with
+   coarse bands); the near/edge surfaces (the expensive, swim-prone ones) would stay software/RBG0. */
+static unsigned int   prof_floor_vq_int;      /* this frame: interior-only quad estimate */
+static unsigned int   prof_floor_vq_int_peak; /* monotonic peak of the interior-only cost */
+#define FLOOR_HBAND    16   /* screen rows per affine strip band (the Mode-7 strip granularity) */
+#define FLOOR_MAXTILES 16   /* clamp on 64-texel u-tiles/band (the emitter would cap too) */
 #endif
 
 /* SATURN PERF 2.4 Stage 1: wall-prep timer, called by R_StoreWallRange (r_segs.c)
@@ -1017,33 +1045,85 @@ void RP_MakeSpansLeave(void) {
    finalises the finished group into the max.  Always defined; the whole body is
    compiled out unless RP_PROF, so a shipping build (RP_PROF 0) pays only an empty
    call.  Visplanes arrive picnum-sorted, so same-key runs are contiguous. */
+#if RP_PROF
+/* For the VDP1-floor quad estimate: the floor texel-step bases (r_plane.c) + view
+   depth/slope.  Redundant-but-legal externs keep this profiler self-contained. */
+extern fixed_t basexscale, baseyscale, viewz, yslope[];
+extern int     sat_vdp2_floor;
+#endif
 void RP_PlanePixels(int picnum, int height, int minx, int maxx,
                     const unsigned char *top, const unsigned char *bottom)
 {
 #if RP_PROF
-    unsigned int pix = 0u;
-    int x;
+    unsigned int pix = 0u, vq = 0u;
+    int x, ymin = 255, ymax = -1;
     for (x = minx; x <= maxx; x++)
     {
         unsigned int t = top[x];
         if (t != 0xffu)
         {
             unsigned int b = bottom[x];
-            if (b >= t) pix += b - t + 1u;
+            if (b >= t)
+            {
+                pix += b - t + 1u;
+                if ((int)t < ymin) ymin = (int)t;     /* visplane screen-y extent */
+                if ((int)b > ymax) ymax = (int)b;
+            }
+        }
+    }
+    /* VDP1-floor quad estimate (inc-0): bbox-clamped affine strips.  Split [ymin,ymax]
+       into FLOOR_HBAND bands; per band the flat wraps every 64 texels across the bbox
+       width -> tiles = u-span/64 + 1.  Mirrors what the emitter would produce. */
+    if (ymax >= ymin)
+    {
+        fixed_t ph = (height >= viewz) ? (height - viewz) : (viewz - height);
+        int width = maxx - minx + 1;
+        int yb;
+        for (yb = ymin; yb <= ymax; yb += FLOOR_HBAND)
+        {
+            fixed_t dist, xs, ys, axs, ays;
+            unsigned int du, dv, span;
+            int ym = yb + (FLOOR_HBAND >> 1);
+            int tiles;
+            if (ym > ymax) ym = ymax;
+            if (ym < 0) ym = 0; else if (ym >= viewheight) ym = viewheight - 1;
+            dist = FixedMul(ph, yslope[ym]);
+            xs = FixedMul(dist, basexscale); axs = (xs < 0) ? -xs : xs;
+            ys = FixedMul(dist, baseyscale); ays = (ys < 0) ? -ys : ys;
+            du = ((unsigned int)axs >> 8) * (unsigned int)width >> 8;   /* texels across width */
+            dv = ((unsigned int)ays >> 8) * (unsigned int)width >> 8;
+            span = (du > dv) ? du : dv;
+            tiles = (int)(span / 64u) + 1;
+            if (tiles > FLOOR_MAXTILES) tiles = FLOOR_MAXTILES;
+            vq += (unsigned int)tiles;
         }
     }
     prof_plane_pix += pix;
+    prof_floor_vq  += vq;
+    /* interior = does NOT touch the near screen edge (bottom for a floor, top for a ceiling) */
+    if (ymax >= ymin)
+    {
+        int is_floor  = (height < viewz);
+        int near_edge = is_floor ? (ymax >= viewheight - 1) : (ymin <= 0);
+        if (!near_edge) prof_floor_vq_int += vq;
+    }
     prof_plane_n++;
     if (picnum == prof_pp_cur_pic && height == prof_pp_cur_h)
     {
         prof_pp_cur_sum += pix;
+        prof_pp_cur_vq  += vq;
     }
     else
     {
-        if (prof_pp_cur_sum > prof_plane_dom) prof_plane_dom = prof_pp_cur_sum;
+        if (prof_pp_cur_sum > prof_plane_dom)
+        {
+            prof_plane_dom    = prof_pp_cur_sum;
+            prof_floor_vq_dom = prof_pp_cur_vq;
+        }
         prof_pp_cur_pic = picnum;
         prof_pp_cur_h   = height;
         prof_pp_cur_sum = pix;
+        prof_pp_cur_vq  = vq;
     }
 #else
     (void)picnum; (void)height; (void)minx; (void)maxx; (void)top; (void)bottom;
@@ -1124,7 +1204,7 @@ static void rp_finish(void)
             snprintf(t, sizeof t, "TMO#%d al%d od%d ex%d r%d/%d   ",
                      rp_timeout_count, SYNC->slave_alive, SYNC->slave_opaque_done,
                      SYNC->slave_execs, SYNC->ready, tot);
-            dbg_print(0, 20, t);
+            dbg_print(0, 5, t);   /* TMO overwrites the Bw/Bp row (now 5) on a timeout */
         }
 #endif
         if (++rp_consec_timeouts >= 6)
@@ -1252,6 +1332,14 @@ void RP_BeginFrame(void)
 #if RP_PROF
         p3_t_begin = rp_frt();   /* P3 profiler: frame start (parity rows are off here) */
         prof_wallprep = 0;       /* Bp accumulator (R_StoreWallRange); the parity reset is skipped here */
+        /* RBG0/VDP1-floor sizing: the P3 path skips the main reset below, so reset here too
+           (else the prof_plane and prof_floor counters accumulate across frames -> Vs/Vp
+           would never be per-frame). */
+        prof_plane_pix = prof_plane_dom = prof_plane_n = 0;
+        prof_pp_cur_sum = prof_pp_cur_vq = 0;
+        prof_pp_cur_pic = -2147483647;
+        prof_pp_cur_h   = 0;
+        prof_floor_vq = prof_floor_vq_dom = prof_floor_vq_int = 0;
 #endif
         return; }
 #if RP_DEBUG
@@ -1273,6 +1361,8 @@ void RP_BeginFrame(void)
     prof_pp_cur_sum = 0;
     prof_pp_cur_pic = -2147483647;   /* sentinel: no flat group open yet */
     prof_pp_cur_h   = 0;
+    prof_floor_vq = prof_floor_vq_dom = prof_pp_cur_vq = 0;   /* VDP1 floor estimate (peak persists) */
+    prof_floor_vq_int = 0;
 #endif
 }
 
@@ -1329,13 +1419,30 @@ static void rp_p3_prof_show(void)
     char p[44];
     snprintf(p, sizeof p, "Bw%u.%u Bp%u.%u P%u.%u M%u.%u",
              bw10/10,bw10%10, bp10/10,bp10%10, p10/10,p10%10, m10/10,m10%10);
-    dbg_print(0, 20, p);
+    dbg_print(0, 5, p);
     /* w = master idle waiting for the slave (master FRT): w~0 => the slave keeps up / balanced.
        idle% = the slave's idle share of the render: it works in P, sits idle in B+M -> this is
        the slack masked + wall-prep will fill (it should DROP as each phase is offloaded). */
     snprintf(p, sizeof p, "MST%ums w%u.%u SLVidle%u%% ",
              rp_master_ms, w10/10, w10%10, idle);
-    dbg_print(0, 18, p);
+    dbg_print(0, 3, p);   /* OVERLAY 2026-06-24: critical-path packed to rows 3-5 */
+    /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one
+       that actually runs (parity disabled), so the setter MUST live here too -- not only in
+       the rp_active block.  The full FLAT line (row 13) is hidden behind split viewports, so
+       dg_saturn mirrors Vs/Vp onto row 16.  vsec = VDP1 candidate cost (= total when RBG0 owns
+       its plane via sat_vdp2_floor, else total minus the pixel-dominant group). */
+    {
+        unsigned int vqtot = prof_floor_vq, vdom = prof_floor_vq_dom, vsec;
+        if (prof_pp_cur_sum > prof_plane_dom) vdom = prof_pp_cur_vq;   /* fold the last open group */
+        vsec = sat_vdp2_floor ? vqtot : (vqtot >= vdom ? vqtot - vdom : 0u);
+        if (vsec > prof_floor_vq_peak) prof_floor_vq_peak = vsec;
+        if (prof_floor_vq_int > prof_floor_vq_int_peak) prof_floor_vq_int_peak = prof_floor_vq_int;
+        sat_floor_vq_cur  = (int)vsec;
+        sat_floor_vq_peak = (int)prof_floor_vq_peak;
+        snprintf(p, sizeof p, "FLAT Vs%u Vp%u Vi%u      ",
+                 vsec, prof_floor_vq_peak, prof_floor_vq_int_peak);
+        (void)p;   /* FLAT (parked VDP1-floor telemetry) cut from overlay -- VDP1_FLOOR_PLAN.md */
+    }
 }
 #endif
 
@@ -1362,7 +1469,7 @@ void RP_EndFrame(void)
         snprintf(p, sizeof p, "REC%u.%u EX%u.%u W%u.%u c%-4d ",
                  rec10/10, rec10%10, exe10/10, exe10%10,
                  wai10/10, wai10%10, rec_count);
-        dbg_print(0, 19, p);
+        dbg_print(0, 4, p);
         /* Row 20 (SATURN PERF 2.4 Stage 1): B (the BSP walk) split into pure BSP
            traversal (Bw) vs wall-prep (Bp = time in R_StoreWallRange), plus the
            planes (P) and masked (M) generation.  Bp is what 2.4 would offload to
@@ -1380,7 +1487,7 @@ void RP_EndFrame(void)
             snprintf(p, sizeof p, "Bw%u.%u Bp%u.%u P%u.%u M%u.%u ",
                      bw10/10, bw10%10, bp10/10, bp10%10,
                      p10/10, p10%10, m10/10, m10%10);
-            dbg_print(0, 20, p);
+            dbg_print(0, 5, p);
             /* Phase-0a fine split (rows 11/12).  Bp -> setup (per-seg trig/scale)
                + loop (R_RenderSegLoop per-column).  P -> alloc (flat W_Cache/
                Release) + makespans (R_MakeSpans walk + R_MapPlane) + other. */
@@ -1416,12 +1523,24 @@ void RP_EndFrame(void)
         {
             unsigned int dom = prof_plane_dom;
             unsigned int tot = prof_plane_pix;
-            unsigned int pct;
-            if (prof_pp_cur_sum > dom) dom = prof_pp_cur_sum;   /* fold the last open group */
+            unsigned int vdom = prof_floor_vq_dom;
+            unsigned int vqtot = prof_floor_vq, vsec, pct;
+            if (prof_pp_cur_sum > dom)                 /* fold the last open group */
+            {
+                dom = prof_pp_cur_sum;
+                vdom = prof_pp_cur_vq;
+            }
             pct = (tot > 0u) ? (dom * 100u / tot) : 0u;
-            snprintf(p, sizeof p, "FLAT t%uk d%uk %u%% n%u   ",
-                     tot / 1000u, dom / 1000u, pct, prof_plane_n);
-            dbg_print(0, 13, p);
+            /* VDP1 floor candidate cost = ALL of vqtot when sat_vdp2_floor is on (RBG0 already
+               took its plane, excluded above), else vqtot minus the pixel-dominant group
+               (which RBG0 would take).  Vp = monotonic peak = the inc-0 go/no-go number. */
+            vsec = sat_vdp2_floor ? vqtot : (vqtot >= vdom ? vqtot - vdom : 0u);
+            if (vsec > prof_floor_vq_peak) prof_floor_vq_peak = vsec;
+            sat_floor_vq_cur  = (int)vsec;                 /* surfaced on visible row 2 */
+            sat_floor_vq_peak = (int)prof_floor_vq_peak;   /* (row 13 is hidden in split) */
+            snprintf(p, sizeof p, "FLAT d%u%% n%u Vt%u Vs%u Vp%u   ",
+                     pct, prof_plane_n, vqtot, vsec, prof_floor_vq_peak);
+            (void)p;   /* FLAT (parked VDP1-floor telemetry) cut from overlay -- VDP1_FLOOR_PLAN.md */
         }
         /* Row 18: MST (master frame ms, set by dg_saturn.cxx fps_update -- the
            synchronous bottleneck; the standalone MST row 15 was dropped) + the slave
@@ -1437,7 +1556,7 @@ void RP_EndFrame(void)
             unsigned int idle = (st > sd) ? ((st - sd) * 100u / st) : 0u;
             snprintf(p, sizeof p, "MST%ums SLV i%u%% b%u%% t%u d%u  ",
                      rp_master_ms, idle, busy, st, sd);
-            dbg_print(0, 18, p);
+            dbg_print(0, 3, p);   /* OVERLAY 2026-06-24: critical-path packed to rows 3-5 */
         }
     }
 #endif

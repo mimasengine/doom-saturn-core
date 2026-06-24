@@ -37,6 +37,7 @@
 
 #include "r_local.h"
 #include "r_sky.h"
+#include "r_cache.h"
 
 
 
@@ -1123,6 +1124,10 @@ void R_RenderPlayerView (player_t* player)
     game_phase = 4; /* R_RenderPlayerView (BSP + execute) */
 
     R_SetupFrame (player);
+
+    // SATURN: age the bounded streaming texture cache once per view, before the
+    // BSP walk re-touches the visible composites (no-op unless sat_streaming).
+    R_PostTexCacheFrame ();
 
     if (sat_xsplit)
     {

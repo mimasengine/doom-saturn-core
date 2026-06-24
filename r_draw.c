@@ -112,12 +112,18 @@ void R_DrawColumn (void)
     if (count < 0) 
 	return; 
 				 
-#ifdef RANGECHECK 
-    if ((unsigned)dc_x >= SCREENWIDTH
+#ifdef RANGECHECK
+    /* SATURN: skip-not-halt an out-of-range column.  2p split feeds 0xff(255)
+       clip values into wall/sprite columns (old behaviour: I_Error hard halt),
+       and a dc_yh in [viewheight,SCREENHEIGHT) passes the old SCREENHEIGHT check
+       yet draws into stale ylookup[] = silent OOB write (the no-message crash).
+       viewheight is the true viewport bound; the skip is byte-identical for
+       valid columns (dc_yh < viewheight already, in 1p and split alike). */
+    if ((unsigned)dc_x >= (unsigned)SCREENWIDTH
 	|| dc_yl < 0
-	|| dc_yh >= SCREENHEIGHT) 
-	I_Error ("R_DrawColumn: %i to %i at %i", dc_yl, dc_yh, dc_x); 
-#endif 
+	|| dc_yh >= viewheight)
+	return;
+#endif
 
     // Framebuffer destination address.
     // Use ylookup LUT to avoid multiply with ScreenWidth.
@@ -229,16 +235,12 @@ void R_DrawColumnLow (void)
     if (count < 0) 
 	return; 
 				 
-#ifdef RANGECHECK 
-    if ((unsigned)dc_x >= SCREENWIDTH
+#ifdef RANGECHECK
+    if ((unsigned)dc_x >= (unsigned)SCREENWIDTH
 	|| dc_yl < 0
-	|| dc_yh >= SCREENHEIGHT)
-    {
-	
-	I_Error ("R_DrawColumn: %i to %i at %i", dc_yl, dc_yh, dc_x);
-    }
-    //	dccount++; 
-#endif 
+	|| dc_yh >= viewheight)      /* SATURN: skip-not-halt (see R_DrawColumn) */
+	return;
+#endif
     // Blocky mode, need to multiply by 2.
     x = dc_x << 1;
     
@@ -310,13 +312,10 @@ void R_DrawFuzzColumn (void)
     if (count < 0) 
 	return; 
 
-#ifdef RANGECHECK 
-    if ((unsigned)dc_x >= SCREENWIDTH
-	|| dc_yl < 0 || dc_yh >= SCREENHEIGHT)
-    {
-	I_Error ("R_DrawFuzzColumn: %i to %i at %i",
-		 dc_yl, dc_yh, dc_x);
-    }
+#ifdef RANGECHECK
+    if ((unsigned)dc_x >= (unsigned)SCREENWIDTH
+	|| dc_yl < 0 || dc_yh >= viewheight)   /* SATURN: skip-not-halt (see R_DrawColumn) */
+	return;
 #endif
     
     dest = ylookup[dc_yl] + columnofs[dc_x];
@@ -375,13 +374,10 @@ void R_DrawFuzzColumnLow (void)
     
     x = dc_x << 1;
     
-#ifdef RANGECHECK 
-    if ((unsigned)x >= SCREENWIDTH
-	|| dc_yl < 0 || dc_yh >= SCREENHEIGHT)
-    {
-	I_Error ("R_DrawFuzzColumn: %i to %i at %i",
-		 dc_yl, dc_yh, dc_x);
-    }
+#ifdef RANGECHECK
+    if ((unsigned)x >= (unsigned)SCREENWIDTH
+	|| dc_yl < 0 || dc_yh >= viewheight)   /* SATURN: skip-not-halt (see R_DrawColumn) */
+	return;
 #endif
     
     dest = ylookup[dc_yl] + columnofs[x];
@@ -441,16 +437,12 @@ void R_DrawTranslatedColumn (void)
     if (count < 0) 
 	return; 
 				 
-#ifdef RANGECHECK 
-    if ((unsigned)dc_x >= SCREENWIDTH
+#ifdef RANGECHECK
+    if ((unsigned)dc_x >= (unsigned)SCREENWIDTH
 	|| dc_yl < 0
-	|| dc_yh >= SCREENHEIGHT)
-    {
-	I_Error ( "R_DrawColumn: %i to %i at %i",
-		  dc_yl, dc_yh, dc_x);
-    }
-    
-#endif 
+	|| dc_yh >= viewheight)      /* SATURN: skip-not-halt (see R_DrawColumn) */
+	return;
+#endif
 
 
     dest = ylookup[dc_yl] + columnofs[dc_x]; 
@@ -490,16 +482,12 @@ void R_DrawTranslatedColumnLow (void)
     // low detail, need to scale by 2
     x = dc_x << 1;
 				 
-#ifdef RANGECHECK 
-    if ((unsigned)x >= SCREENWIDTH
+#ifdef RANGECHECK
+    if ((unsigned)x >= (unsigned)SCREENWIDTH
 	|| dc_yl < 0
-	|| dc_yh >= SCREENHEIGHT)
-    {
-	I_Error ( "R_DrawColumn: %i to %i at %i",
-		  dc_yl, dc_yh, x);
-    }
-    
-#endif 
+	|| dc_yh >= viewheight)      /* SATURN: skip-not-halt (see R_DrawColumn) */
+	return;
+#endif
 
 
     dest = ylookup[dc_yl] + columnofs[x]; 

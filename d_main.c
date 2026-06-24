@@ -193,6 +193,7 @@ void D_Display (void)
     int				y;
     boolean			done;
     boolean			wipe;
+    boolean			fade = false;   // SATURN: streaming CRAM dip-to-black transition
     boolean			redrawsbar;
 #if DISPLAY_DEBUG
     volatile uint32_t dd_t0, dd_t1, dd_t2, dd_t3, dd_t4;
@@ -231,15 +232,38 @@ void D_Display (void)
              the new level's data, which we need to render the first frame captured by
              wipe_EndScreen.  We cannot free it, and 192 KB won't fit alongside it in
              the 864 KB zone, so skip the wipe in this direction only. */
+        extern int sat_streaming_mode;   // p_setup.c -- big-WAD CD path
+        extern void DG_FadeOut(void);    // dg_saturn.cxx -- CRAM dip-to-black (out)
         if (gamestate == GS_LEVEL)
         {
             wipe = false;
         }
         else
         {
-            wipe = true;
             Z_FreeTags(PU_LEVEL, PU_PURGELEVEL - 1);
-            wipe_StartScreen(0, 0, SCREENWIDTH, SCREENHEIGHT);
+            /* SATURN: in CD-streaming mode (big WADs, no cart) the zone's ~600 KB
+               PU_STATIC floor fragments the free space so no contiguous ~70 KB run
+               survives for wipe_StartScreen's SCREENWIDTH*SCREENHEIGHT buffer, even
+               immediately after freeing PU_LEVEL above -- this was the "Z_Malloc fail
+               71704 (fr242K lg64K st621K lv0K)" transition crash (lv0K proves
+               PU_LEVEL is already gone; the kill is fragmentation, not exhaustion).
+               So skip the melt when streaming (replaced by the CRAM fade below);
+               shareware/cart (sat_streaming_mode==0, and DoomJo) keep it. */
+            wipe = !sat_streaming_mode;
+            if (wipe)
+                wipe_StartScreen(0, 0, SCREENWIDTH, SCREENHEIGHT);
+        }
+        /* SATURN streaming transition (docs/TRANSITIONS_PLAN.md): replace the
+           buffer-hungry melt with a buffer-FREE CRAM palette dip-to-black.  Fade the
+           CURRENT (still-displayed) frame out NOW; the switch below draws the new
+           gamestate while CRAM is black; fade it back in after the blit (the !wipe
+           path).  Works in BOTH directions -- fade-in needs no captured screen, so
+           entering a level (which the melt had to skip: it couldn't free the new
+           geometry for the ~192 KB buffer) finally transitions too. */
+        if (sat_streaming_mode)
+        {
+            DG_FadeOut();
+            fade = true;
         }
     }
     else
@@ -410,6 +434,11 @@ void D_Display (void)
     if (!wipe)
     {
 	I_FinishUpdate ();              // page flip or blit buffer
+	if (fade)                      // SATURN: rise the new frame from black (CRAM dip-to-black)
+	{
+	    extern void DG_FadeIn(void);
+	    DG_FadeIn();
+	}
 #if DISPLAY_DEBUG
 	{
 	    /* Sub-phase breakdown of D_Display over a 1s window, in ms (DG_GetTicksMs).
@@ -432,7 +461,7 @@ void D_Display (void)
 		static char dd_dbg[41];
 		sprintf(dd_dbg, "st%4u rp%4u hu%3u ot%3u bl%4u f%3u",
 			sum_st, sum_rp, sum_hu, sum_ot, sum_bl, dd_f);
-		dbg_print(0, 5, dd_dbg);
+		dbg_print(0, 13, dd_dbg);   /* OVERLAY 2026-06-24: D_Display split below the critical-path block */
 		sum_st = sum_rp = sum_hu = sum_ot = sum_bl = 0;
 		dd_f = 0;
 		dd_win = now;
@@ -640,10 +669,10 @@ void doomgeneric_Tick()
             /* row 2: T S D X/total  row 3: G(ap) I(ntra) */
             sprintf(dbg, "T%4u S%4u D%4u X%4u/%4u",
                     mt, ms, md, X, el);
-            dbg_print(0, 3, dbg);
+            dbg_print(0, 14, dbg);   /* tick budget T/S/D/X -> row 14 (critical-path took 3-5) */
             sprintf(dbg, "G%4u I%4u tk%4u",
                     mg, X > mg ? X - mg : 0, mtk);
-            dbg_print(0, 4, dbg);
+            dbg_print(0, 15, dbg);   /* G/I/tk -> row 15 */
             sum_t = sum_s = sum_d = sum_gap = sum_tick = 0;
             win_start = now;
         }

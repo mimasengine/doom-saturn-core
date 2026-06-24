@@ -5,9 +5,19 @@
 #define R_PARALLEL_H
 
 /* Draw-command queue, carved from the top of low work RAM.
-   DG_ZoneBase (dg_saturn.cxx) shrinks Doom's zone heap accordingly. */
-#define RP_CMD_BUF_ADDR  0x002D8000
+   DG_ZoneBase (dg_saturn.cxx) shrinks Doom's zone heap accordingly.
+   RP_CMD_BUF_SIZE is -D-overridable per port: DoomSRL shrinks it (walls go to
+   VDP1, so the slave's column-command traffic is low) to GROW the streaming zone
+   -- the buffer is a ring that auto-flushes at RP_MAX (r_parallel.c), so a
+   smaller buffer only flushes more often on command-heavy frames, never drops a
+   command.  DoomJo keeps the 160KB default (no VDP1 walls => higher traffic).
+   ADDR is DERIVED from SIZE so the buffer always sits flush against the top of
+   low work RAM (end = 0x00300000) and the grown zone can never overlap it
+   (default size keeps ADDR at the historical 0x002D8000). */
+#ifndef RP_CMD_BUF_SIZE
 #define RP_CMD_BUF_SIZE  0x00028000   /* 160KB = 5120 commands of 32 bytes */
+#endif
+#define RP_CMD_BUF_ADDR  (0x00300000 - RP_CMD_BUF_SIZE)
 
 /* Called from R_RenderPlayerView (r_main.c). */
 void RP_BeginFrame(void);

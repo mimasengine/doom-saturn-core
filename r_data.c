@@ -34,6 +34,7 @@
 
 #include "doomstat.h"
 #include "r_sky.h"
+#include "r_cache.h"
 
 
 #include "r_data.h"
@@ -229,6 +230,7 @@ R_DrawColumnInCache
 void R_GenerateComposite (int texnum)
 {
     byte*		block;
+    int			cached = 0;
     texture_t*		texture;
     texpatch_t*		patch;	
     patch_t*		realpatch;
@@ -242,13 +244,27 @@ void R_GenerateComposite (int texnum)
 	
     texture = textures[texnum];
 
-    block = Z_Malloc (texturecompositesize[texnum],
-		      PU_STATIC, 
-		      &texturecomposite[texnum]);	
+    // SATURN: in CD-streaming mode build the composite into the bounded LRU
+    // texture cache (recency-evicted, capped) instead of the main zone, so the
+    // streaming working set is bounded and the CD reads amortized.  A NULL
+    // return (cache inactive / pool full / parallel pass) falls back to the
+    // classic main-zone PU_CACHE composite -- i.e. exactly today's behaviour.
+    block = R_TexCacheAlloc (texturecompositesize[texnum],
+			     (void **)&texturecomposite[texnum]);
+    if (block)
+    {
+	cached = 1;	// pool block; texturecomposite[texnum] already published
+    }
+    else
+    {
+	block = Z_Malloc (texturecompositesize[texnum],
+			  PU_STATIC,
+			  &texturecomposite[texnum]);
+    }
 
     collump = texturecolumnlump[texnum];
     colofs = texturecolumnofs[texnum];
-    
+
     // Composite the columns together.
     patch = texture->patches;
 		
@@ -284,9 +300,11 @@ void R_GenerateComposite (int texnum)
 						
     }
 
-    // Now that the texture has been built in column cache,
-    //  it is purgable from zone memory.
-    Z_ChangeTag (block, PU_CACHE);
+    // Classic path: now that the texture is built it is purgable from the zone.
+    // Cache-pool blocks are managed by the LRU (R_PostTexCacheFrame), not the
+    // zone purger, so they are left alone here.
+    if (!cached)
+	Z_ChangeTag (block, PU_CACHE);
 }
 
 
@@ -399,6 +417,8 @@ R_GetColumn
 
     if (!texturecomposite[tex])
 	R_GenerateComposite (tex);
+    else if (sat_texcache_active)
+	R_TexCacheTouch (texturecomposite[tex]);   // keep visible composites resident
 
     return texturecomposite[tex] + ofs;
 }
@@ -553,6 +573,16 @@ static void GenerateTextureHashTable(void)
     }
 }
 
+
+// SATURN Phase-0 measurement (docs/TEXTURECOLUMNLUMP_PLAN.md): the unconditional
+// PU_STATIC per-column directory floor, measured once at load, shown on the overlay
+// (TEX row).  Confirms the ~400-600 KB estimate on the real shipping WADs before
+// committing to the composite-on-demand refactor.
+int sat_tex_numtex   = 0;   // numtextures
+int sat_tex_sumwidth = 0;   // Sum of texture widths = total columns
+int sat_tex_dirbytes = 0;   // texturecolumnlump + texturecolumnofs bytes = 4 * sumwidth (the floor)
+int sat_tex_mptex    = 0;   // # multi-patch textures (patchcount > 1) -> need a composite
+int sat_tex_mpwidth  = 0;   // Sum width of multi-patch textures (Option-E whole-slab size proxy)
 
 //
 // R_InitTextures
@@ -714,7 +744,14 @@ void R_InitTextures (void)
 	textureheight[i] = texture->height<<FRACBITS;
 		
 	totalwidth += texture->width;
+	if (texture->patchcount > 1)     // SATURN Phase-0: multi-patch => needs a composite
+	{ sat_tex_mptex++; sat_tex_mpwidth += texture->width; }
     }
+
+    // SATURN Phase-0 measurement: the per-column directory floor (4 * Sum width).
+    sat_tex_numtex   = numtextures;
+    sat_tex_sumwidth = totalwidth;
+    sat_tex_dirbytes = totalwidth * 4;   // texturecolumnlump(2) + texturecolumnofs(2) per column
 
     Z_Free(patchlookup);
 

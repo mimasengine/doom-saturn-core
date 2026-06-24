@@ -318,12 +318,15 @@ P_CheckSight
     bitnum = 1 << (pnum&7);
 
     // Check in REJECT table.
-    if (rejectmatrix[bytenum]&bitnum)
+    // SATURN: rejectmatrix is NULL when the REJECT was skipped to save zone RAM in
+    // CD-streaming mode (p_setup.c P_LoadReject) -- no early-out, just fall through
+    // to the full LOS check below (correct, only slower).
+    if (rejectmatrix && (rejectmatrix[bytenum]&bitnum))
     {
 	sightcounts[0]++;
 
 	// can't possibly be connected
-	return false;	
+	return false;
     }
 
     // An unobstructed LOS is possible.
