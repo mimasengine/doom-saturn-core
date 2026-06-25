@@ -5,7 +5,9 @@
 // leftover main-zone RAM, so big-WAD CD-streaming play stops thrashing
 // composites (evict -> rebuild -> patch re-read from CD) frame to frame.
 // Ported from d32xr's r_cache.c, adapted to this core's classic composite model
-// (texturecomposite[] directory + R_GenerateComposite producer).
+// (texturecomposite[] directory + R_GenerateComposite producer).  Portions
+// derived from d32xr under the MIT License (c) 2021 Victor Luchits, Derek John
+// Evans, id Software and ZeniMax Media -- see the full notice in r_cache.c.
 //
 // Active ONLY when sat_streaming_mode (the big-WAD CD path) and NOT during an
 // x-split parallel pass (the slave must never touch the allocator).  DoomJo
