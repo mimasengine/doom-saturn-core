@@ -51,7 +51,7 @@ planefunction_t		ceilingfunc;
    high WRAM BSS limit.  512 * 664B = 332KB of the 864KB zone heap; ~532KB
    remains for the game — sufficient for E1 shareware maps.
    vpsort[] stays in BSS (512 * 4B = 2KB, harmless).
-   SATURN streaming: DoomSRL overrides this to 256 via -DMAXVISPLANES in its
+   SATURN streaming: Mimas overrides this to 256 via -DMAXVISPLANES in its
    Makefile to reclaim ~166KB of the zone for big-WAD (Doom II) streaming, where
    the per-level PU_STATIC floor + geometry must fit the 884KB zone with no cart.
    256 is still 2x vanilla's 128; overflow -> clean I_Error (r_plane.c:476/567),
@@ -86,7 +86,7 @@ visplane_t*		ceilingplane;
    (correctness A/B only).  Lower VP_POOL_PLANES, gated on r_visplane_peak telemetry,
    to realise the saving (overflow => I_Error, same hard-limit semantics as the pool). */
 #ifndef VP_POOL_PLANES
-#define VP_POOL_PLANES   MAXVISPLANES   /* core default = no saving (safe). DoomSRL overrides via -DVP_POOL_PLANES=N in its Makefile to reclaim zone for big WADs; size to r_visplane_peak + margin. */
+#define VP_POOL_PLANES   MAXVISPLANES   /* core default = no saving (safe). Mimas overrides via -DVP_POOL_PLANES=N in its Makefile to reclaim zone for big WADs; size to r_visplane_peak + margin. */
 #endif
 #define VP_SLICE_BYTES   (SCREENWIDTH + 2)
 static byte	*plane_pool;
@@ -127,7 +127,7 @@ static byte *R_PoolSlice (void)
    so the walk never pointer-chases the slow visplane struct except to compare the
    three key fields.  Gated for a hardware A/B (set 0 = original linear scan).
    Pure C, DoomJo-safe, no new cross-CPU coherency surface (master-only generation).
-   SATURN PERF: a runtime int (was a compile-time #define) so DoomSRL can A/B the
+   SATURN PERF: a runtime int (was a compile-time #define) so Mimas can A/B the
    hash vs the vanilla linear scan live on hardware via pad Y; DoomJo never toggles
    it -> stays 1 -> byte-identical.  The hash machinery below is now always compiled. */
 int sat_visplane_hash = 1;
@@ -660,7 +660,7 @@ R_MakeSpans
 }
 
 
-/* SATURN parallel-REC (Option C / P1) -- the d32xr r_phase7 plane model adapted to DoomSRL.
+/* SATURN parallel-REC (Option C / P1) -- the d32xr r_phase7 plane model adapted to Mimas.
    A POTATO-floor visplane drawn SELF-CONTAINED: ALL per-CPU state on the STACK (a local
    spanstart[] + the height/colormap/source passed by value) with an inline span memset --
    NO plane globals (planeheight, planezlight, the ds_ span state, cachedheight, spanstart).  This is the unit
@@ -835,7 +835,7 @@ typedef struct { visplane_t *pl; byte *src; lighttable_t **plzlight;
 planework_t plane_worklist[MAXVISPLANES];
 int         plane_worklist_n;
 /* master gate: 0 = old global record/parity path (DoomJo + the working baseline, byte-
-   identical); 1 = the P3 worklist + master/slave visplane split (set by the DoomSRL
+   identical); 1 = the P3 worklist + master/slave visplane split (set by the Mimas
    platform, main.cxx).  Defined in r_parallel.c with the dispatch. */
 extern int  sat_plane_parallel;
 
@@ -1195,7 +1195,7 @@ void R_DrawPlanes (void)
 
 #if SAT_PLANE_LOCAL
     /* P3: draw the queued regular flats -- master + slave each draw a half (the d32xr visplane
-       split).  sat_plane_parallel (set by the DoomSRL platform via main.cxx) enables the slave
+       split).  sat_plane_parallel (set by the Mimas platform via main.cxx) enables the slave
        half via r_parallel.c; otherwise (DoomJo / off) the master draws them all.  Then release
        the deferred flat locks (no-op on the cart, where W_CacheLumpNum is a direct pointer). */
     {

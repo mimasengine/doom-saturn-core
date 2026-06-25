@@ -147,7 +147,7 @@ void Z_Free (void* ptr)
 	// it is a no-op (as W_ReleaseLumpNum already does for mapped lumps).
 	if (W_PtrIsMapped(ptr))
 	    return;
-	// DIAGNOSTIC: p=freed ptr, ra=caller return addr (-> build/DoomSRL.map),
+	// DIAGNOSTIC: p=freed ptr, ra=caller return addr (-> build/Mimas.map),
 	// id/tag = block state (id=0 tag=0 => double-free; garbage id => non-zone ptr).
 	I_Error ("Z_Free bad p=%p ra=%p id=%08x tag=%d", ptr,
 	         __builtin_return_address(0), (unsigned)block->id, block->tag);
@@ -226,7 +226,7 @@ Z_Malloc
 
     // SATURN DIAGNOSTIC: a bogus (negative / >zone) request size means a corrupt caller
     // computation (e.g. the cart-launch "req -134218728").  Catch it AT THE SOURCE with
-    // the caller's return address (-> build/DoomSRL.map) instead of a confusing scan halt.
+    // the caller's return address (-> build/Mimas.map) instead of a confusing scan halt.
     if (size <= 0 || (unsigned int)size > (unsigned int)mainzone->size)
         I_Error ("Z_Malloc bad size=%i ra=%p", size, __builtin_return_address(0));
 

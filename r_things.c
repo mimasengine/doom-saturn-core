@@ -1006,7 +1006,7 @@ void R_DrawSprite (vissprite_t* spr)
  * SATURN parallel-REC (Option B / masked-by-half): the slave SH-2 draws the
  * vissprites in the RIGHT screen-x half while the master draws the LEFT half,
  * during the masked phase (M).  Self-contained -- its column state is a SEPARATE
- * static set (s_*) drawn on a dedicated stack (DoomSRL has no GBR-TLS, GBR is
+ * static set (s_*) drawn on a dedicated stack (Mimas has no GBR-TLS, GBR is
  * SGL's), so it races nothing with the master.  Both iterate the SAME sorted
  * vissprites (z-order preserved); each clips its columns to its half -> disjoint
  * pixels.  Sprite CLIPPING against the shared drawsegs is replicated; masked WALLS

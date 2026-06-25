@@ -3,11 +3,11 @@
 **
 ** Pure C, SDK-agnostic: the command queue, executors, sync protocol and
 ** cache-coherency rules are all hardware-level (SH-2 / SGL), so this exact
-** file is compiled by BOTH ports (DoomSRL and DoomJo).  The only platform
+** file is compiled by BOTH ports (Mimas and DoomJo).  The only platform
 ** touch-points are:
 **   - slSlaveFunc()  : SGL, linked by both ports
 **   - dbg_print()     : a thin debug-overlay shim each port provides
-**                      (SRL::Debug::Print on DoomSRL, native on DoomJo)
+**                      (SRL::Debug::Print on Mimas, native on DoomJo)
 **   - cache purge    : direct CCR register write (same hardware op everywhere)
 */
 #include <stdio.h>
@@ -721,7 +721,7 @@ static int rp_wait(volatile int *flag)
 /* SATURN: THE ~1-2min freeze fix.  slSlaveFunc bump-allocates a 12-byte record
    {0x30, func, arg} from the SGL transient work buffer at GBR+72 and advances
    the pointer every call, but NEVER resets it -- SGL normally resets it once
-   per frame inside slSynch(), which DoomSRL replaced with its own vblank sync.
+   per frame inside slSynch(), which Mimas replaced with its own vblank sync.
    Because rp_restart() calls slSlaveFunc every frame, GBR+72 crept forward 12
    bytes/frame into the SGL system area and after ~1-2 min overran the VBlank
    user-callback pointer at GBR+20 (0x060FFC14); _BlankIn then jsr'd to garbage
@@ -811,7 +811,7 @@ static void master_cache_purge(void)
  * (R_DrawPlaneWorklist -> R_DrawVisplane* -> R_*Span, shallow; the only stack cost is the       *
  * local spanstart_l[SCREENHEIGHT] ~0.9KB).                                                      *
  * ------------------------------------------------------------------------------------------ */
-int sat_plane_parallel = 0;              /* set by the DoomSRL platform (src/main.cxx) */
+int sat_plane_parallel = 0;              /* set by the Mimas platform (src/main.cxx) */
 extern void R_DrawPlaneWorklist(int from, int to);
 
 static volatile int rp_plane_done = 1;
@@ -1423,7 +1423,7 @@ extern angle_t viewangle;
 extern int     gamemap, leveltime;
 #endif
 /* Reset the windowed stats (the platform calls it when the variable under test changes).
-   Unconditional body so DoomSRL links it even with RP_PROF off. */
+   Unconditional body so Mimas links it even with RP_PROF off. */
 void RP_ProfReset(void)
 {
 #if RP_PROF

@@ -2,7 +2,7 @@
 
 Shared source for the two Sega Saturn Doom ports:
 
-- **DoomSRL** — Saturn Ring Library (SRL / C++23) platform layer.
+- **Mimas** — Saturn Ring Library (SRL / C++23) platform layer.
 - **DoomJo** — Jo Engine (C) platform layer.
 
 This repo holds the SDK-agnostic code that both ports compile verbatim:

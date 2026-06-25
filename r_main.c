@@ -1026,7 +1026,7 @@ int sat_xsplit = SAT_XSPLIT;
 extern int sat_view_x0, sat_view_x1;   /* x-range clip window (r_bsp.c R_ClearClipSegs) */
 extern int rp_disabled;                /* r_parallel.c serial latch */
 
-/* SATURN x-split (Step B3c): the DoomSRL platform (src/xsplit_slave.cxx) wires these to
+/* SATURN x-split (Step B3c): the Mimas platform (src/xsplit_slave.cxx) wires these to
    dispatch/await the SLAVE SH-2 rendering its half via the dual-compiled slave_ renderer.
    NULL on DoomJo and until the platform sets them -> the driver falls back to the A1 serial
    2-pass.  dispatch(player, x0, x1): point the slave's clip range at [x0,x1) and slSlaveFunc. */

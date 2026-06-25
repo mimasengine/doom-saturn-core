@@ -1,12 +1,12 @@
 /*
-** DoomSRL -- dual-SH2 renderer back end (see r_parallel.cxx).
+** Mimas -- dual-SH2 renderer back end (see r_parallel.cxx).
 */
 #ifndef R_PARALLEL_H
 #define R_PARALLEL_H
 
 /* Draw-command queue, carved from the top of low work RAM.
    DG_ZoneBase (dg_saturn.cxx) shrinks Doom's zone heap accordingly.
-   RP_CMD_BUF_SIZE is -D-overridable per port: DoomSRL shrinks it (walls go to
+   RP_CMD_BUF_SIZE is -D-overridable per port: Mimas shrinks it (walls go to
    VDP1, so the slave's column-command traffic is low) to GROW the streaming zone
    -- the buffer is a ring that auto-flushes at RP_MAX (r_parallel.c), so a
    smaller buffer only flushes more often on command-heavy frames, never drops a
@@ -65,7 +65,7 @@ void RP_PlanePixels(int picnum, int height, int minx, int maxx,
    dc_source).  Essentially always 0 on current hardware (slave reliable). */
 extern int rp_disabled;
 
-/* SATURN (DoomSRL platform only): rewind the SGL slave work pointers (GBR+72/+68)
+/* SATURN (Mimas platform only): rewind the SGL slave work pointers (GBR+72/+68)
    to their captured base, exactly as slSynch would.  Normally called once per
    frame from rp_restart; exposed so the platform layer (dg_saturn.cxx dual-CPU
    blit) can rewind before a 2nd slSlaveFunc/frame and avoid the work-pointer

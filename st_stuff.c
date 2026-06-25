@@ -1112,7 +1112,7 @@ void ST_diffDraw(void)
 // tables + V_DrawPatch directly -- NO backing-screen/diff (the platform
 // repaints the 160x64 panel under it every frame) and NO single-instance
 // global state, so it is safe to call once per player.  Anchors come from the
-// generated hud2p_layout.h.  Default-unused: only the DoomSRL split path calls
+// generated hud2p_layout.h.  Default-unused: only the Mimas split path calls
 // it, so DoomJo and 1-player are unaffected.
 // -----------------------------------------------------------------------
 
