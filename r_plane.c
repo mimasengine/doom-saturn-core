@@ -364,8 +364,12 @@ R_MapPlane
        Mirrors rp_exec_span / rp_exec_span_low byte-for-byte (fixed flat texel,
        distance-shaded via ds_colormap).  Gated on sat_potato_floors -> pot0 stays
        byte-identical and DoomJo (never sets Potato) is unaffected.  Set
-       SAT_POTATO_INLINE_SPANS 0 to revert to the record+execute path. */
+       SAT_POTATO_INLINE_SPANS 0 to revert to the record+execute path.  Mimas makes this
+       -D-overridable (Makefile knob) so the inline-vs-span A/B is a build flag, not a
+       source edit; default stays 1. */
+#ifndef SAT_POTATO_INLINE_SPANS
 #define SAT_POTATO_INLINE_SPANS 1
+#endif
 #if SAT_POTATO_INLINE_SPANS
 #define R_POTATO_TEXEL 2080   /* centre texel of a 64x64 flat (v32,u32); == r_parallel.c POTATO_TEXEL */
     if (sat_potato_floors)
@@ -839,8 +843,10 @@ int         plane_worklist_n;
    platform, main.cxx).  Defined in r_parallel.c with the dispatch. */
 extern int  sat_plane_parallel;
 
-/* draw worklist entries [from,to) -- run by the master for its half AND by the slave (via
-   r_parallel.c RP_DispatchPlanes) for the other half. */
+/* draw worklist entries [from,to) -- run by BOTH CPUs via r_parallel.c RP_DrawPlanesSplit:
+   the static half-split (master [0,half) / slave [half,n)) or, when sat_plane_steal=1, the
+   two-pointer work-steal (master fwd from 0 / slave bwd from n-1, one plane per call).  DoomJo /
+   sat_plane_parallel=0 calls it once as (0,n) on the master. */
 void R_DrawPlaneWorklist (int from, int to)
 {
     int i;
@@ -1200,16 +1206,10 @@ void R_DrawPlanes (void)
        the deferred flat locks (no-op on the cart, where W_CacheLumpNum is a direct pointer). */
     {
         extern int sat_plane_parallel;
-        extern void RP_DispatchPlanes(int from, int to);
-        extern void RP_WaitPlanes(void);
+        extern void RP_DrawPlanesSplit(int n);
         int n = plane_worklist_n, i;
         if (sat_plane_parallel && n > 1)
-        {
-            int half = n >> 1;
-            RP_DispatchPlanes(half, n);      /* slave draws [half, n)  */
-            R_DrawPlaneWorklist(0, half);    /* master draws [0, half) */
-            RP_WaitPlanes();                 /* wait for the slave's half */
-        }
+            RP_DrawPlanesSplit(n);           /* master+slave: static half-split or work-steal (pad Y) */
         else
             R_DrawPlaneWorklist(0, n);
         for (i = 0; i < n; i++)

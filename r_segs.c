@@ -742,10 +742,13 @@ void RP_QueueWall(int start, int stop)
     w->start = start; w->stop = stop;
 }
 
-void RP_FlushWalls(void)
+/* Replay queued walls [from,to) in BSP order (single in-order consumer => the floorclip/
+   ceilingclip occlusion chain is identical).  Does NOT reset walljob_n -- the caller does, so
+   the slave (RANK 3 inc-1, r_parallel.c) can flush a range without owning the master's counter. */
+void RP_FlushWallsRange(int from, int to)
 {
     int i;
-    for (i = 0; i < walljob_n; i++)
+    for (i = from; i < to; i++)
     {
         walljob_t *w = &walljobs[i];
         curline      = w->curline;
@@ -756,6 +759,11 @@ void RP_FlushWalls(void)
         ceilingplane = w->ceilingplane;
         R_StoreWallRange(w->start, w->stop);
     }
+}
+
+void RP_FlushWalls(void)
+{
+    RP_FlushWallsRange(0, walljob_n);
     walljob_n = 0;
 }
 

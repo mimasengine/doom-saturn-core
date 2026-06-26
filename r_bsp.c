@@ -549,8 +549,18 @@ void R_Subsector (int num)
     }
     else
 	ceilingplane = NULL;
-		
-    R_AddSprites (frontsector);	
+
+    /* SATURN (pari A sizing): count this visible subsector + its VDP1-deportable surfaces
+       (floor; non-sky ceiling) + side count, to size "all floors/ceilings as VDP1 quads".
+       No-op unless RP_PROF; pure C, DoomJo-safe. */
+    {
+	extern void RP_Subsector(int numlines, int nsurf);
+	RP_Subsector(sub->numlines,
+		     (floorplane ? 1 : 0)
+		     + ((ceilingplane && frontsector->ceilingpic != skyflatnum) ? 1 : 0));
+    }
+
+    R_AddSprites (frontsector);
 
     while (count--)
     {

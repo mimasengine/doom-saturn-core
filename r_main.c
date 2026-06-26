@@ -1078,8 +1078,15 @@ static void R_RenderViewPass (int last_pass)
     R_RenderBSPNode (numnodes-1);
 
     /* SATURN parallel-REC: run the deferred wall-prep (R_StoreWallRange queued during the
-       BSP walk).  No-op when sat_wallprep_defer is 0 (the walls ran inline already). */
-    { extern void RP_FlushWalls(void); RP_FlushWalls(); }
+       BSP walk).  No-op when sat_wallprep_defer is 0 (the walls ran inline already).
+       RANK 3 inc-1 (docs/RANK3_WALLPREP.md): when sat_wallprep_slave is on, the whole flush
+       runs on the SLAVE (non-overlapped: dispatch here, walk is done, master waits). */
+    { extern void RP_FlushWalls(void);
+      extern int sat_wallprep_slave, walljob_n;
+      extern void RP_DispatchWallPrep(int n); extern void RP_WaitWallPrep(void);
+      if (sat_wallprep_slave) { RP_DispatchWallPrep(walljob_n); RP_WaitWallPrep(); walljob_n = 0; }
+      else                      RP_FlushWalls();
+    }
 
     SAT_RP_BSPDONE ();   // SATURN: profiler BSP/planes boundary (row-20 B/P/M)
 

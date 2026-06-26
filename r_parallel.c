@@ -822,11 +822,30 @@ static volatile int rp_plane_done = 1;
    it would overflow and corrupt SGL.  Give the plane slave its OWN 4KB stack and switch to
    it for the draw.  (Only the slave touches this, so its write-through writes need no purge.) */
 static char rp_plane_slave_stack[4 * 1024] __attribute__((aligned(16)));
-static int  rp_plane_from, rp_plane_to;
+/* SATURN PERF (RANK 1): two-pointer work-steal for the visplane draw, replacing the static
+   half=n>>1 split.  The master draws planes FORWARD from 0, the slave draws BACKWARD from n-1;
+   each publishes its cursor in UNCACHED memory and stops when they meet.  Self-balancing -- the
+   slower CPU simply covers fewer planes and w->0, with NO per-scene tuning (mirrors the parity
+   column steal ~line 627).  Visplanes are disjoint framebuffer regions with no inter-plane
+   overdraw, so the <=~1-plane overlap at the crossing draws identical pixels (harmless, like a
+   doubly-drawn opaque column).  No gap is possible: the master stops at m>=PLANE_SPOS and s only
+   decreases, so the final S<=M => [0,M) U [S,n) covers [0,n).  n is passed via the slave param
+   (no cached shared word); the cursors use the |0x20000000 uncached alias so the live cross-CPU
+   reads are always fresh. */
+static volatile int rp_plane_mpos, rp_plane_spos;
+#define PLANE_MPOS (*(volatile int *)((unsigned int)&rp_plane_mpos | 0x20000000u))
+#define PLANE_SPOS (*(volatile int *)((unsigned int)&rp_plane_spos | 0x20000000u))
+static int rp_steal_n;
 
-static void rp_plane_worklist_noarg(void)
+static void rp_plane_steal_slave(void)   /* slave: draw backward from n-1, stop at the master */
 {
-    R_DrawPlaneWorklist(rp_plane_from, rp_plane_to);
+    int s = rp_steal_n;
+    while (s > PLANE_MPOS)
+    {
+        R_DrawPlaneWorklist(s - 1, s);   /* one plane */
+        s--;
+        PLANE_SPOS = s;                  /* publish */
+    }
 }
 
 /* SH-2 trampoline: save r14 on the old stack, keep the old SP in r14 (callee-saved, so the
@@ -848,21 +867,68 @@ static void rp_run_on_stack(void (*fn)(void))
         : "r0","r1","r2","r3","r4","r5","r6","r7","pr","t","mach","macl","memory");
 }
 
-static void rp_plane_slave_body(void *param)
+static void rp_plane_steal_body(void *param)
 {
-    int packed = (int)(unsigned int)param;   /* (from<<16)|to -- avoids a shared coherency word */
     master_cache_purge();                    /* slave: read the master's fresh worklist + tables */
-    rp_plane_from = (packed >> 16) & 0xffff;
-    rp_plane_to   = packed & 0xffff;
-    rp_run_on_stack(rp_plane_worklist_noarg);/* draw on the dedicated stack */
+    rp_steal_n = (int)(unsigned int)param;   /* set AFTER the purge (the invalidate would drop a
+                                                dirty line) -- n via param, no cached shared word */
+    rp_run_on_stack(rp_plane_steal_slave);   /* draw on the dedicated 4KB stack */
     PLANE_DONE = 1;
 }
 
-void RP_DispatchPlanes(int from, int to)
+/* Static half-split path, kept for the live A/B (pad Y) against the work-steal: the slave draws a
+   FIXED [from,to) (the old behaviour) so w (the master's wait at the barrier) shows the count-split
+   imbalance the steal removes.  from/to set AFTER the purge (same write-back rule as the steal). */
+static int rp_static_from, rp_static_to;
+static void rp_plane_static_slave(void) { R_DrawPlaneWorklist(rp_static_from, rp_static_to); }
+static void rp_plane_static_body(void *param)
+{
+    int packed = (int)(unsigned int)param;
+    master_cache_purge();
+    rp_static_from = (packed >> 16) & 0xffff;
+    rp_static_to   = packed & 0xffff;
+    rp_run_on_stack(rp_plane_static_slave);
+    PLANE_DONE = 1;
+}
+
+/* Live A/B (pad Y, row 1 'ws'): 1 = two-pointer work-steal, 0 = static half-split.  Read by the
+   MASTER ONLY (in RP_DrawPlanesSplit) -- the chosen slave body is passed via slSlaveFunc, so the
+   slave never reads this flag (no new cross-CPU coherency surface).  DoomJo keeps
+   sat_plane_parallel=0 so it never reaches here.
+   DEFAULT 0 = STATIC: on HW the work-steal REGRESSED at E1M1 (per-plane uncached cursor sync +
+   the slave's fixed startup latency -- which makes the master finish first so w>0 every frame --
+   + the <=2-plane crossing overlap, all > the tiny count-split imbalance at n~20).  Kept behind
+   the toggle so the regression can be re-confirmed on the same scene (Y: ws0 vs ws1). */
+int sat_plane_steal = 0;
+
+void RP_WaitPlanes(void);   /* defined just below */
+
+/* Visplane split: master + slave.  Two modes for the hardware A/B (sat_plane_steal). */
+void RP_DrawPlanesSplit(int n)
 {
     PLANE_DONE = 0;
     rp_sgl_workptr_reset();                  /* GBR-creep guard for this 2nd dispatch/frame */
-    slSlaveFunc(rp_plane_slave_body, (void *)(unsigned int)(((from & 0xffff) << 16) | (to & 0xffff)));
+    if (sat_plane_steal)
+    {
+        int m = 0;
+        PLANE_MPOS = 0;
+        PLANE_SPOS = n;
+        slSlaveFunc(rp_plane_steal_body, (void *)(unsigned int)n);
+        while (m < PLANE_SPOS)               /* master: forward from 0, stop where the slave is */
+        {
+            R_DrawPlaneWorklist(m, m + 1);
+            m++;
+            PLANE_MPOS = m;
+        }
+    }
+    else
+    {
+        int half = n >> 1;                   /* old static split: master [0,half), slave [half,n) */
+        slSlaveFunc(rp_plane_static_body,
+                    (void *)(unsigned int)(((half & 0xffff) << 16) | (n & 0xffff)));
+        R_DrawPlaneWorklist(0, half);
+    }
+    RP_WaitPlanes();                         /* slave sets PLANE_DONE; purges before the blit */
 }
 
 void RP_WaitPlanes(void)
@@ -915,6 +981,73 @@ void RP_WaitMasked(void)
     master_cache_purge();                     /* read the slave's drawn sprite pixels before the blit */
 }
 
+/* ------------------------------------------------------------------------------------------ *
+ * SATURN RANK 3 (docs/RANK3_WALLPREP.md) inc-1: run the deferred wall-prep flush on the SLAVE   *
+ * instead of the master.  NON-overlapped -- the master dispatches AFTER the BSP walk (walljob_n  *
+ * final) and spins in RP_WaitWallPrep.  This relocates the Bp bucket to the slave timeline       *
+ * (validates byte-identity + the cache/stack/coherency path) but yields NO fps win yet (inc-2    *
+ * pipelines it behind the walk).  The slave is the SINGLE in-order consumer of walljobs[0..n)    *
+ * (= BSP order), so the floorclip/ceilingclip occlusion chain stays byte-identical.  Same        *
+ * dedicated 4KB stack + GBR-creep guard as the plane/masked dispatch; runs in the B phase,       *
+ * strictly before P and M, so the single slave never overlaps its own later work.                *
+ * ------------------------------------------------------------------------------------------ */
+extern void RP_FlushWallsRange(int from, int to);
+
+static volatile int rp_wp_done = 1;
+#define WP_DONE (*(volatile int *)((unsigned int)&rp_wp_done | 0x20000000u))
+static int rp_wp_n;          /* slave-side: how many walls to flush (n via slSlaveFunc param) */
+static int rp_wp_disp_n;     /* master-side: n dispatched, for the serial timeout fallback     */
+/* master-FRT ticks the master spent in RP_WaitWallPrep = the slave's flush wall-clock.  This is
+   the inc-2 go/no-go number: if it's >= the old on-master Bp, the slave is slower (LWRAM cold) and
+   inc-2's overlap won't pay.  Surfaced as 'Bp' on row 5 when sat_wallprep_slave is on (so Bp always
+   = wall-prep cost wherever it ran; the slave's own FRT cannot time a duration, see :176). */
+static unsigned int prof_wpwait;
+
+int sat_wallprep_slave = 0;  /* live pad toggle (L+R), 0/1/2; the platform ties sat_wallprep_defer.
+   1 = slave + full cache purge (cold, correct).  2 = slave + NO purge = WARM diagnostic (d32xr keeps
+   its secondary warm; here the slave reuses last frame's cache -> CORRECT ONLY in a static scene,
+   garbage if you move, but it measures the warm 'Bp' ceiling to confirm the cold-purge hypothesis). */
+
+static void rp_wallprep_slave_fn(void)   /* runs on the dedicated 4KB stack */
+{
+    RP_FlushWallsRange(0, rp_wp_n);       /* flush all queued walls, in BSP order */
+}
+
+static void rp_wallprep_body(void *param)
+{
+    unsigned int p = (unsigned int)param; /* (mode<<16)|n -- mode via the register, always fresh */
+    if (((p >> 16) & 0xff) == 1)
+        master_cache_purge();             /* mode 1: full purge (slave reads master's fresh data).
+                                             mode 2: SKIP = warm (static-scene-correct diagnostic). */
+    rp_wp_n = (int)(p & 0xffff);          /* set AFTER any purge -- n via param, no cached word */
+    rp_run_on_stack(rp_wallprep_slave_fn);
+    WP_DONE = 1;                          /* last statement, uncached */
+}
+
+void RP_DispatchWallPrep(int n)
+{
+    int mode = sat_wallprep_slave;        /* master reads it fresh; passed to the slave via the param */
+    rp_wp_disp_n = n;
+    WP_DONE = 0;
+    rp_sgl_workptr_reset();               /* GBR-creep guard for this dispatch */
+    slSlaveFunc(rp_wallprep_body, (void *)(unsigned int)(((mode & 0xff) << 16) | (n & 0xffff)));
+}
+
+void RP_WaitWallPrep(void)
+{
+    volatile int guard = 30000000;        /* bounded spin; never wedge if the slave dies */
+#if RP_PROF
+    unsigned short t0 = rp_frt();          /* master idle while the slave flushes = the flush time */
+#endif
+    while (!WP_DONE && guard-- > 0) { }
+#if RP_PROF
+    prof_wpwait = (unsigned short)(rp_frt() - t0);
+#endif
+    if (!WP_DONE)
+        RP_FlushWallsRange(0, rp_wp_disp_n);   /* slave died -> serial fallback (idempotent enough) */
+    master_cache_purge();                 /* read the slave's drawsegs/visplanes/clip/wall_acc */
+}
+
 /* SATURN PERF: master frame ms, set once/sec by the platform fps_update
    (dg_saturn.cxx) and printed as the prefix of the slave's row-18 SLV line (the
    standalone MST row was dropped -- it only pointed at rows 19/20).  Defined
@@ -928,6 +1061,8 @@ unsigned int rp_master_ms = 0;
    extern links even when RP_PROF is off (they then stay 0). */
 int sat_floor_vq_cur  = 0;
 int sat_floor_vq_peak = 0;
+/* pari A sizing (per-subsector "all floors/ceilings as VDP1 quads"), surfaced to the overlay. */
+int sat_prof_ss_n = 0, sat_prof_ss_q = 0, sat_prof_ss_qpk = 0, sat_prof_ss_q4pct = 0;
 
 #if RP_PROF
 /* Read the SH-2 free-running timer (FRC @ 0xFFFFFE12/13).  Read H then L so the
@@ -986,6 +1121,12 @@ static unsigned int   prof_floor_vq_peak; /* monotonic peak of the VDP1 candidat
    coarse bands); the near/edge surfaces (the expensive, swim-prone ones) would stay software/RBG0. */
 static unsigned int   prof_floor_vq_int;      /* this frame: interior-only quad estimate */
 static unsigned int   prof_floor_vq_int_peak; /* monotonic peak of the interior-only cost */
+/* pari A sizing (per-subsector): cost if ALL floors/ceilings were VDP1 quads (PowerSlave model). */
+static unsigned int   prof_ss_n;      /* visible subsectors this frame */
+static unsigned int   prof_ss_surf;   /* VDP1-deportable surfaces (floor + non-sky ceiling) */
+static unsigned int   prof_ss_q;      /* geometry quad count (fan pieces, untextured) */
+static unsigned int   prof_ss_q4;     /* surfaces from <=4-sided (pure-quad) subsectors */
+static unsigned int   prof_ss_q_peak; /* monotonic peak of prof_ss_q */
 #define FLOOR_HBAND    16   /* screen rows per affine strip band (the Mode-7 strip granularity) */
 #define FLOOR_MAXTILES 16   /* clamp on 64-texel u-tiles/band (the emitter would cap too) */
 #endif
@@ -996,12 +1137,15 @@ static unsigned int   prof_floor_vq_int_peak; /* monotonic peak of the interior-
 void RP_WallPrepEnter(void)
 {
 #if RP_PROF
+    if (sat_wallprep_slave) return;   /* runs on the SLAVE -> its FRT is a different clock; don't
+                                         time it here (the flush cost comes from prof_wpwait). */
     prof_wp_t0 = rp_frt();
 #endif
 }
 void RP_WallPrepLeave(void)
 {
 #if RP_PROF
+    if (sat_wallprep_slave) return;
     prof_wallprep += (unsigned short)(rp_frt() - prof_wp_t0);
 #endif
 }
@@ -1127,6 +1271,25 @@ void RP_PlanePixels(int picnum, int height, int minx, int maxx,
     }
 #else
     (void)picnum; (void)height; (void)minx; (void)maxx; (void)top; (void)bottom;
+#endif
+}
+
+/* SATURN (pari A sizing): per visible subsector, accumulate the would-be VDP1 quad cost if
+   floors+ceilings were drawn as per-subsector quads (the PowerSlave model).  numlines = side
+   count; nsurf = deportable surfaces (floor + non-sky ceiling).  pieces = quad-fan pieces for an
+   numlines-gon (<=4 sides -> 1 quad; VDP1 draws a 4-gon as one distorted sprite).  GEOMETRY-only
+   (untextured) -- texture tiling (bands x 64-wrap) would multiply it.  No-op unless RP_PROF; pure
+   C, DoomJo-safe (DoomJo links it but never reads the globals). */
+void RP_Subsector(int numlines, int nsurf)
+{
+#if RP_PROF
+    int pieces = (numlines <= 4) ? 1 : ((numlines - 2 + 1) / 2);
+    prof_ss_n++;
+    prof_ss_surf += (unsigned int)nsurf;
+    prof_ss_q    += (unsigned int)(nsurf * pieces);
+    if (numlines <= 4) prof_ss_q4 += (unsigned int)nsurf;
+#else
+    (void)numlines; (void)nsurf;
 #endif
 }
 
@@ -1340,6 +1503,7 @@ void RP_BeginFrame(void)
         prof_pp_cur_pic = -2147483647;
         prof_pp_cur_h   = 0;
         prof_floor_vq = prof_floor_vq_dom = prof_floor_vq_int = 0;
+        prof_ss_n = prof_ss_surf = prof_ss_q = prof_ss_q4 = 0;
 #endif
         return; }
 #if RP_DEBUG
@@ -1363,6 +1527,7 @@ void RP_BeginFrame(void)
     prof_pp_cur_h   = 0;
     prof_floor_vq = prof_floor_vq_dom = prof_pp_cur_vq = 0;   /* VDP1 floor estimate (peak persists) */
     prof_floor_vq_int = 0;
+    prof_ss_n = prof_ss_surf = prof_ss_q = prof_ss_q4 = 0;    /* pari A sizing (peak persists) */
 #endif
 }
 
@@ -1470,7 +1635,10 @@ static void rp_p3_prof_show(void)
     unsigned int idle = rend ? (sidle * 100u / rend) : 0u;
     /* split B: Bp = wall-prep (R_StoreWallRange, the part the slave could take, d32xr-style);
        Bw = the BSP walk + clip + sprite projection (inherently serial). */
-    unsigned int bp10 = prof_wallprep * 10u / 224u;
+    /* Bp = wall-prep cost wherever it ran: prof_wallprep when inline on the master, or the master's
+       wait for the slave flush (prof_wpwait) when sat_wallprep_slave.  Bw = B minus that = the pure
+       BSP walk in BOTH modes (so a wp0/wp1 A/B reads cleanly: Bp(wp1) > Bp(wp0) => slave slower). */
+    unsigned int bp10 = (sat_wallprep_slave ? prof_wpwait : prof_wallprep) * 10u / 224u;
     unsigned int bw10 = (b10 > bp10) ? (b10 - bp10) : 0u;
     char p[44];
     snprintf(p, sizeof p, "Bw%u.%u Bp%u.%u P%u.%u M%u.%u        ",
@@ -1535,6 +1703,12 @@ static void rp_p3_prof_show(void)
                  vsec, prof_floor_vq_peak, prof_floor_vq_int_peak);
         (void)p;   /* FLAT string parked; Vs/Vp + dom%/n now surfaced by the platform (row 17) */
     }
+    /* pari A sizing -> globals (platform shows on row 20). */
+    if (prof_ss_q > prof_ss_q_peak) prof_ss_q_peak = prof_ss_q;
+    sat_prof_ss_n     = (int)prof_ss_n;
+    sat_prof_ss_q     = (int)prof_ss_q;
+    sat_prof_ss_qpk   = (int)prof_ss_q_peak;
+    sat_prof_ss_q4pct = prof_ss_surf ? (int)(prof_ss_q4 * 100u / prof_ss_surf) : 0;
 }
 #endif
 
