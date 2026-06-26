@@ -205,6 +205,7 @@ R_RenderMaskedSegRange
    column with the texture's dominant colour (sat_wall_color), set here per wall
    section so the whole wall is one continuous hue.  Off by default. */
 extern int  sat_potato_walls;
+extern int  sat_wall_nocpu;     /* SATURN: banded/flat VDP1 modes skip the close-wall CPU fallback */
 extern int  sat_wall_color;
 extern int  sat_wall_textured;
 extern int  R_WallPotatoColor (int tex);
@@ -381,11 +382,12 @@ void R_RenderSegLoop (void)
 	}
     }
 
-    /* SATURN: pot2-fl -- a plain (non-special) wall draws as a CLAMPED flat VDP1 quad, which
-       cannot swim/explode, so the close-wall CPU fallback above is pointless (Romain: "désactive
-       le fallback cpu en pot2, vu qu'ils sont flats").  Force VDP1, no software, for every tier.
-       SPECIAL walls (sat_wall_textured) stay TEXTURED -> they CAN swim, so keep their fallback. */
-    if (sat_potato_walls && !sat_wall_textured && SAT_WALL_VDP1_OK && sat_wall_skip && rw_stopx > rw_x)
+    /* SATURN: pot2 (banded/flat) -- a plain (non-special) wall draws as a VDP1 quad, so the close-wall
+       CPU fallback above is skipped.  FLAT (pot2-fl) clamps -> can't swim; BANDED (pot2-bd) CAN swim/
+       squish on close walls, but in the tiny split windows that's accepted (Romain) for the master Bp
+       win.  Force VDP1, no software, for every tier.  SPECIAL walls (sat_wall_textured) stay TEXTURED
+       and keep their own fallback. */
+    if (sat_wall_nocpu && !sat_wall_textured && SAT_WALL_VDP1_OK && sat_wall_skip && rw_stopx > rw_x)
     {
 	sat_sw_mid = sat_sw_up = sat_sw_lo = 0;
 	if (midtexture && !curline->backsector) sat_v1_mid = 1;

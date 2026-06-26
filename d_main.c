@@ -178,6 +178,8 @@ void R_ExecuteSetViewSize (void);
 /* SATURN split-screen perf breakdown (diagnose the 2p slowdown): ms in each piece of
    the split render block, exposed for the overlay.  0 in 1p (block not entered). */
 unsigned int sat_spl_sw = 0, sat_spl_v0 = 0, sat_spl_v1 = 0, sat_spl_kick = 0;
+unsigned int sat_spl_v2 = 0, sat_spl_v3 = 0;   /* SATURN: per-view render ms for views 2/3 (3/4p) */
+int sat_split_view = 0;                         /* SATURN: current split view index (0..3); set in D_Display */
 
 void D_Display (void)
 {
@@ -330,7 +332,8 @@ void D_Display (void)
 	       3-4p = 160x112 quadrants (no HUD yet -- the 4p HUD is a later iteration).  Views render
 	       SEQUENTIALLY on the master (a concurrent 2nd renderer overflows 2MB -- docs/
 	       PARALLEL_REC_AUDIT.md); the slave still phase-splits each view.  VDP1 walls are kept for
-	       2p (accumulated across both views, kicked ONCE here); 3/4p force software walls. */
+	       ALL split views now (2p halves + 3/4p quadrants), accumulated and kicked ONCE here; the
+	       wall-skip is per-view (pad-X toggles all views VDP1 <-> all software). */
 	    int n    = sat_local_players; if (n > 4) n = 4;
 	    int twop = (n == 2);
 	    int hw   = SCREENWIDTH / 2;                                /* 160 */
@@ -340,23 +343,27 @@ void D_Display (void)
 	    int sws = sat_wall_skip;
 	    int sds = detailshift;                    /* low-detail (+ld modes) applies for all views */
 	    int sky_save = sat_vdp2_sky;              /* NBG0 can't serve N viewangles -> software sky */
-	    int vdp1 = twop && sat_split_vdp1;        /* VDP1 walls only in 2p for now; 3/4p = software */
-	    uint32_t ta = 0, tb = 0, tc = 0, td = 0;  /* split-block breakdown timers */
+	    int vdp1 = sat_split_vdp1;        /* SATURN: VDP1 walls for ALL split views (pad-X toggles all-VDP1 <-> all-software) */
+	    uint32_t tv[5] = { 0 }, td = 0;           /* per-view timestamps tv[0..n] + post-kick td */
 	    int i;
 	    sat_split_active = 1;
 	    detailshift = sat_split_lowdetail;        /* 0 = hi-detail (byte-identical); 1 = half-res */
 	    sat_psprite_yoff = fh / 2 - 50;           /* drop the half-size gun to the view bottom */
 	    sat_vdp2_sky = 0;                         /* force the SOFTWARE sky (each view draws its own) */
-	    if (!vdp1) sat_wall_skip = 0;             /* software walls (3/4p, or the 2p A/B baseline) */
-	    ta = d_ms();
+	    /* sat_wall_skip is set PER VIEW in the loop below (all views VDP1 when pad-X on; all software when off) */
+	    tv[0] = d_ms();
 	    for (i = 0; i < n; i++)
 	    {
+		/* SATURN: VDP1 owns walls for ALL views (pad-X toggles all<->software).  sat_split_view
+		   tells the accumulator which view a wall belongs to (4-way command-budget split); the
+		   wall emit adds viewwindowy so bottom-row quadrants (vpy=112) land at the right screen y. */
+		sat_split_view = i;
+		sat_wall_skip  = vdp1 ? 1 : 0;
 		R_SetViewWindow (vpx[i], twop ? 0 : vpy[i], hw, fh);
 		R_RenderPlayerView (&players[i]);
-		if (i == 0) tb = d_ms();
-		else if (i == 1) tc = d_ms();
+		tv[i + 1] = d_ms();
 	    }
-	    if (vdp1 && sat_walls_done_hook) sat_walls_done_hook (); /* single kick, both 2p views */
+	    if (vdp1 && sat_walls_done_hook) sat_walls_done_hook (); /* single kick: all accumulated views */
 	    td = d_ms();
 	    sat_split_active = 0;
 	    sat_wall_skip    = sws;
@@ -364,9 +371,11 @@ void D_Display (void)
 	    sat_psprite_yoff = 0;
 	    sat_vdp2_sky     = sky_save;
 	    sat_spl_sw   = 0;
-	    sat_spl_v0   = tb - ta;        /* view 0 (incl. its R_SetViewWindow)         */
-	    sat_spl_v1   = tc - tb;        /* view 1 (2p: the right half; 4p: top-right)  */
-	    sat_spl_kick = td - tc;        /* remaining views + the VDP1 kick             */
+	    sat_spl_v0   = (n > 0) ? (tv[1] - tv[0]) : 0;   /* per-view R_RenderPlayerView ms */
+	    sat_spl_v1   = (n > 1) ? (tv[2] - tv[1]) : 0;
+	    sat_spl_v2   = (n > 2) ? (tv[3] - tv[2]) : 0;
+	    sat_spl_v3   = (n > 3) ? (tv[4] - tv[3]) : 0;
+	    sat_spl_kick = td - tv[n];                      /* JUST the VDP1 flush+kick now */
 	    was_split = 1;
 	}
 	else

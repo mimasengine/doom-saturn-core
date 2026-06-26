@@ -873,6 +873,13 @@ int sat_vdp2_sky = 0;
    in fully-enclosed rooms the VDP1 walls' (torn) index-0 gaps show the dark backdrop instead
    of the bright sky, so the tearing is far less visible.  DoomJo ignores it (software sky). */
 int sat_frame_has_sky = 0;
+/* SATURN (sky-vs-floor classifier, Romain 2026-06-26): per-frame pixel coverage of the SKY vs the
+   dominant (player) floor, so we can measure map by map whether the HW-sky bank is worth keeping
+   (sky is NOT everywhere; the floor is) or better freed for a textured VDP2 floor.  sat_sky_px counts
+   every sky visplane (any sky mode); sat_floor_px counts the dominant-floor skip => read both in a
+   perf-sim floor-on mode (pad-Y mode 1/3).  Absolute pixel counts, reset each frame.  DoomJo-safe. */
+unsigned int sat_sky_px   = 0;
+unsigned int sat_floor_px = 0;
 /* SATURN: floor -> VDP2 RBG0 hardware Mode-7 plane.  When set by the platform,
    R_DrawPlanes leaves the FLOOR visplanes (a flat below the eye) as index 0 so the
    RBG0 floor composited behind the framebuffer shows through -- exactly like the sky
@@ -925,6 +932,11 @@ int sat_floor_ld = 0;   /* pot0.5: half-rate textured-floor fill (forward-declar
    Default 0.  Aimed at the future 2/4-player split-screen builds (more views,
    tighter budget). */
 int sat_potato_walls = 0;
+/* SATURN: skip the close-wall CPU fallback (force every tier to VDP1) for the BANDED and FLAT
+   VDP1 wall modes (wmode>=1).  Flat quads can't swim; banded quads CAN swim/squish on close
+   walls, accepted in the tiny split windows for the master Bp win.  Set by sat_apply_potato.
+   Distinct from sat_potato_walls (flat-only software solid-colour parity).  Default 0. */
+int sat_wall_nocpu = 0;
 extern byte *ylookup[];
 extern int   columnofs[];
 
@@ -956,6 +968,7 @@ void R_DrawPlanes (void)
 #endif
 
     sat_frame_has_sky = 0;   /* set below if any sky visplane is in view (platform drops NBG0 if not) */
+    sat_sky_px = 0; sat_floor_px = 0;   /* SATURN: sky-vs-floor coverage this frame (classifier) */
 #if SAT_PLANE_LOCAL
     plane_worklist_n = 0;   /* P3: reset the regular-flat worklist for this frame */
 #endif
@@ -964,7 +977,8 @@ void R_DrawPlanes (void)
        height + flat + light band here; the floor-skip below leaves just those visplanes as
        index 0 (other heights/flats/bands keep drawing in software).  (A per-frame "dominant
        floor" pick was tried and dropped -- it flickers when two floors trade the lead.) */
-    if (sat_vdp2_floor)
+    if (sat_vdp2_floor || sat_vdp1_floor)   /* SATURN: also compute it for the VDP1/perf-sim path, which
+                                               needs the dominant identity to EXCLUDE it (skip secondary only) */
     {
 	sector_t *vs = R_PointInSubsector(viewx, viewy)->sector;
 	sat_vdp2_floor_h    = vs->floorheight;
@@ -1033,6 +1047,7 @@ void R_DrawPlanes (void)
 		    int n;
 		    if (yl > yh) continue;
 		    n = yh - yl + 1;
+		    sat_sky_px += (unsigned)n;   /* SATURN classifier: sky coverage (VDP2-sky path) */
 		    if (detailshift)
 		    {
 			/* low-detail: the visplane x is the halved column; each one
@@ -1067,6 +1082,7 @@ void R_DrawPlanes (void)
 
 		if (dc_yl <= dc_yh)
 		{
+		    sat_sky_px += (unsigned)(dc_yh - dc_yl + 1);   /* SATURN classifier: sky coverage (software-sky path) */
 		    angle = (viewangle + xtoviewangle[x])>>ANGLETOSKYSHIFT;
 		    dc_x = x;
 		    dc_source = R_GetColumn(skytexture, angle);
@@ -1093,6 +1109,7 @@ void R_DrawPlanes (void)
 		int n;
 		if (yl > yh) continue;
 		n = yh - yl + 1;
+		sat_floor_px += (unsigned)n;   /* SATURN classifier: dominant-floor coverage */
 		if (detailshift)
 		{
 		    int sx = x << 1;
