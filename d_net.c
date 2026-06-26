@@ -71,13 +71,24 @@ static void PlayerQuitGame(player_t *player)
 static void RunTic(ticcmd_t *cmds, boolean *ingame)
 {
     extern boolean advancedemo;
+    extern int sat_local_players;       /* SATURN: live local split-screen count */
     unsigned int i;
 
     // Check for player quits.
 
     for (i = 0; i < MAXPLAYERS; ++i)
     {
-        if (!demoplayback && playeringame[i] && !ingame[i])
+        /* SATURN: local split-screen MP has no network, so ingame[] can lag
+           playeringame[] by a few pipeline tics whenever the live count changes
+           (a new game applies the armed count, or an in-game drop-in spawns or
+           removes a marine).  A spurious PlayerQuitGame here would evict an active
+           split marine for GOOD -- it would still render (the renderer reads
+           sat_local_players) but never think: no movement, no weapon, no respawn,
+           and its damage flash would never decay.  The active local players
+           [0..sat_local_players) never "quit"; only slots past the live count may
+           (and in local MP those are already out of the game). */
+        if (!demoplayback && playeringame[i] && !ingame[i]
+            && (int)i >= sat_local_players)
         {
             PlayerQuitGame(&players[i]);
         }

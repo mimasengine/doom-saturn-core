@@ -108,8 +108,10 @@ extern  boolean	netgame;
 extern int deathmatch;
 
 // SATURN local multiplayer (docs/MULTIPLAYER_PLAN.md): 1 = single player (default).
-extern int  sat_local_players;
+extern int  sat_local_players; // LIVE count (renderer + ticcmd read this)
+extern int  sat_armed_players; // title-armed count applied to the NEXT new game by G_DoNewGame
 extern int  sat_deathmatch;
+extern int  sat_dropin_want;   // drop-in co-op: platform-requested live player count (0 = none)
 extern void (*sat_build_local_ticcmd)(ticcmd_t *, int);
 
 // -------------------------

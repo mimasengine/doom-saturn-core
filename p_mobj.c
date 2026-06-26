@@ -596,6 +596,44 @@ void P_RemoveMobj (mobj_t* mobj)
 }
 
 
+//
+// P_SatRemovePlayerMobj
+// SATURN drop-in co-op: safely remove a live player's mobj mid-level (used when
+// the in-game player count is cycled DOWN).  Vanilla P_RemoveMobj leaves dangling
+// references behind, so first NULL every pointer that could still aim at this
+// mobj -- a chasing monster's target/tracer, a sector's soundtarget, another
+// player's attacker -- otherwise the next tic would dereference freed memory.
+//
+void P_SatRemovePlayerMobj (mobj_t* mo)
+{
+    extern int        numsectors;
+    extern sector_t*  sectors;
+    thinker_t*	th;
+    int		i;
+
+    if (!mo)
+	return;
+
+    for (th = thinkercap.next ; th != &thinkercap ; th = th->next)
+    {
+	mobj_t* m;
+	if (th->function.acp1 != (actionf_p1)P_MobjThinker)
+	    continue;
+	m = (mobj_t*)th;
+	if (m->target == mo) m->target = NULL;
+	if (m->tracer == mo) m->tracer = NULL;
+    }
+    for (i = 0 ; i < numsectors ; i++)
+	if (sectors[i].soundtarget == mo)
+	    sectors[i].soundtarget = NULL;
+    for (i = 0 ; i < MAXPLAYERS ; i++)
+	if (players[i].attacker == mo)
+	    players[i].attacker = NULL;
+
+    P_RemoveMobj (mo);
+}
+
+
 
 
 //

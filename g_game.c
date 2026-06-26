@@ -77,10 +77,12 @@
 
 void	G_ReadDemoTiccmd (ticcmd_t* cmd); 
 void	G_WriteDemoTiccmd (ticcmd_t* cmd); 
-void	G_PlayerReborn (int player); 
- 
-void	G_DoReborn (int playernum); 
- 
+void	G_PlayerReborn (int player);
+
+void	G_DoReborn (int playernum);
+void	G_SatDropInService (void);          /* SATURN drop-in co-op (serviced from G_Ticker) */
+void	P_SatRemovePlayerMobj (mobj_t* mo);  /* p_mobj.c: ref-safe player despawn */
+
 void	G_DoLoadLevel (void); 
 void	G_DoNewGame (void); 
 void	G_DoPlayDemo (void); 
@@ -854,11 +856,15 @@ boolean G_Responder (event_t* ev)
 void G_Ticker (void) 
 { 
     int		i;
-    int		buf; 
+    int		buf;
     ticcmd_t*	cmd;
-    
+
+    // SATURN: apply any pending drop-in co-op change (START on pad 2 in-game)
+    // here, between tics, before the reborn pass below sees the new players.
+    G_SatDropInService ();
+
     // do player reborns if needed
-    for (i=0 ; i<MAXPLAYERS ; i++) 
+    for (i=0 ; i<MAXPLAYERS ; i++)
 	if (playeringame[i] && players[i].playerstate == PST_REBORN) 
 	    G_DoReborn (i);
     
@@ -1289,12 +1295,131 @@ void G_DoReborn (int playernum)
 	    }	    
 	    // he's going to be inside something.  Too bad.
 	}
-	P_SpawnPlayer (&playerstarts[playernum]); 
-    } 
-} 
- 
- 
-void G_ScreenShot (void) 
+	P_SpawnPlayer (&playerstarts[playernum]);
+    }
+}
+
+
+//
+// SATURN drop-in co-op (docs/MULTIPLAYER_PLAN.md): change the LIVE local-player
+// count in the middle of a level (START on pad 2, cycling 1->2->3->4->1).
+//
+// Growing: a newly-added marine spawns at its own co-op start, FULLY equipped
+// (P_SpawnPlayer sees PST_REBORN -> G_PlayerReborn gives fist+pistol+ammo).  A
+// fresh slot has no mobj yet, so it spawns DIRECTLY via P_SpawnPlayer -- it must
+// NOT go through G_DoReborn, which dereferences players[].mo.
+//
+// Shrinking (wrap 4->1, or any reduction): the dropped marines are removed with
+// P_SatRemovePlayerMobj, which first clears every dangling reference (monster
+// target/tracer, sector soundtarget, player attacker) so nothing derefs the
+// freed mobj next tic.
+//
+// The LIVE count (this) is distinct from the title-armed count sat_armed_players
+// applied by G_DoNewGame, so a fresh game always starts at the armed count no
+// matter how the previous game's live count ended.  Default-inert for DoomJo and
+// the 1p build: nothing there ever sets sat_dropin_want, so this never runs.
+//
+int  sat_dropin_want = 0;   /* platform-requested live player count, 0 = no pending change */
+
+void G_SatDropInSetPlayers (int want)
+{
+    int n, i, j;
+
+    if (gamestate != GS_LEVEL || !usergame)
+	return;
+    if (want < 1)
+	want = 1;
+    if (want > MAXPLAYERS)
+	want = MAXPLAYERS;
+    if (want == sat_local_players)
+	return;
+
+    n = sat_local_players;
+
+    if (want > n)
+    {
+	/* ---- grow: spawn the newly-active marines at their co-op starts ---- */
+	for (i = n ; i < want ; i++)
+	{
+	    if (playeringame[i] && players[i].mo)   /* already live -> just re-count */
+	    {
+		n = i + 1;
+		continue;
+	    }
+	    if (playerstarts[i].type == 0)          /* this map has no co-op start for slot i */
+		break;
+
+	    playeringame[i] = true;
+	    players[i].playerstate = PST_REBORN;    /* P_SpawnPlayer -> G_PlayerReborn equips the marine */
+
+	    if (G_CheckSpot (i, &playerstarts[i]))
+	    {
+		P_SpawnPlayer (&playerstarts[i]);
+	    }
+	    else
+	    {
+		/* own start blocked -> borrow another player's start (as G_DoReborn does) */
+		for (j = 0 ; j < MAXPLAYERS ; j++)
+		{
+		    if (playerstarts[j].type && G_CheckSpot (i, &playerstarts[j]))
+		    {
+			playerstarts[j].type = i + 1;       /* fake as player i */
+			P_SpawnPlayer (&playerstarts[j]);
+			playerstarts[j].type = j + 1;       /* restore */
+			break;
+		    }
+		}
+		if (j == MAXPLAYERS)
+		    P_SpawnPlayer (&playerstarts[i]);       /* last-ditch (may overlap) */
+	    }
+
+	    if (!players[i].mo)                     /* spawn failed -> roll back, stop growing */
+	    {
+		playeringame[i] = false;
+		break;
+	    }
+	    n = i + 1;
+	}
+    }
+    else
+    {
+	/* ---- shrink: remove the dropped marines (refs cleared first) ---- */
+	for (i = n - 1 ; i >= want ; i--)
+	{
+	    if (players[i].mo)
+	    {
+		P_SatRemovePlayerMobj (players[i].mo);
+		players[i].mo = NULL;
+	    }
+	    playeringame[i] = false;
+	    players[i].playerstate = PST_REBORN;
+	}
+	n = want;
+    }
+
+    sat_local_players = n;
+    /* netgame while >1 so a death respawns co-op-style at the start (G_DoReborn)
+       instead of reloading the level, and the consistency check stays disabled. */
+    netgame    = (sat_local_players > 1);
+    deathmatch = (sat_local_players > 1) ? sat_deathmatch : false;
+    /* The view re-fits itself: the split block calls R_SetViewWindow per view when
+       growing, and D_Display's was_split tracker restores the full view when the
+       count drops back to 1 -- so no setsizeneeded hitch (R_ExecuteSetViewSize ~74ms). */
+}
+
+/* Serviced once per game tic from G_Ticker, so the spawn/despawn happens between
+   tics (never mid-thinker-walk from the platform input poll). */
+void G_SatDropInService (void)
+{
+    int want = sat_dropin_want;
+
+    sat_dropin_want = 0;
+    if (want)
+	G_SatDropInSetPlayers (want);
+}
+
+
+void G_ScreenShot (void)
 { 
     gameaction = ga_screenshot; 
 } 
@@ -1711,12 +1836,17 @@ G_DeferedInitNew
 /* SATURN local multiplayer (docs/MULTIPLAYER_PLAN.md, Iter 1).  Default = single player, so
    DoomJo + the 1p shipping build are behaviourally identical.  The platform sets these:
    sat_local_players (2..4) + sat_build_local_ticcmd (reads pad p -> ticcmd for players 1..N-1). */
-int  sat_local_players = 1;
+int  sat_local_players = 1;                            /* LIVE count: renderer + ticcmd read this */
+int  sat_armed_players  = 1;                            /* title-armed count for the NEXT new game */
 int  sat_deathmatch    = 0;                            /* 0 = coop, 1/2 = deathmatch */
 void (*sat_build_local_ticcmd)(ticcmd_t *, int) = 0;   /* platform hook, NULL on DoomJo/1p */
 
 void G_DoNewGame (void)
 {
+    /* SATURN: a fresh game always starts at the title-armed count, so a previous
+       game's drop-in LIVE count (which may have been cycled up to 4) can never
+       leak into a new game -- this is the authoritative reset point. */
+    sat_local_players = sat_armed_players;
     demoplayback = false;
     netdemo = false;
     netgame    = (sat_local_players > 1);              /* SATURN: local MP -> treat as a netgame */

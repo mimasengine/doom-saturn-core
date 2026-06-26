@@ -1011,14 +1011,16 @@ void R_DrawSprite (vissprite_t* spr)
  * vissprites (z-order preserved); each clips its columns to its half -> disjoint
  * pixels.  Sprite CLIPPING against the shared drawsegs is replicated; masked WALLS
  * stay on the master full-width (rare in shareware; a grate behind a slave-half
- * sprite can race -- a known limit, fixed next).  Translated columns (player
- * colours, never in 1p) fall back to the base draw. */
+ * sprite can race -- a known limit, fixed next).  Translated columns (other
+ * players' colours in local MP) are handled too (R_SlaveDrawTransColumn), so the
+ * slave (right) half shows the correct per-player colour, not the base green. */
 int sat_masked_parallel = 0;          /* gate, set by the platform (src/main.cxx) */
 int g_mask_x1 = 32767;                 /* master vissprite right clip [0,x1); reset to viewwidth each use */
 
 static int      s_dc_x, s_dc_yl, s_dc_yh, s_fuzzpos, s_x0, s_x1, s_coltype;
 static fixed_t  s_dc_iscale, s_dc_texturemid, s_spryscale, s_sprtopscreen;
 static byte    *s_dc_source;
+static byte    *s_dc_translation;   /* SATURN masked-by-half: player-colour translation table (MF_TRANSLATION) */
 static lighttable_t *s_dc_colormap;
 static short   *s_mfloorclip, *s_mceilingclip;
 static short    s_clipbot[SCREENWIDTH], s_cliptop[SCREENWIDTH];
@@ -1049,6 +1051,31 @@ static void R_SlaveDrawColumn (void)
     {
 	byte *dest = ylookup[s_dc_yl] + columnofs[s_dc_x];
 	while (count-- > 0) { *dest = colormap[source[frac>>25]]; dest += SCREENWIDTH; frac += fracstep; }
+    }
+}
+
+/* SATURN masked-by-half: like R_SlaveDrawColumn but with the player-colour
+   translation (xlat) step, so the slave's RIGHT half recolours other players'
+   marines (indigo/brown/red) instead of leaving them the base green.  Mirrors the
+   master's R_DrawTranslatedColumn / the RP_TRANS executor (rp_exec_trans). */
+static void R_SlaveDrawTransColumn (void)
+{
+    int count = s_dc_yh - s_dc_yl + 1;
+    byte *source = s_dc_source, *colormap = (byte *)s_dc_colormap, *xlat = s_dc_translation;
+    unsigned fracstep = s_dc_iscale<<9;
+    unsigned frac = (s_dc_texturemid + (s_dc_yl-centery)*s_dc_iscale)<<9;
+    if (detailshift)   /* low-detail: s_dc_x is the HALVED column -> pixel-double into 2 screen px */
+    {
+	int sx = s_dc_x << 1;
+	byte *d0 = ylookup[s_dc_yl] + columnofs[sx];
+	byte *d1 = ylookup[s_dc_yl] + columnofs[sx+1];
+	while (count-- > 0) { byte c = colormap[xlat[source[frac>>25]]]; *d0 = c; *d1 = c;
+			      d0 += SCREENWIDTH; d1 += SCREENWIDTH; frac += fracstep; }
+    }
+    else
+    {
+	byte *dest = ylookup[s_dc_yl] + columnofs[s_dc_x];
+	while (count-- > 0) { *dest = colormap[xlat[source[frac>>25]]]; dest += SCREENWIDTH; frac += fracstep; }
     }
 }
 
@@ -1098,7 +1125,9 @@ static void R_SlaveDrawMaskedColumn (column_t* column)
         {
             s_dc_source = (byte *)column + 3;
             s_dc_texturemid = basetexturemid - (column->topdelta<<FRACBITS);
-            if (s_coltype == 1) R_SlaveFuzzColumn(); else R_SlaveDrawColumn();
+            if (s_coltype == 1)      R_SlaveFuzzColumn();
+            else if (s_coltype == 2) R_SlaveDrawTransColumn();
+            else                     R_SlaveDrawColumn();
         }
         column = (column_t *)((byte *)column + column->length + 4);
     }
@@ -1110,7 +1139,16 @@ static void R_SlaveDrawVisSprite (vissprite_t* vis)
     column_t *column; int texturecolumn; fixed_t frac; patch_t *patch;
     patch = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
     s_dc_colormap = vis->colormap;
-    s_coltype = s_dc_colormap ? 0 : 1;        /* NULL colormap = fuzz/shadow */
+    if (!s_dc_colormap)
+        s_coltype = 1;                        /* NULL colormap = fuzz/shadow */
+    else if (vis->mobjflags & MF_TRANSLATION) /* other players' colours (local MP) */
+    {
+        s_coltype = 2;
+        s_dc_translation = translationtables - 256 +
+            ( (vis->mobjflags & MF_TRANSLATION) >> (MF_TRANSSHIFT-8) );
+    }
+    else
+        s_coltype = 0;                        /* normal */
     s_dc_iscale = abs(vis->xiscale)>>detailshift;
     s_dc_texturemid = vis->texturemid;
     frac = vis->startfrac;

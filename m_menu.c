@@ -1140,7 +1140,16 @@ void M_QuitResponse(int key)
 	    S_StartSound(NULL,quitsounds[(gametic>>2)&7]);
 	I_WaitVBL(105);
     }
+#ifdef __sh__
+    // SATURN/console: there is no OS to exit to -- "Quit Game" returns to the
+    // title/main menu (same as End Game) instead of running the exit path,
+    // which on a console would tear down graphics/sound and limp back into the
+    // game loop in an undefined state.  Shared verbatim with DoomJo (also __sh__).
+    M_ClearMenus();
+    D_StartTitle();
+#else
     I_Quit ();
+#endif
 }
 
 

@@ -316,8 +316,14 @@ void D_Display (void)
 	extern int sat_split_active, sat_split_vdp1, sat_wall_skip, viewheight;
 	extern int detailshift, sat_split_lowdetail, sat_psprite_yoff, sat_vdp2_sky;
 	extern void R_SetViewWindow (int, int, int, int);
+	extern void R_ExecuteSetViewSize (void);
 	extern void (*sat_walls_done_hook)(void);
-	if (sat_local_players > 1)
+	static int was_split = 0;
+	/* SATURN: split-render only a REAL co-op game (usergame).  An armed
+	   sat_local_players>1 left over the attract/demo loop (e.g. after a
+	   drop-in game returns to the title) must NOT split -- a demo is 1p, so
+	   players[1..].mo are NULL and R_RenderPlayerView would deref NULL. */
+	if (sat_local_players > 1 && usergame)
 	{
 	    /* SATURN split-screen (docs/MULTIPLAYER_PLAN.md): render each player into its own
 	       viewport.  2p = two 160x160 vertical halves with the compact HUD in the bottom 64px;
@@ -361,9 +367,21 @@ void D_Display (void)
 	    sat_spl_v0   = tb - ta;        /* view 0 (incl. its R_SetViewWindow)         */
 	    sat_spl_v1   = tc - tb;        /* view 1 (2p: the right half; 4p: top-right)  */
 	    sat_spl_kick = td - tc;        /* remaining views + the VDP1 kick             */
+	    was_split = 1;
 	}
 	else
+	{
+	    /* SATURN: coming back from a split (drop-in down-cycle, or a new 1p game
+	       after a co-op session) the per-view R_SetViewWindow left the view fitted
+	       to a half/quadrant -- restore the full-screen view once on the transition
+	       so a 1p game never renders into a stale partial window. */
+	    if (was_split)
+	    {
+		R_ExecuteSetViewSize ();
+		was_split = 0;
+	    }
 	    R_RenderPlayerView (&players[displayplayer]);
+	}
     }
 #if DISPLAY_DEBUG
     dd_t2 = d_ms();  /* after R_RenderPlayerView */
@@ -854,6 +872,17 @@ void D_DoAdvanceDemo (void)
 //
 void D_StartTitle (void)
 {
+    // SATURN: returning to the attract loop (boot / End Game / Quit Game) ends any
+    // co-op session, so reset the local-player state to single-player.  This gives a
+    // clean 1p main menu after Quit and keeps a stale armed count (or a pending
+    // drop-in) from leaking into the title/demo loop.  The 2nd pad re-arms co-op at
+    // the title with START (poll_pad).  Inert for DoomJo / the 1p build (already 1).
+    sat_local_players = 1;
+    sat_dropin_want   = 0;
+    netgame           = false;
+    deathmatch        = false;
+    playeringame[1] = playeringame[2] = playeringame[3] = false;
+
     gameaction = ga_nothing;
     demosequence = -1;
     D_AdvanceDemo ();
