@@ -911,7 +911,11 @@ int sat_plane_steal = 0;
    below the count-split imbalance the steal removes at low n).  DoomJo keeps sat_plane_parallel=0 so
    it never reaches here.  rp_plane_lock[] = 256 bytes .bss, harmless/unused in DoomJo. */
 static volatile unsigned char rp_plane_lock[MAXVISPLANES];
-int sat_plane_tas = 0;
+/* DEFAULT ON (2026-06-29): HW-validated >= static EVERYWHERE (+0.9..+0.3 fps, never regresses).
+   The master idle it leaves (w) is FREE -- the master has nothing else in the plane phase -- so
+   row-split (which fills that idle by DUPLICATING the plane walk on both CPUs) is reproducibly
+   ~0.3 fps SLOWER and stays parked (sat_plane_rowsplit, off).  Toggle off via pad-C for A/B. */
+int sat_plane_tas = 1;
 
 /* TAS.B claim of rp_plane_lock[i]: returns 1 if WE won it (byte was 0), 0 if already taken. */
 static inline int rp_tas_claim(int i)
@@ -936,6 +940,27 @@ static void rp_plane_tas_body(void *param)
     PLANE_DONE = 1;
 }
 
+/* SATURN row-split (sat_plane_rowsplit) -- the UNIVERSAL balancer (supersedes the plane-grain
+   split): both CPUs draw ALL planes, master the TOP rows [0,mid), slave [mid,256), via
+   R_DrawPlaneWorklistRows.  The per-row FILL (the real cost) is split 50/50 regardless of plane
+   sizes, so a single DOMINANT plane (d99%) is balanced across both SH-2 -- exactly what the
+   plane-grain split (static / TAS) cannot do.  Whole-cache purge kept for the slave (per-frame
+   coherency).  DoomJo keeps sat_plane_parallel=0 -> never reached. */
+int sat_plane_rowsplit = 0;
+extern int viewheight;
+extern void R_DrawPlaneWorklistRows(int from, int to, int row_lo, int row_hi);
+static int rp_rows_n, rp_rows_mid;
+static void rp_plane_rows_slave(void) { R_DrawPlaneWorklistRows(0, rp_rows_n, rp_rows_mid, 256); }
+static void rp_plane_rows_body(void *param)
+{
+    int packed = (int)(unsigned int)param;
+    master_cache_purge();                /* per-frame worklist/visplane/table coherency */
+    rp_rows_n   = (packed >> 16) & 0xffff;
+    rp_rows_mid = packed & 0xffff;
+    rp_run_on_stack(rp_plane_rows_slave);
+    PLANE_DONE = 1;
+}
+
 void RP_WaitPlanes(void);   /* defined just below */
 
 /* Visplane split: master + slave.  Two modes for the hardware A/B (sat_plane_steal). */
@@ -943,7 +968,13 @@ void RP_DrawPlanesSplit(int n)
 {
     PLANE_DONE = 0;
     rp_sgl_workptr_reset();                  /* GBR-creep guard for this 2nd dispatch/frame */
-    if (sat_plane_tas)
+    if (sat_plane_rowsplit)
+    {
+        int mid = viewheight >> 1;           /* 50/50 screen rows (later: bias on w) */
+        slSlaveFunc(rp_plane_rows_body, (void *)(unsigned int)(((n & 0xffff) << 16) | (mid & 0xffff)));
+        R_DrawPlaneWorklistRows(0, n, 0, mid);   /* master: TOP rows of ALL planes; slave: bottom */
+    }
+    else if (sat_plane_tas)
     {
         int m = n - 1;
         for (int i = 0; i < n; i++) rp_plane_lock[i] = 0;   /* arm claims (write-through to RAM) */
@@ -1718,8 +1749,13 @@ static void rp_p3_prof_show(void)
     /* w = master idle waiting for the slave (master FRT): w~0 => the slave keeps up / balanced.
        idle% = the slave's idle share of the render: it works in P, sits idle in B+M -> this is
        the slack masked + wall-prep will fill (it should DROP as each phase is offloaded). */
-    snprintf(p, sizeof p, "MST%ums w%u.%u SLVidle%u%% ",
-             rp_master_ms, w10/10, w10%10, idle);
+    /* nr = MST - render(B+P+M) = the NON-render master cost (blit / game-tic / sound / VDP1 present).
+       Surfaces whether a heavy frame is render-bound (small nr) or dominated by non-render (big nr,
+       seen ~140ms on heavy Doom II maps).  rend is tenths-ms; rp_master_ms is ms. */
+    unsigned int rend_ms = rend / 10u;
+    unsigned int nr_ms   = (rp_master_ms > rend_ms) ? (rp_master_ms - rend_ms) : 0u;
+    snprintf(p, sizeof p, "MST%ums w%u.%u SLVidle%u%% nr%u ",
+             rp_master_ms, w10/10, w10%10, idle, nr_ms);
     dbg_print(0, 3, p);   /* OVERLAY 2026-06-24: critical-path packed to rows 3-5 */
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one
        that actually runs (parity disabled), so the setter MUST live here too -- not only in

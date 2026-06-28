@@ -712,7 +712,8 @@ static inline void R_PotatoSpan (int y, int x1, int x2, fixed_t plheight,
 }
 
 static void R_DrawVisplanePotato (visplane_t *pl, int color,
-                                  lighttable_t **plzlight, fixed_t plheight)
+                                  lighttable_t **plzlight, fixed_t plheight,
+                                  int row_lo, int row_hi)   /* SATURN row-split: only fill spans whose row is in [row_lo,row_hi) */
 {
     int spanstart_l[256];   /* per-CPU, on the stack.  SATURN BUGFIX: [256] not
                                [SCREENHEIGHT(224)] -- this is indexed by pl->top[x]/
@@ -730,8 +731,8 @@ static void R_DrawVisplanePotato (visplane_t *pl, int color,
         int t1 = pl->top[x-1], b1 = pl->bottom[x-1];
         int t2 = pl->top[x],   b2 = pl->bottom[x];
 
-        while (t1 < t2 && t1 <= b1) { R_PotatoSpan (t1, spanstart_l[t1], x-1, plheight, plzlight, color); t1++; }
-        while (b1 > b2 && b1 >= t1) { R_PotatoSpan (b1, spanstart_l[b1], x-1, plheight, plzlight, color); b1--; }
+        while (t1 < t2 && t1 <= b1) { if (t1 >= row_lo && t1 < row_hi) R_PotatoSpan (t1, spanstart_l[t1], x-1, plheight, plzlight, color); t1++; }
+        while (b1 > b2 && b1 >= t1) { if (b1 >= row_lo && b1 < row_hi) R_PotatoSpan (b1, spanstart_l[b1], x-1, plheight, plzlight, color); b1--; }
         while (t2 < t1 && t2 <= b2) { spanstart_l[t2] = x; t2++; }
         while (b2 > b1 && b2 >= t2) { spanstart_l[b2] = x; b2--; }
     }
@@ -805,7 +806,8 @@ static inline void R_TexturedSpan (int y, int x1, int x2, fixed_t plheight,
 }
 
 static void R_DrawVisplaneTextured (visplane_t *pl, byte *src,
-                                    lighttable_t **plzlight, fixed_t plheight)
+                                    lighttable_t **plzlight, fixed_t plheight,
+                                    int row_lo, int row_hi)   /* SATURN row-split: only fill spans whose row is in [row_lo,row_hi) */
 {
     int spanstart_l[256];   /* per-CPU, on the stack.  SATURN BUGFIX: [256] not
                                [SCREENHEIGHT(224)] -- this is indexed by pl->top[x]/
@@ -821,8 +823,8 @@ static void R_DrawVisplaneTextured (visplane_t *pl, byte *src,
         int t1 = pl->top[x-1], b1 = pl->bottom[x-1];
         int t2 = pl->top[x],   b2 = pl->bottom[x];
 
-        while (t1 < t2 && t1 <= b1) { R_TexturedSpan (t1, spanstart_l[t1], x-1, plheight, plzlight, src); t1++; }
-        while (b1 > b2 && b1 >= t1) { R_TexturedSpan (b1, spanstart_l[b1], x-1, plheight, plzlight, src); b1--; }
+        while (t1 < t2 && t1 <= b1) { if (t1 >= row_lo && t1 < row_hi) R_TexturedSpan (t1, spanstart_l[t1], x-1, plheight, plzlight, src); t1++; }
+        while (b1 > b2 && b1 >= t1) { if (b1 >= row_lo && b1 < row_hi) R_TexturedSpan (b1, spanstart_l[b1], x-1, plheight, plzlight, src); b1--; }
         while (t2 < t1 && t2 <= b2) { spanstart_l[t2] = x; t2++; }
         while (b2 > b1 && b2 >= t2) { spanstart_l[b2] = x; b2--; }
     }
@@ -847,18 +849,24 @@ extern int  sat_plane_parallel;
    the static half-split (master [0,half) / slave [half,n)) or, when sat_plane_steal=1, the
    two-pointer work-steal (master fwd from 0 / slave bwd from n-1, one plane per call).  DoomJo /
    sat_plane_parallel=0 calls it once as (0,n) on the master. */
-void R_DrawPlaneWorklist (int from, int to)
+void R_DrawPlaneWorklistRows (int from, int to, int row_lo, int row_hi)
 {
     int i;
     for (i = from; i < to; i++)
     {
         planework_t *w = &plane_worklist[i];
         if (w->potato)
-            R_DrawVisplanePotato   (w->pl, w->color, w->plzlight, w->plheight);
+            R_DrawVisplanePotato   (w->pl, w->color, w->plzlight, w->plheight, row_lo, row_hi);
         else
-            R_DrawVisplaneTextured (w->pl, w->src, w->plzlight, w->plheight);
+            R_DrawVisplaneTextured (w->pl, w->src, w->plzlight, w->plheight, row_lo, row_hi);
     }
 }
+/* SATURN row-split (the universal balancer): both CPUs draw ALL planes but only the spans whose ROW
+   is in [row_lo,row_hi) -- splits the per-row FILL (the real cost) regardless of plane sizes, so a
+   single DOMINANT plane (d99%) is split across both SH-2, which the plane-granularity split cannot do.
+   The spanstart walk runs fully on both CPUs (cheap); only R_*Span is gated. row_hi=256 = full byte
+   range => the non-split callers below stay render-identical (gate always true). */
+void R_DrawPlaneWorklist (int from, int to) { R_DrawPlaneWorklistRows(from, to, 0, 256); }
 #endif
 
 
