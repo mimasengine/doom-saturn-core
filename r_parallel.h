@@ -73,4 +73,9 @@ extern int rp_disabled;
    declaration only -> zero impact). */
 void rp_sgl_workptr_reset(void);
 
+/* SATURN: set to 1 by the platform when slSynch() runs every frame, so
+   rp_sgl_workptr_reset() becomes a no-op (slSynch owns the work-pointer reset and the
+   slave auto-resyncs).  Default 0 = the manual freeze guard stays active (DoomJo). */
+extern int rp_slsynch_owns_frame;
+
 #endif

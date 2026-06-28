@@ -728,8 +728,21 @@ static int rp_wait(volatile int *flag)
    -> CPU illegal-instruction exception -> SGL halt-loop = the freeze.  We
    restore GBR+72 to its post-init base before each slSlaveFunc, exactly as
    slSynch would, so the single per-frame record always reuses the same slot. */
+/* SATURN slSynch model (Mimas vdp1-full-slsynch): when the platform drives slSynch()
+   every frame, slSynch itself resets the SGL slave work WRITE pointer (GBR+72) to the
+   CommandBuf base every frame, and the slave's _SlaveControl auto-resyncs its READ
+   pointer (GBR+68) the instant it sees +72 rewound below it.  The manual rewind below
+   then becomes ACTIVELY HARMFUL: it forces +68 back to a stale frame-1 base that slSynch
+   never targets, desyncing the slave command consumer so id=40 sprite records (the VDP1
+   walls) get sorted into a _SortList that slSynch's _sbMakeDMATable never DMAs to VDP1 =
+   invisible walls.  The platform sets this to 1 to neutralise every rp_sgl_workptr_reset
+   call at once (rp_restart, the extra wallprep/plane/masked dispatches, and the blit).
+   DoomJo (full software, no slSynch) leaves it 0 so its GBR-creep freeze guard stays. */
+int rp_slsynch_owns_frame = 0;
+
 void rp_sgl_workptr_reset(void)
 {
+    if (rp_slsynch_owns_frame) return;   /* slSynch owns +72; the slave auto-resyncs +68 */
     /* The SGL slave work area has TWO pointers that slSlaveFunc/the slave bump
        +12B per frame and that slSynch normally resets together: the WRITE pointer
        at GBR+72 and the slave's READ pointer at GBR+68 (confirmed on hardware via

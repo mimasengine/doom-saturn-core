@@ -266,6 +266,29 @@ extern int sat_vdp2_floor;
 #define SAT_SEG_MAX 4096
 static unsigned char sat_seg_cpu[SAT_SEG_MAX];
 
+/* SATURN DIAG (missing-walls hunt): per-frame tally of WHERE each wall tier goes, so one HW boot
+   tells us if the missing walls are floor-culled, CPU-routed, or VDP1-routed -- no guessing.
+   Read + reset by the platform (dg_saturn.cxx vdp1_raw_present) once per frame.  Pure ints, safe
+   on DoomJo (it just never reads them). */
+int sat_dbg_cull = 0;     /* tiers culled: entirely below the RBG0 floor line (drawn by neither) */
+int sat_dbg_part = 0;     /* tiers handed to CPU because partially below the floor line */
+int sat_dbg_cpu  = 0;     /* tiers routed to CPU (too close / magnified, incl. exit-overlap) */
+int sat_dbg_v1   = 0;     /* tiers handed to the VDP1 hook (accumulated) */
+
+/* SATURN A/B (missing-walls test): 1 = the RBG0 floor-cull is active (a wall entirely below the
+   floor line is dropped -- restores the occlusion the transparent RBG0 floor lost).  0 = disable
+   the cull, so a would-be-culled wall falls through to the "partially below" branch and the CPU
+   draws it clipped to floorclip (no VDP1 bleed-through).  Lets us see on HW whether the missing
+   walls are the floor-culled ones.  Set by the platform (dg_saturn.cxx).  Default 1 = normal. */
+int sat_wall_floorcull = 1;
+
+/* SATURN A/B (missing-walls, Romain's plan 2026-06-28): 1 = FORCE every textured tier onto the
+   VDP1 hook -- bypass ALL the CPU-routing conditions (magnified, span>SPAN, span>=V1, floor-cull,
+   partial-below).  Lets us see what VDP1 does with the COMPLETE wall set; the close/magnified ones
+   WILL squish (that is why those conditions exist) -- we re-add them one at a time afterwards.
+   0 = normal routing.  Set by the platform (dg_saturn.cxx). */
+int sat_wall_forcev1 = 0;
+
 void R_RenderSegLoop (void)
 {
     angle_t		angle;
@@ -398,6 +421,21 @@ void R_RenderSegLoop (void)
 	}
     }
 
+    /* SATURN A/B force-everything-to-VDP1 (sat_wall_forcev1): override ALL the routing above so
+       every textured tier goes to the VDP1 hook regardless of magnification / span.  The cull and
+       partial-below branches below are also bypassed when this is set.  Squish on close walls is
+       EXPECTED here -- this is the "draw them all first" step, conditions re-added afterwards. */
+    if (sat_wall_forcev1 && sat_wall_hook && SAT_WALL_VDP1_OK && sat_wall_skip && rw_stopx > rw_x)
+    {
+	sat_sw_mid = sat_sw_up = sat_sw_lo = 0;
+	sat_v1_mid = (midtexture && !curline->backsector) ? 1 : 0;
+	if (curline->backsector)
+	{
+	    sat_v1_up = toptexture    ? 1 : 0;
+	    sat_v1_lo = bottomtexture ? 1 : 0;
+	}
+    }
+
     /* SATURN VDP1 world renderer (Step 2): one-sided (solid) walls -> the platform as
        a quad.  The 4 screen corners come from the same topfrac/bottomfrac the loop
        below steps; midtexture = the full-height wall texture. */
@@ -426,12 +464,13 @@ void R_RenderSegLoop (void)
 	     -> hand the tier to the SOFTWARE renderer, which clips each column to floorclip (no
 	     texture squish).  sat_sw_mid forces the column loop + sw_draws below.
 	   - fully above: VDP1 as usual. */
-	if (sat_vdp2_floor && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
-	    { /* entirely below the floor -> cull (neither VDP1 nor CPU draws it) */ }
-	else if (sat_vdp2_floor && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
-	    sat_sw_mid = 1;   /* partially below -> CPU fallback (clipped to the floor line) */
-	else if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, midtexture, u1, u2, v0, v1, cm))
-	    sat_sw_mid = 1;   /* VDP1 starved (command list full) -> draw this wall in SOFTWARE, not sky */
+	if (!sat_wall_forcev1 && sat_vdp2_floor && sat_wall_floorcull && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
+	    { sat_dbg_cull++; /* entirely below the floor -> cull (neither VDP1 nor CPU draws it) */ }
+	else if (!sat_wall_forcev1 && sat_vdp2_floor && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
+	    { sat_dbg_part++; sat_sw_mid = 1; }  /* partially below -> CPU fallback (clipped to floor) */
+	else { sat_dbg_v1++;
+	    if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, midtexture, u1, u2, v0, v1, cm))
+		sat_sw_mid = 1; }  /* VDP1 starved (command list full) -> draw this wall in SOFTWARE, not sky */
     }
 
     /* SATURN VDP1 world renderer: two-sided walls -> upper (toptexture) + lower
@@ -458,13 +497,13 @@ void R_RenderSegLoop (void)
 	    /* SATURN: same floor handling as the other tiers -- cull an upper (toptexture) wall
 	       entirely below the RBG0 floor line; hand a partially-below one to the CPU (clips to
 	       floorclip).  (Rare for a ceiling-side tier, but completes the set.) */
-	    if (sat_vdp2_floor && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
-		{ /* entirely below the floor -> cull */ }
-	    else if (sat_vdp2_floor && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
-		sat_sw_up = 1;   /* partially below -> CPU fallback (clipped to the floor line) */
-	    else
+	    if (!sat_wall_forcev1 && sat_vdp2_floor && sat_wall_floorcull && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
+		{ sat_dbg_cull++; /* entirely below the floor -> cull */ }
+	    else if (!sat_wall_forcev1 && sat_vdp2_floor && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
+		{ sat_dbg_part++; sat_sw_up = 1; }  /* partially below -> CPU fallback (clipped to floor) */
+	    else { sat_dbg_v1++;
 		if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, toptexture, u1, u2, v0, v1, cm))
-		    sat_sw_up = 1;   /* VDP1 starved (list full) -> draw this upper in SOFTWARE, not sky */
+		    sat_sw_up = 1; }  /* VDP1 starved (list full) -> draw this upper in SOFTWARE, not sky */
 	}
 	if (bottomtexture && sat_v1_lo)   /* bottom of the opening -> floor */
 	{
@@ -476,13 +515,13 @@ void R_RenderSegLoop (void)
 	    /* SATURN: same floor handling as the one-sided wall -- cull a lower (bottomtexture)
 	       wall entirely below the floor; hand a partially-below one to the CPU, which clips
 	       each column to floorclip (no VDP1 bleed-through, no squish). */
-	    if (sat_vdp2_floor && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
-		{ /* entirely below the floor -> cull */ }
-	    else if (sat_vdp2_floor && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
-		sat_sw_lo = 1;   /* partially below -> CPU fallback (clipped to the floor line) */
-	    else
+	    if (!sat_wall_forcev1 && sat_vdp2_floor && sat_wall_floorcull && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
+		{ sat_dbg_cull++; /* entirely below the floor -> cull */ }
+	    else if (!sat_wall_forcev1 && sat_vdp2_floor && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
+		{ sat_dbg_part++; sat_sw_lo = 1; }  /* partially below -> CPU fallback (clipped to floor) */
+	    else { sat_dbg_v1++;
 		if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, bottomtexture, u1, u2, v0, v1, cm))
-		    sat_sw_lo = 1;   /* VDP1 starved (list full) -> draw this lower in SOFTWARE, not sky */
+		    sat_sw_lo = 1; }  /* VDP1 starved (list full) -> draw this lower in SOFTWARE, not sky */
 	}
     }
 #undef SAT_VROWS
@@ -498,6 +537,16 @@ void R_RenderSegLoop (void)
     else
         sw_draws = (toptexture    && (!sat_wall_skip || sat_sw_up))
                 || (bottomtexture && (!sat_wall_skip || sat_sw_lo));
+
+    /* SATURN DIAG: pure-CPU tiers (close/magnified -> sat_v1 was forced 0 in the routing block).
+       Partial-floor CPU tiers have sat_v1==1 (counted in sat_dbg_part); this isolates the close/mag
+       route so the readout's 4 buckets (cull+part+v1+cpu) sum to the seg's textured tiers. */
+    if (sat_wall_skip)
+    {
+        if (sat_sw_mid && !sat_v1_mid) sat_dbg_cpu++;
+        if (sat_sw_up  && !sat_v1_up)  sat_dbg_cpu++;
+        if (sat_sw_lo  && !sat_v1_lo)  sat_dbg_cpu++;
+    }
 
     for ( ; rw_x < rw_stopx ; rw_x++)
     {
