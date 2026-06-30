@@ -934,6 +934,12 @@ int sat_vdp2_floor_dominant = 0;
    sky/floor decalage at any vantage).  Reset to a large sentinel each frame; stays there if no floor
    is in view (platform falls back to its static horizon).  DoomJo never reads it. */
 int sat_vdp2_floor_top_y = 0x3FFF;
+/* SATURN (Romain 2026-06-30): floorheight of the sector the PLAYER stands in (the view sector under the
+   eye), independent of the dominant pick.  The platform's player-height horizon (the "line-color" upper
+   bound) keys on THIS, not on sat_vdp2_floor_h -- which is the DOMINANT floor's height when
+   sat_vdp2_floor_dominant is set (they were the same before that feature).  Set in R_DrawPlanes when the
+   HW floor is active; DoomJo never reads it. */
+int sat_view_floor_h = 0;
 /* SATURN: the player's-floor flat data (64x64 = 4096 bytes) for the platform to swizzle
    into the RBG0 cells.  Same lump the software floor would use (animated-flat aware via
    flattranslation).  Returns 0 outside a level.  Off-path for DoomJo (never called). */
@@ -1018,6 +1024,7 @@ void R_DrawPlanes (void)
                                                needs the dominant identity to EXCLUDE it (skip secondary only) */
     {
 	sector_t *vs = R_PointInSubsector(viewx, viewy)->sector;
+	sat_view_floor_h = vs->floorheight;   /* player's view-sector floor height -> the platform's player-height horizon */
 	if (!sat_vdp2_floor_dominant)
 	{
 	    /* legacy: the floor the player stands in */
