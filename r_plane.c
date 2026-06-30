@@ -921,6 +921,13 @@ lighttable_t *sat_vdp2_floor_cmap = 0;
    or dark ZONE) keeps drawing in software at its own brightness, so it stays correct no
    matter where the player stands (instead of the whole HW floor flipping brightness). */
 int sat_vdp2_floor_band = 0;
+/* SATURN (Romain 2026-06-30): alternate RBG0 floor pick.  0 (default, and DoomJo) -> RBG0 renders
+   the floor UNDER THE EYE (legacy).  1 -> RBG0 renders the DOMINANT visible floor (the flat
+   covering the most on-screen pixels), recomputed ONLY when the view sector changes -- kept
+   latched within a sector so there is no per-frame flicker (which is exactly why the old
+   per-frame dominant pick was dropped).  Runtime toggle so BOTH paths stay compiled and are
+   A/B-switchable without a rebuild; the platform sets it.  DoomJo never sets it. */
+int sat_vdp2_floor_dominant = 0;
 /* SATURN: the player's-floor flat data (64x64 = 4096 bytes) for the platform to swizzle
    into the RBG0 cells.  Same lump the software floor would use (animated-flat aware via
    flattranslation).  Returns 0 outside a level.  Off-path for DoomJo (never called). */
@@ -947,6 +954,16 @@ int sat_potato_walls = 0;
 int sat_wall_nocpu = 0;
 extern byte *ylookup[];
 extern int   columnofs[];
+
+/* SATURN: derive the RBG0 floor colormap from a light band, EXACTLY like the software floor's
+   nearest-distance shade (zlight[band+extralight][0]).  Shared by the under-eye and dominant
+   floor picks so both stay luminosity-identical.  See the under-eye block for the rationale. */
+static void sat_floor_cmap_from_band(int band)
+{
+    int li = band + extralight;
+    if (li < 0) li = 0; else if (li >= LIGHTLEVELS) li = LIGHTLEVELS - 1;
+    sat_vdp2_floor_cmap = zlight[li][0];
+}
 
 //
 // R_DrawPlanes
@@ -981,29 +998,84 @@ void R_DrawPlanes (void)
     plane_worklist_n = 0;   /* P3: reset the regular-flat worklist for this frame */
 #endif
 
-    /* SATURN: RBG0 renders the player's CURRENT floor.  Capture the view sector's floor
-       height + flat + light band here; the floor-skip below leaves just those visplanes as
-       index 0 (other heights/flats/bands keep drawing in software).  (A per-frame "dominant
-       floor" pick was tried and dropped -- it flickers when two floors trade the lead.) */
+    /* SATURN: pick the floor RBG0 renders.  Two modes (sat_vdp2_floor_dominant):
+         0 (default) -- the floor UNDER THE EYE (view sector), captured every frame.
+         1           -- the DOMINANT visible floor, recomputed ONLY when the view sector changes
+                        (kept latched within a sector -> stable, no per-frame flicker, the reason
+                        the old per-frame dominant pick was dropped).
+       The floor-skip below leaves index 0 ONLY on visplanes matching the chosen (height,flat,band)
+       triple; other heights/flats/bands keep drawing in software at their own brightness.  The
+       colormap (nearest-distance shade) is derived from the chosen band via sat_floor_cmap_from_band. */
     if (sat_vdp2_floor || sat_vdp1_floor)   /* SATURN: also compute it for the VDP1/perf-sim path, which
                                                needs the dominant identity to EXCLUDE it (skip secondary only) */
     {
 	sector_t *vs = R_PointInSubsector(viewx, viewy)->sector;
-	sat_vdp2_floor_h    = vs->floorheight;
-	sat_vdp2_floor_pic  = vs->floorpic;
-	sat_vdp2_floor_band = vs->lightlevel >> LIGHTSEGSHIFT;   /* light band, for the skip match */
-	/* light: map the view sector's light band (+extralight, like the software floor) to a
-	   colormap level (0 = brightest .. NUMCOLORMAPS-1 = darkest) so the RBG0 floor dims with
-	   the room.  The floor-skip below leaves ONLY same-band visplanes for RBG0; differently-
-	   lit same-flat sectors (a brighter/darker ZONE) keep drawing in software at THEIR own
-	   brightness -> the bright zone stays bright regardless of where the player stands. */
+	if (!sat_vdp2_floor_dominant)
 	{
-	    int li = sat_vdp2_floor_band + extralight;
-	    int lvl;
-	    if (li < 0) li = 0; else if (li >= LIGHTLEVELS) li = LIGHTLEVELS - 1;
-	    lvl = (LIGHTLEVELS - 1 - li) * NUMCOLORMAPS / LIGHTLEVELS;   /* bright band -> level 0 */
-	    if (lvl < 0) lvl = 0; else if (lvl >= NUMCOLORMAPS) lvl = NUMCOLORMAPS - 1;
-	    sat_vdp2_floor_cmap = colormaps + lvl * 256;
+	    /* legacy: the floor the player stands in */
+	    sat_vdp2_floor_h    = vs->floorheight;
+	    sat_vdp2_floor_pic  = vs->floorpic;
+	    sat_vdp2_floor_band = vs->lightlevel >> LIGHTSEGSHIFT;   /* light band, for the skip match */
+	    sat_floor_cmap_from_band(sat_vdp2_floor_band);
+	}
+	else
+	{
+	    /* dominant: recompute only on a view-sector change; otherwise keep the latched floor */
+	    static sector_t *sat_dom_last_sec = (sector_t *)0;
+	    if (vs != sat_dom_last_sec)
+	    {
+		/* sum visible-FLOOR coverage by (picnum,height,band) triple, then pick the largest.
+		   Cheap because it runs only on a sector change.  Sky and ceilings (height >= viewz)
+		   are excluded so the winner is always a flat the floor-skip below can hand to RBG0.
+		   visplanes are already complete here (built during the BSP/seg pass). */
+		struct { fixed_t h; int pic; int band; unsigned int cov; } acc[16];
+		int nacc = 0, bi = -1, k, x;
+		unsigned int bestcov = 0;
+		visplane_t *p;
+		sat_dom_last_sec = vs;
+		for (p = visplanes ; p < lastvisplane ; p++)
+		{
+		    unsigned int cov = 0;
+		    int band;
+		    if (p->minx > p->maxx) continue;
+		    if (p->minx < 0 || p->maxx >= SCREENWIDTH) continue;   /* skip corrupt visplane */
+		    if (p->picnum == skyflatnum) continue;                 /* sky is not a floor */
+		    if (p->height >= viewz) continue;                      /* ceiling (at/above the eye) */
+		    for (x = p->minx ; x <= p->maxx ; x++)
+		    {
+			int t = p->top[x], b = p->bottom[x];
+			if (t <= b) cov += (unsigned)(b - t + 1);           /* 0xff sentinel -> t>b -> skipped */
+		    }
+		    if (!cov) continue;
+		    band = p->lightlevel >> LIGHTSEGSHIFT;
+		    for (k = 0 ; k < nacc ; k++)
+			if (acc[k].h == p->height && acc[k].pic == p->picnum && acc[k].band == band)
+			    break;
+		    if (k == nacc)
+		    {
+			if (nacc >= 16) continue;   /* table full: ignore further minor triples */
+			acc[k].h = p->height; acc[k].pic = p->picnum; acc[k].band = band; acc[k].cov = 0;
+			nacc++;
+		    }
+		    acc[k].cov += cov;
+		    if (acc[k].cov > bestcov) { bestcov = acc[k].cov; bi = k; }
+		}
+		if (bi >= 0)
+		{
+		    sat_vdp2_floor_h    = acc[bi].h;
+		    sat_vdp2_floor_pic  = acc[bi].pic;
+		    sat_vdp2_floor_band = acc[bi].band;
+		}
+		else
+		{
+		    /* no floor in view (looking at sky/ceiling): fall back to the under-eye floor */
+		    sat_vdp2_floor_h    = vs->floorheight;
+		    sat_vdp2_floor_pic  = vs->floorpic;
+		    sat_vdp2_floor_band = vs->lightlevel >> LIGHTSEGSHIFT;
+		}
+		sat_floor_cmap_from_band(sat_vdp2_floor_band);
+	    }
+	    /* else: keep the latched sat_vdp2_floor_* from the last sector change */
 	}
     }
 
