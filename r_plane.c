@@ -928,6 +928,12 @@ int sat_vdp2_floor_band = 0;
    per-frame dominant pick was dropped).  Runtime toggle so BOTH paths stay compiled and are
    A/B-switchable without a rebuild; the platform sets it.  DoomJo never sets it. */
 int sat_vdp2_floor_dominant = 0;
+/* SATURN (Romain 2026-06-30): the TOP screen row (framebuffer row) of the floor actually punched this
+   frame -- the floor plane's real on-screen horizon.  The platform clips the RBG0 window AND the
+   HW-sky transparent boundary to THIS row so the sky always comes down exactly to the floor (no
+   sky/floor decalage at any vantage).  Reset to a large sentinel each frame; stays there if no floor
+   is in view (platform falls back to its static horizon).  DoomJo never reads it. */
+int sat_vdp2_floor_top_y = 0x3FFF;
 /* SATURN: the player's-floor flat data (64x64 = 4096 bytes) for the platform to swizzle
    into the RBG0 cells.  Same lump the software floor would use (animated-flat aware via
    flattranslation).  Returns 0 outside a level.  Off-path for DoomJo (never called). */
@@ -954,6 +960,7 @@ int sat_potato_walls = 0;
 int sat_wall_nocpu = 0;
 extern byte *ylookup[];
 extern int   columnofs[];
+extern int   viewwindowy;   /* SATURN: framebuffer Y offset of the view -> screen row = top[x] + viewwindowy */
 
 /* SATURN: derive the RBG0 floor colormap from a light band, EXACTLY like the software floor's
    nearest-distance shade (zlight[band+extralight][0]).  Shared by the under-eye and dominant
@@ -994,6 +1001,7 @@ void R_DrawPlanes (void)
 
     sat_frame_has_sky = 0;   /* set below if any sky visplane is in view (platform drops NBG0 if not) */
     sat_sky_px = 0; sat_floor_px = 0;   /* SATURN: sky-vs-floor coverage this frame (classifier) */
+    sat_vdp2_floor_top_y = 0x3FFF;      /* SATURN: reset; the floor punch below lowers it to the floor's top screen row */
 #if SAT_PLANE_LOCAL
     plane_worklist_n = 0;   /* P3: reset the regular-flat worklist for this frame */
 #endif
@@ -1188,6 +1196,7 @@ void R_DrawPlanes (void)
 		int yh = pl->bottom[x];
 		int n;
 		if (yl > yh) continue;
+		{ int sr = yl + viewwindowy; if (sr < sat_vdp2_floor_top_y) sat_vdp2_floor_top_y = sr; }  /* track the floor's TOP screen row (its real horizon) */
 		n = yh - yl + 1;
 		sat_floor_px += (unsigned)n;   /* SATURN classifier: dominant-floor coverage */
 		if (detailshift)
