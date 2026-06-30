@@ -89,12 +89,18 @@ static void ExtendLumpInfo(int newnumlumps)
     lumpinfo_t *newlumpinfo;
     unsigned int i;
 
-    newlumpinfo = calloc(newnumlumps, sizeof(lumpinfo_t));
+    // SATURN: lumpinfo lives in the Doom zone (roomy ~1MB LWRAM), NOT the small libc heap.
+    // It is the heap's dominant consumer (numlumps * sizeof(lumpinfo_t)); keeping it out of
+    // the HWRAM libc heap lets HEAP_SIZE (syscalls.c) shrink, which grows the SRL TLSF pool.
+    // Z_Malloc does not zero, so clear it (calloc semantics: entries past the copied range
+    // need NULL cache/next).  Z_Init runs long before the first W_AddFile, so the zone is up.
+    newlumpinfo = Z_Malloc(newnumlumps * sizeof(lumpinfo_t), PU_STATIC, NULL);
 
     if (newlumpinfo == NULL)
     {
 	I_Error ("Couldn't realloc lumpinfo");
     }
+    memset(newlumpinfo, 0, newnumlumps * sizeof(lumpinfo_t));
 
     // Copy over lumpinfo_t structures from the old array. If any of
     // these lumps have been cached, we need to update the user
@@ -117,8 +123,9 @@ static void ExtendLumpInfo(int newnumlumps)
         }
     }
 
-    // All done.
-    free(lumpinfo);
+    // All done.  (Guard: the first call has lumpinfo == NULL; Z_Free(NULL) would crash.)
+    if (lumpinfo != NULL)
+	Z_Free (lumpinfo);
     lumpinfo = newlumpinfo;
     numlumps = newnumlumps;
 }
