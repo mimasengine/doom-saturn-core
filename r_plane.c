@@ -894,6 +894,18 @@ unsigned int sat_floor_px = 0;
    skip.  Ceilings (above the eye) still draw in software.  Default 0 => DoomJo and the
    normal build draw floors normally. */
 int sat_vdp2_floor = 0;
+/* SATURN split: the SINGLE view that punches the HW floor in split-screen (0 = P1, default).
+   Set by the platform; DoomJo never touches it. */
+int sat_rbg0_view = 0;
+/* SATURN split: true only if THIS view must punch the HW floor.  Outside split (sat_split_active==0)
+   it is exactly sat_vdp2_floor -> 1-player unchanged.  In split, only sat_rbg0_view punches; the
+   other views draw their software floor.  DoomJo-safe: sat_vdp2_floor==0 short-circuits before the
+   split globals are read.  Pure C (used by both r_plane.c and r_segs.c). */
+int sat_floor_punch_here(void)
+{
+    extern int sat_split_active, sat_split_view;
+    return sat_vdp2_floor && (!sat_split_active || sat_split_view == sat_rbg0_view);
+}
 
 /* SATURN (VDP1 floor, inc-1): deport SECONDARY floors/ceilings (every visplane reaching the
    regular-flat path -- i.e. NOT sky, NOT the RBG0 dominant) to the VDP1 affine-strip layer.
@@ -1192,7 +1204,7 @@ void R_DrawPlanes (void)
 	// anchored at that height and shaded at that one brightness -- shows through.  Other
 	// heights/flats, a same-flat sector at a DIFFERENT light band (a bright/dark zone), and
 	// all ceilings keep drawing in software (at their own brightness).  Off by default (DoomJo).
-	if (sat_vdp2_floor
+	if (sat_floor_punch_here()
 	    && pl->height == sat_vdp2_floor_h
 	    && pl->picnum == sat_vdp2_floor_pic
 	    && (pl->lightlevel >> LIGHTSEGSHIFT) == sat_vdp2_floor_band)
