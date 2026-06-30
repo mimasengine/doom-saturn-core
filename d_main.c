@@ -317,6 +317,7 @@ void D_Display (void)
     {
 	extern int sat_split_active, sat_split_vdp1, sat_wall_skip, viewheight;
 	extern int detailshift, sat_split_lowdetail, sat_psprite_yoff, sat_vdp2_sky;
+	extern int sat_vdp2_floor, sat_rbg0_view, sat_split_p1hw;   /* SATURN split: P1-only HW floor punch */
 	extern void R_SetViewWindow (int, int, int, int);
 	extern void R_ExecuteSetViewSize (void);
 	extern void (*sat_walls_done_hook)(void);
@@ -343,6 +344,7 @@ void D_Display (void)
 	    int sws = sat_wall_skip;
 	    int sds = detailshift;                    /* low-detail (+ld modes) applies for all views */
 	    int sky_save = sat_vdp2_sky;              /* NBG0 can't serve N viewangles -> software sky */
+	    int floor_save = sat_vdp2_floor;          /* SATURN split: P1-only HW-floor punch; restored after the loop */
 	    int vdp1 = sat_split_vdp1;        /* SATURN: VDP1 walls for ALL split views (pad-X toggles all-VDP1 <-> all-software) */
 	    uint32_t tv[5] = { 0 }, td = 0;           /* per-view timestamps tv[0..n] + post-kick td */
 	    int i;
@@ -358,6 +360,7 @@ void D_Display (void)
 		   tells the accumulator which view a wall belongs to (4-way command-budget split); the
 		   wall emit adds viewwindowy so bottom-row quadrants (vpy=112) land at the right screen y. */
 		sat_split_view = i;
+		sat_vdp2_floor = (sat_split_p1hw && i == sat_rbg0_view) ? 1 : 0;   /* SATURN split: only this view punches the HW floor */
 		sat_wall_skip  = vdp1 ? 1 : 0;
 		R_SetViewWindow (vpx[i], twop ? 0 : vpy[i], hw, fh);
 		R_RenderPlayerView (&players[i]);
@@ -366,10 +369,16 @@ void D_Display (void)
 	    if (vdp1 && sat_walls_done_hook) sat_walls_done_hook (); /* single kick: all accumulated views */
 	    td = d_ms();
 	    sat_split_active = 0;
+	    /* SATURN: 3p leaves the bottom-right quadrant empty -> fill it with a player-position
+	       minimap (software fb writes only; does NOT consume the VDP1 wall budget).  Drawn
+	       AFTER the kick + td so it never pollutes the sat_spl_kick measurement. */
+	    if (n == 3)
+		AM_DrawMiniMap (vpx[3], vpy[3], hw, fh);
 	    sat_wall_skip    = sws;
 	    detailshift      = sds;
 	    sat_psprite_yoff = 0;
 	    sat_vdp2_sky     = sky_save;
+	    sat_vdp2_floor   = floor_save;
 	    sat_spl_sw   = 0;
 	    sat_spl_v0   = (n > 0) ? (tv[1] - tv[0]) : 0;   /* per-view R_RenderPlayerView ms */
 	    sat_spl_v1   = (n > 1) ? (tv[2] - tv[1]) : 0;

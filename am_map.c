@@ -1287,6 +1287,190 @@ void AM_drawPlayers(void)
 
 }
 
+//
+// SATURN: standalone minimap for the empty 4th quadrant in 3-player split-screen.
+//
+// The split loop (d_main.c) renders 3 views into 3 of the 4 quadrants and leaves the
+// bottom-right one (160,112)-(320,224) empty (cleared to index 0 each frame).  This fills
+// that 160x112 rect with a fit-to-level panel + one dot per live player.
+//
+// It writes DIRECTLY into I_VideoBuffer with the REAL framebuffer stride (SCREENWIDTH),
+// NOT am_map's PUTDOT -- whose fb[y*f_w+x] conflates the map-window WIDTH with the row
+// STRIDE and is only correct at full screen width (f_w == 320).  Self-contained: own
+// vertex-extent scan, own uniform fit, own stride-correct plot.  Pure C so DoomJo
+// (GCC 9.3) can share it.  Called only when sat_local_players == 3.
+//
+// Increment 3: fog-of-war (only cheating || ML_MAPPED lines, like the full automap -- they
+// reveal as ANY of the 3 players sees them, r_segs.c sets ML_MAPPED) + the original automap
+// colour code, no border.  The baked scratch (Z_Malloc PU_STATIC, in the 1MB LWRAM Doom zone
+// -- NOT the tiny TLSF pool or HWRAM .bss) is rebuilt whenever a new level loads OR the
+// mapped-line count grows; per-frame cost stays a 17.5KB memcpy + the 3 player dots.
+//
+#define MM_BG  246                              // near-black opaque bg (index 0 = VDP2-transparent, avoid)
+// wall colours reuse the original automap palette directly: WALLCOLORS / FDWALLCOLORS /
+// CDWALLCOLORS / SECRETWALLCOLORS / TSWALLCOLORS (see the #defines at the top of this file).
+
+// Cached minimap state.  mm_scratch is the baked w*h panel (bg + revealed walls); it is
+// rebuilt whenever lines[] is reallocated (new level) or the revealed-line count changes
+// (fog-of-war).  The fit params are stashed so the per-frame dots match the baked walls.
+static byte*    mm_scratch     = NULL;
+static void*    mm_built_for   = NULL;          // the lines[] pointer the scratch was baked for
+static int      mm_built_shown = -1;            // the revealed-line count the scratch was baked for
+static int      mm_minx, mm_miny, mm_scale, mm_dh, mm_padx, mm_pady;
+
+// Bresenham into the LOCAL scratch (stride == w, a full-width buffer -> always safe).
+static void mm_scratch_line(byte* sc, int w, int x0, int y0, int x1, int y1, int color)
+{
+    int dx = x1 - x0, ax = 2 * (dx < 0 ? -dx : dx), sx = dx < 0 ? -1 : 1;
+    int dy = y1 - y0, ay = 2 * (dy < 0 ? -dy : dy), sy = dy < 0 ? -1 : 1;
+    int x = x0, y = y0, d;
+
+    if (ax > ay)
+    {
+        d = ay - ax / 2;
+        for (;;)
+        {
+            sc[y * w + x] = color;
+            if (x == x1) break;
+            if (d >= 0) { y += sy; d -= ax; }
+            x += sx; d += ay;
+        }
+    }
+    else
+    {
+        d = ax - ay / 2;
+        for (;;)
+        {
+            sc[y * w + x] = color;
+            if (y == y1) break;
+            if (d >= 0) { x += sx; d -= ay; }
+            y += sy; d += ax;
+        }
+    }
+}
+
+// Bake bg + border + every (non-ML_DONTDRAW) wall into the scratch, once per level.  The
+// level extent is fit to a 2px inset, so EVERY vertex maps inside [2,w-2]x[2,h-2] and no
+// segment can fall outside the buffer -> no clipping needed.  Fit params are stashed for
+// the per-frame dots.
+static void mm_build_scratch(byte* sc, int w, int h)
+{
+    int minx, maxx, miny, maxy, spanx, spany;
+    int aw, ah, sx, sy, s, dw, dh, padx, pady, i;
+
+    minx = miny =  0x7fffffff;
+    maxx = maxy = -0x7fffffff;
+    for (i = 0; i < numvertexes; i++)
+    {
+        int vx = vertexes[i].x >> FRACBITS;
+        int vy = vertexes[i].y >> FRACBITS;
+        if (vx < minx) minx = vx;
+        if (vx > maxx) maxx = vx;
+        if (vy < miny) miny = vy;
+        if (vy > maxy) maxy = vy;
+    }
+    spanx = maxx - minx; if (spanx < 1) spanx = 1;
+    spany = maxy - miny; if (spany < 1) spany = 1;
+
+    aw = w - 4; ah = h - 4;
+    sx = (aw << 8) / spanx;
+    sy = (ah << 8) / spany;
+    s  = sx < sy ? sx : sy;
+    dw = (spanx * s) >> 8;
+    dh = (spany * s) >> 8;
+    padx = 2 + (aw - dw) / 2;            // scratch-local (0-based); FB adds ox/oy later
+    pady = 2 + (ah - dh) / 2;
+
+    // background (no border -- it clashed); local coords
+    memset(sc, MM_BG, w * h);
+
+    // walls: mirror AM_drawWalls -- fog-of-war (draw only cheating || ML_MAPPED lines) and
+    // the original automap colour code (red solid, brown floor-change, yellow ceiling-change,
+    // gray plain two-sided when cheating).  pw_allmap (computer map) is not honoured here.
+    for (i = 0; i < numlines; i++)
+    {
+        line_t* l = &lines[i];
+        int x0, y0, x1, y1, color;
+        if (l->flags & ML_DONTDRAW) continue;
+        if (!(cheating || (l->flags & ML_MAPPED))) continue;        // fog-of-war
+        if (!l->backsector)
+            color = WALLCOLORS;                                     // one-sided solid wall
+        else if (l->special == 39)
+            color = WALLCOLORS + WALLRANGE / 2;                     // teleporter
+        else if (l->flags & ML_SECRET)
+            color = cheating ? SECRETWALLCOLORS : WALLCOLORS;       // secret door
+        else if (l->backsector->floorheight != l->frontsector->floorheight)
+            color = FDWALLCOLORS;                                   // floor-height change
+        else if (l->backsector->ceilingheight != l->frontsector->ceilingheight)
+            color = CDWALLCOLORS;                                   // ceiling-height change
+        else if (cheating)
+            color = TSWALLCOLORS;                                   // plain two-sided (cheat only)
+        else
+            continue;                                               // plain two-sided: not drawn
+        x0 = padx + (((l->v1->x >> FRACBITS) - minx) * s >> 8);
+        y0 = pady + dh - 1 - (((l->v1->y >> FRACBITS) - miny) * s >> 8);
+        x1 = padx + (((l->v2->x >> FRACBITS) - minx) * s >> 8);
+        y1 = pady + dh - 1 - (((l->v2->y >> FRACBITS) - miny) * s >> 8);
+        mm_scratch_line(sc, w, x0, y0, x1, y1, color);
+    }
+
+    // stash the fit so the per-frame dots match the baked walls
+    mm_minx = minx; mm_miny = miny; mm_scale = s; mm_dh = dh;
+    mm_padx = padx; mm_pady = pady;
+}
+
+void AM_DrawMiniMap(int ox, int oy, int w, int h)
+{
+    static const int their_colors[MAXPLAYERS] = { GREENS, GRAYS, BROWNS, REDS };
+    byte* fb = I_VideoBuffer;
+    int i, yy;
+
+    if (!fb || numvertexes <= 0 || numlines <= 0)
+        return;
+
+    // allocate the baked panel once (w,h are the fixed 160x112 quadrant); rebuild its
+    // contents on a new level (lines[] reallocated) OR when more lines have been revealed.
+    // The revealed count is monotonic within a level, so it is a faithful, cheap dirty key.
+    {
+        int shown = 0;
+        for (i = 0; i < numlines; i++)
+            if (!(lines[i].flags & ML_DONTDRAW) && (cheating || (lines[i].flags & ML_MAPPED)))
+                shown++;
+        if (mm_scratch == NULL)
+            mm_scratch = Z_Malloc(w * h, PU_STATIC, NULL);
+        if (mm_built_for != (void*) lines || shown != mm_built_shown)
+        {
+            mm_build_scratch(mm_scratch, w, h);
+            mm_built_for   = (void*) lines;
+            mm_built_shown = shown;
+        }
+    }
+
+    // blit the baked panel into the FB quadrant (stride convert w -> SCREENWIDTH)
+    for (yy = 0; yy < h; yy++)
+        memcpy(fb + (oy + yy) * SCREENWIDTH + ox, mm_scratch + yy * w, w);
+
+    // overplot a 3x3 dot per live player (same fit as the baked walls)
+    for (i = 0; i < MAXPLAYERS; i++)
+    {
+        int px, py, bx, by, color;
+        if (!playeringame[i] || !players[i].mo)
+            continue;
+        color = their_colors[i];
+        px = ox + mm_padx + (((players[i].mo->x >> FRACBITS) - mm_minx) * mm_scale >> 8);
+        py = oy + mm_pady + mm_dh - 1 - (((players[i].mo->y >> FRACBITS) - mm_miny) * mm_scale >> 8);
+        for (by = py - 1; by <= py + 1; by++)
+        {
+            if (by < oy || by >= oy + h) continue;
+            for (bx = px - 1; bx <= px + 1; bx++)
+            {
+                if (bx < ox || bx >= ox + w) continue;
+                fb[by * SCREENWIDTH + bx] = color;
+            }
+        }
+    }
+}
+
 void
 AM_drawThings
 ( int	colors,

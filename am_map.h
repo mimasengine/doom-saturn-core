@@ -42,6 +42,11 @@ void AM_Drawer (void);
 // if the level is completed while it is up.
 void AM_Stop (void);
 
+// SATURN: draw a fit-to-level minimap (panel + per-player dots) into the I_VideoBuffer
+// sub-rectangle (ox,oy)-(ox+w,oy+h), stride SCREENWIDTH.  Used to fill the empty 4th
+// quadrant in 3-player split-screen.  See am_map.c for the increment plan.
+void AM_DrawMiniMap (int ox, int oy, int w, int h);
+
 
 extern cheatseq_t cheat_amap;
 
