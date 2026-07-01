@@ -39,6 +39,8 @@ extern byte*		dc_source;
 //  here.
 void 	R_DrawColumn (void);
 void 	R_DrawColumnLow (void);
+void 	R_DrawSkyColumn (void);     /* SATURN split: sky column with CLAMP (no top wrap) -- see r_draw.c */
+void 	R_DrawSkyColumnLow (void);
 
 // The Spectre/Invisibility effect.
 void 	R_DrawFuzzColumn (void);

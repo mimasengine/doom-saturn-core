@@ -250,14 +250,104 @@ void R_DrawColumnLow (void)
     fracstep = dc_iscale; 
     frac = dc_texturemid + (dc_yl-centery)*fracstep;
     
-    do 
+    do
     {
 	// Hack. Does not work corretly.
 	*dest2 = *dest = dc_colormap[dc_source[(frac>>FRACBITS)&127]];
 	dest += SCREENWIDTH;
 	dest2 += SCREENWIDTH;
-	frac += fracstep; 
+	frac += fracstep;
 
+    } while (count--);
+}
+
+
+/* SATURN split-screen sky column drawers: identical to R_DrawColumn / R_DrawColumnLow but instead of
+   WRAPPING the texture row (&127), they handle the TOP overflow specially.  In a split view the halved
+   viewwidth roughly DOUBLES the sky's vertical scale (pspriteiscale), so the visible span runs off the
+   top of the 128-tall sky texture; the vanilla wrap then showed a 2nd, upside-down mountain band at the
+   top (the 2p/3p/4p sky bug), and a flat clamp to the top row showed streaky vertical bars.  Instead,
+   in the overflow region (texel < 0) we sample the column's OWN top band [0..SKY_GRAIN_MAX] with a cheap
+   per-(x,row) hash: this keeps each column's brightness (the sky's light/dark zones stay put) and the
+   real sky palette, but breaks the streaks into fine GRAIN -- as if the sky texture continued taller.
+   The mountains keep their correct (1p) proportions (the SCALE is left UNCHANGED).  Used only for the
+   sky and only in split (r_plane.c: 1p keeps colfunc, byte-identical).  Shared core, pure C; DoomJo
+   never splits so it never calls these. */
+#define SKY_GRAIN_MAX 7   /* power-of-2 minus 1: grain samples the top 8 texels of the column; raise for coarser grain, 0 = flat clamp */
+static inline int R_SkyGrainTexel (int x, int row)
+{
+    unsigned h = (unsigned)(x * 73 + row * 179);   /* cheap 2D hash -> fine, non-repeating dither */
+    h ^= h >> 5;
+    return (int)(h & SKY_GRAIN_MAX);               /* real top-band texel index (same palette, keeps column density) */
+}
+void R_DrawSkyColumn (void)
+{
+    int			count;
+    byte*		dest;
+    fixed_t		frac;
+    fixed_t		fracstep;
+
+    count = dc_yh - dc_yl;
+    if (count < 0)
+	return;
+#ifdef RANGECHECK
+    if ((unsigned)dc_x >= (unsigned)SCREENWIDTH
+	|| dc_yl < 0
+	|| dc_yh >= viewheight)
+	return;
+#endif
+    dest = ylookup[dc_yl] + columnofs[dc_x];
+    fracstep = dc_iscale;
+    frac = dc_texturemid + (dc_yl-centery)*fracstep;
+    byte col_cache[128];
+    memcpy(col_cache, dc_source, 128);
+    int row = dc_yl;
+    do
+    {
+	int t = frac>>FRACBITS;
+	if (t < 0) t = R_SkyGrainTexel(dc_x, row);   /* top overflow: grain from the column's top band (no wrap, no streak) */
+	else if (t > 127) t = 127;
+	*dest = dc_colormap[col_cache[t]];
+	dest += SCREENWIDTH;
+	frac += fracstep;
+	row++;
+    } while (count--);
+}
+
+void R_DrawSkyColumnLow (void)
+{
+    int			count;
+    byte*		dest;
+    byte*		dest2;
+    fixed_t		frac;
+    fixed_t		fracstep;
+    int			x;
+
+    count = dc_yh - dc_yl;
+    if (count < 0)
+	return;
+#ifdef RANGECHECK
+    if ((unsigned)dc_x >= (unsigned)SCREENWIDTH
+	|| dc_yl < 0
+	|| dc_yh >= viewheight)
+	return;
+#endif
+    x = dc_x << 1;
+    dest = ylookup[dc_yl] + columnofs[x];
+    dest2 = ylookup[dc_yl] + columnofs[x+1];
+    fracstep = dc_iscale;
+    frac = dc_texturemid + (dc_yl-centery)*fracstep;
+    int row = dc_yl;
+    do
+    {
+	int t = frac>>FRACBITS;
+	if (t < 0) t = R_SkyGrainTexel(dc_x, row);   /* top overflow: grain from the column's top band */
+	else if (t > 127) t = 127;
+	*dest2 = *dest = dc_colormap[dc_source[t]];
+	dest += SCREENWIDTH;
+	dest2 += SCREENWIDTH;
+	frac += fracstep;
+	row++;
     } while (count--);
 }
 

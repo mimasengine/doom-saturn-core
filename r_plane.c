@@ -888,6 +888,21 @@ int sat_frame_has_sky = 0;
    perf-sim floor-on mode (pad-Y mode 1/3).  Absolute pixel counts, reset each frame.  DoomJo-safe. */
 unsigned int sat_sky_px   = 0;
 unsigned int sat_floor_px = 0;
+/* SATURN split HW sky (Part 5 -- docs/RBG0_SKY_SPLIT_ANALYSIS.md §5): the SINGLE split view that gets
+   the hardware NBG0 sky (its sky region is left index-0, exactly like 1p) which the platform windows to
+   that view's band; every OTHER view keeps its software sky.  -1 (default, and DoomJo, and any build
+   whose platform never elects one) = no HW-sky view => every view draws the software sky (today's
+   behaviour, byte-identical).  Set by the platform each frame BEFORE D_Display's split loop (from last
+   frame's per-view coverage + hysteresis); read there to drive the per-view sky-skip. */
+int sat_sky_view = -1;
+/* SATURN: per-view SKY pixel coverage.  D_Display copies sat_sky_px (reset per view at the top of
+   R_DrawPlanes) into sat_sky_px_view[i] after each view renders, so the platform can elect the view
+   that gains the most from a HW sky.  DoomJo never reads it. */
+unsigned int sat_sky_px_view[4] = { 0, 0, 0, 0 };
+/* SATURN: the elected view's viewangle, captured in the split loop so the platform scrolls the single
+   NBG0 sky layer by the RIGHT view's angle (the global viewangle at present time is the LAST view's).
+   angle_t == unsigned int; DoomJo never reads it. */
+angle_t sat_sky_view_angle = 0;
 /* SATURN: floor -> VDP2 RBG0 hardware Mode-7 plane.  When set by the platform,
    R_DrawPlanes leaves the FLOOR visplanes (a flat below the eye) as index 0 so the
    RBG0 floor composited behind the framebuffer shows through -- exactly like the sky
@@ -897,6 +912,8 @@ int sat_vdp2_floor = 0;
 /* SATURN split: the SINGLE view that punches the HW floor in split-screen (0 = P1, default).
    Set by the platform; DoomJo never touches it. */
 int sat_rbg0_view = 0;
+int sat_split_p1hw = 0;   /* SATURN split: platform enables "P1 floor in HW" (pot0 + 2p); read by d_main (per-view punch) */
+extern int sat_split_active, sat_split_view;   /* split state (r_main.c / d_main.c) -- for the per-view top reset + the punch helper */
 /* SATURN split: true only if THIS view must punch the HW floor.  Outside split (sat_split_active==0)
    it is exactly sat_vdp2_floor -> 1-player unchanged.  In split, only sat_rbg0_view punches; the
    other views draw their software floor.  DoomJo-safe: sat_vdp2_floor==0 short-circuits before the
@@ -1019,7 +1036,8 @@ void R_DrawPlanes (void)
 
     sat_frame_has_sky = 0;   /* set below if any sky visplane is in view (platform drops NBG0 if not) */
     sat_sky_px = 0; sat_floor_px = 0;   /* SATURN: sky-vs-floor coverage this frame (classifier) */
-    sat_vdp2_floor_top_y = 0x3FFF;      /* SATURN: reset; the floor punch below lowers it to the floor's top screen row */
+    if (!sat_split_active || sat_split_view == sat_rbg0_view)   /* SATURN split: only the punching view resets, so P2 doesn't wipe P1's floor top */
+        sat_vdp2_floor_top_y = 0x3FFF;  /* reset; the floor punch below lowers it to the floor's top screen row */
 #if SAT_PLANE_LOCAL
     plane_worklist_n = 0;   /* P3: reset the regular-flat worklist for this frame */
 #endif
@@ -1049,6 +1067,14 @@ void R_DrawPlanes (void)
 	{
 	    /* dominant: recompute only on a view-sector change; otherwise keep the latched floor */
 	    static sector_t *sat_dom_last_sec = (sector_t *)0;
+	    static int       sat_dom_last_lt  = -1;
+	    /* SATURN: a fresh level realloc's sectors[]; the cached sat_dom_last_sec then DANGLES and
+	       (Doom's zone allocator is deterministic) can land on a NEW sector's address -> the recompute
+	       is wrongly SKIPPED and the HW floor keeps the PREVIOUS level's stale pic/height = the
+	       intermittent-black P1 split floor at menu-start.  leveltime drops to 0 on every P_SetupLevel,
+	       so a drop forces one fresh dominant-floor pick on the new level. */
+	    if (leveltime < sat_dom_last_lt) sat_dom_last_sec = (sector_t *)0;
+	    sat_dom_last_lt = leveltime;
 	    if (vs != sat_dom_last_sec)
 	    {
 		/* sum visible-FLOOR coverage by (picnum,height,band) triple, then pick the largest.
@@ -1174,6 +1200,15 @@ void R_DrawPlanes (void)
 		continue;
 	    }
 
+	    /* SATURN sky vertical scale: the ORIGINAL pspriteiscale is CORRECT -- it reproduces 1p's sky
+	       proportions (mountains at their normal size).  Do NOT change it: pinning it smaller squishes
+	       the mountains, larger stretches them.  In split-screen the halved viewwidth makes it ~2*FRACUNIT,
+	       so the visible span exceeds the 128-tall texture and the TOP would WRAP around to the mountains
+	       (the dark band = the 2p/3p/4p sky bug).  The real fix is to CLAMP the vertical texture read to
+	       its top row in split (skycolfunc below) so the overflow shows a clean uniform sky band instead
+	       of a wrapped mountain band -- the mountains keep their correct proportions.  1p
+	       (sat_split_active==0) keeps colfunc byte-identical (its span never overflows).  DoomJo never
+	       splits -> unaffected.  Pure C (no C++isms). */
 	    dc_iscale = pspriteiscale>>detailshift;
 
 	    // Sky is allways drawn full bright,
@@ -1193,7 +1228,12 @@ void R_DrawPlanes (void)
 		    angle = (viewangle + xtoviewangle[x])>>ANGLETOSKYSHIFT;
 		    dc_x = x;
 		    dc_source = R_GetColumn(skytexture, angle);
-		    colfunc ();
+		    if (!sat_split_active)
+			colfunc ();               /* 1p: byte-identical (span never overflows the texture) */
+		    else if (detailshift)
+			R_DrawSkyColumnLow ();    /* split low-detail: clamp the top overflow (no wrap) */
+		    else
+			R_DrawSkyColumn ();       /* split hi-detail:  clamp the top overflow (no wrap) */
 		}
 	    }
 	    continue;

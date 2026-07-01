@@ -922,8 +922,25 @@ R_PointInSubsector
 //
 // R_SetupFrame
 //
+/* SATURN split: re-point the view globals at player 0 (P1) so the post-render-loop RBG0 transform
+   (rbg0_set_transform, platform side) anchors on P1, not the LAST split view rendered.  Sets only what
+   the transform reads -- viewx/y/z/angle (+ sin/cos) -- WITHOUT R_SetupFrame's per-frame side effects
+   (extralight, BSP validcount).  Off-path for DoomJo / 1-player. */
+void sat_setup_view_p1 (void)
+{
+    extern player_t players[];
+    player_t *p = &players[0];
+    if (!p->mo) return;
+    viewx = p->mo->x;
+    viewy = p->mo->y;
+    viewz = p->viewz;
+    viewangle = p->mo->angle + viewangleoffset;
+    viewsin = finesine[viewangle>>ANGLETOFINESHIFT];
+    viewcos = finecosine[viewangle>>ANGLETOFINESHIFT];
+}
+
 void R_SetupFrame (player_t* player)
-{		
+{
     int		i;
     
     viewplayer = player;

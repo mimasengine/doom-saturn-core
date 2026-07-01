@@ -1450,7 +1450,10 @@ void AM_DrawMiniMap(int ox, int oy, int w, int h)
     for (yy = 0; yy < h; yy++)
         memcpy(fb + (oy + yy) * SCREENWIDTH + ox, mm_scratch + yy * w, w);
 
-    // overplot a 3x3 dot per live player (same fit as the baked walls)
+    // overplot a 5x5 marker per live player: a 1px WHITE halo + a 3x3 centre in the player's
+    // colour.  The halo keeps the marker visible over the coloured walls -- their_colors[] can
+    // match a wall's colour (P3 brown = floor-change walls, P4 red = solid walls), so a bare dot
+    // would vanish into the wall it sits on.  Same fit as the baked walls.
     for (i = 0; i < MAXPLAYERS; i++)
     {
         int px, py, bx, by, color;
@@ -1459,13 +1462,16 @@ void AM_DrawMiniMap(int ox, int oy, int w, int h)
         color = their_colors[i];
         px = ox + mm_padx + (((players[i].mo->x >> FRACBITS) - mm_minx) * mm_scale >> 8);
         py = oy + mm_pady + mm_dh - 1 - (((players[i].mo->y >> FRACBITS) - mm_miny) * mm_scale >> 8);
-        for (by = py - 1; by <= py + 1; by++)
+        for (by = py - 2; by <= py + 2; by++)
         {
             if (by < oy || by >= oy + h) continue;
-            for (bx = px - 1; bx <= px + 1; bx++)
+            for (bx = px - 2; bx <= px + 2; bx++)
             {
                 if (bx < ox || bx >= ox + w) continue;
-                fb[by * SCREENWIDTH + bx] = color;
+                /* inner 3x3 = player colour (identity); outer ring = WHITE (halo/contrast) */
+                fb[by * SCREENWIDTH + bx] =
+                    (by >= py - 1 && by <= py + 1 && bx >= px - 1 && bx <= px + 1)
+                        ? (byte)color : (byte)WHITE;
             }
         }
     }

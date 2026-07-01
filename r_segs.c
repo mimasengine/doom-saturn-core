@@ -258,6 +258,18 @@ extern int sat_floor_punch_here(void);   /* SATURN split: gate the floor cohesio
                                    test misses).  Grazing walls have LOW mag -> stay on VDP1.  Lower =
                                    more walls to CPU (safer, costlier); higher = fewer (risk squish). */
 
+/* SATURN Phase-0 CPU-fallback profiler (measures the "walls handed to software" prize BEFORE
+   building the VDP1 wall clamp of Phase 1).  By cause:
+     clamp  = vertical SPAN (>V1, fully CPU) or partially-below-the-RBG0-floor-line -- a world-
+              anchored VDP1 vertical clamp (Phase 1) would keep these on VDP1;
+     mag    = face-on MAGNIFICATION (short face-on doors) -- the hard residue the clamp can't fix;
+     starve = the VDP1 command bank was full -- Phase-1 subdivision would make this WORSE.
+   px = span*cols fill-work proxy for the clampable tiers (the master software cost Phase 1 removes).
+   Plain ints, 0-default, reset per frame by the platform (dg_saturn vdp1_wpn_kick) -> DoomJo links
+   AND renders unchanged: it never reads them, and every increment lives inside the sat_wall_skip
+   hybrid routing, which is inert on DoomJo (sat_wall_skip == 0). */
+int sat_fb_clamp_t = 0, sat_fb_mag_t = 0, sat_fb_starve_t = 0, sat_fb_px = 0;
+
 /* EXTRA CPU FRAMES on EXIT (Romain): when a one-sided wall leaves the CPU path (moves away,
    CPU->VDP1), the VDP1 presents several frames late -> a sky gap at the seam.  So for N frames after
    it stops being CPU, the CPU ALSO draws it (overlap) while VDP1 catches up.  N=2.  Per-seg (not a
@@ -338,6 +350,10 @@ void R_RenderSegLoop (void)
 	    sat_v1_mid = (s < SAT_WALL_CPU_V1) && !magnified;  /* magnified -> NO VDP1 quad (it squishes) */
 	    if (cpu_now)
 	    {
+		if (!sat_v1_mid) {   /* Phase-0: count only the FULLY-CPU tiers (not the [SPAN,V1] VDP1-also pre-warm) */
+		    if (s > SAT_WALL_CPU_SPAN) { sat_fb_clamp_t++; sat_fb_px += s * sx; }  /* clampable vertical span */
+		    else                         sat_fb_mag_t++;                            /* magnified-only residue  */
+		}
 		sat_sw_mid = 1;  if (st) *st = 2;   /* CPU draws (close/magnified); arm 2 CPU exit-frames */
 	    }
 	    else
@@ -368,6 +384,9 @@ void R_RenderSegLoop (void)
 	    }
 	    {
 		int cpu_now = cpu_up || cpu_lo || magnified;
+		if (cpu_up) sat_fb_clamp_t++;                        /* Phase-0: clampable span (upper door tier) */
+		if (cpu_lo) sat_fb_clamp_t++;                        /* Phase-0: clampable span (lower door tier) */
+		if (magnified && !cpu_up && !cpu_lo) sat_fb_mag_t++; /* Phase-0: magnified-only door residue      */
 		int idx = (int)(curline - segs);
 		unsigned char *st = (idx >= 0 && idx < SAT_SEG_MAX) ? &sat_seg_cpu[idx] : 0;
 		int overlap = 0;
@@ -430,9 +449,9 @@ void R_RenderSegLoop (void)
 	if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
 	    { /* entirely below the floor -> cull (neither VDP1 nor CPU draws it) */ }
 	else if (sat_floor_punch_here() && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
-	    sat_sw_mid = 1;   /* partially below -> CPU fallback (clipped to the floor line) */
+	    { sat_sw_mid = 1; sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }  /* partially below -> CPU (clip to floor line); Phase-0: clampable */
 	else if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, midtexture, u1, u2, v0, v1, cm))
-	    sat_sw_mid = 1;   /* VDP1 starved (command list full) -> draw this wall in SOFTWARE, not sky */
+	    { sat_sw_mid = 1; sat_fb_starve_t++; }   /* VDP1 starved (command list full) -> draw this wall in SOFTWARE, not sky */
     }
 
     /* SATURN VDP1 world renderer: two-sided walls -> upper (toptexture) + lower
@@ -462,10 +481,10 @@ void R_RenderSegLoop (void)
 	    if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
 		{ /* entirely below the floor -> cull */ }
 	    else if (sat_floor_punch_here() && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
-		sat_sw_up = 1;   /* partially below -> CPU fallback (clipped to the floor line) */
+		{ sat_sw_up = 1; sat_fb_clamp_t++; }   /* partially below -> CPU (clip to floor); Phase-0: clampable */
 	    else
 		if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, toptexture, u1, u2, v0, v1, cm))
-		    sat_sw_up = 1;   /* VDP1 starved (list full) -> draw this upper in SOFTWARE, not sky */
+		    { sat_sw_up = 1; sat_fb_starve_t++; }   /* VDP1 starved (list full) -> upper in SOFTWARE, not sky */
 	}
 	if (bottomtexture && sat_v1_lo)   /* bottom of the opening -> floor */
 	{
@@ -480,10 +499,10 @@ void R_RenderSegLoop (void)
 	    if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
 		{ /* entirely below the floor -> cull */ }
 	    else if (sat_floor_punch_here() && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
-		sat_sw_lo = 1;   /* partially below -> CPU fallback (clipped to the floor line) */
+		{ sat_sw_lo = 1; sat_fb_clamp_t++; }   /* partially below -> CPU (clip to floor); Phase-0: clampable */
 	    else
 		if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, bottomtexture, u1, u2, v0, v1, cm))
-		    sat_sw_lo = 1;   /* VDP1 starved (list full) -> draw this lower in SOFTWARE, not sky */
+		    { sat_sw_lo = 1; sat_fb_starve_t++; }   /* VDP1 starved (list full) -> lower in SOFTWARE, not sky */
 	}
     }
 #undef SAT_VROWS
