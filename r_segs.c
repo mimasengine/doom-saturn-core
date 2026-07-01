@@ -270,6 +270,13 @@ extern int sat_floor_punch_here(void);   /* SATURN split: gate the floor cohesio
    hybrid routing, which is inert on DoomJo (sat_wall_skip == 0). */
 int sat_fb_clamp_t = 0, sat_fb_mag_t = 0, sat_fb_starve_t = 0, sat_fb_px = 0;
 
+/* SATURN Phase-1 wall clamp ([[wall-clamp-world-anchored]]): when set, a SPAN-close one-sided
+   wall STAYS on VDP1 (clamped swim-free in wall_emit_band via the constant-z linear v->y map)
+   instead of the CPU software fallback -- the Option-2 lever.  MAGNIFIED walls still go to CPU
+   (the vertical clamp can't fix the horizontal squish).  Default 0 = shipping byte-identical;
+   the platform sets it from the SAT_WALL_CLAMP compile flag (dg_saturn) for the HW A/B. */
+int sat_wall_clamp = 0;
+
 /* EXTRA CPU FRAMES on EXIT (Romain): when a one-sided wall leaves the CPU path (moves away,
    CPU->VDP1), the VDP1 presents several frames late -> a sky gap at the seam.  So for N frames after
    it stops being CPU, the CPU ALSO draws it (overlap) while VDP1 catches up.  N=2.  Per-seg (not a
@@ -344,15 +351,19 @@ void R_RenderSegLoop (void)
 	    int s1 = (bottomfrac - topfrac) >> HEIGHTBITS;
 	    int s2 = ((bottomfrac + bottomstep * n) - (topfrac + topstep * n)) >> HEIGHTBITS;
 	    int s = s1 > s2 ? s1 : s2;
-	    int cpu_now = (s > SAT_WALL_CPU_SPAN) || magnified;
+	    int span_close = (s > SAT_WALL_CPU_SPAN);   /* kept for the FBK counter */
+	    /* SPAN clamp DISABLED (v0 near-wall affine perspective warp = "moche", owner 2026-07-02):
+	       span-close one-sided walls stay on the CPU (shipping).  sat_wall_clamp now drives ONLY the
+	       BELOW-FLOOR cut (Phase 1b).  Revisit SPAN only with finer near-tile u-subdivision. */
+	    int cpu_now = span_close || magnified;
 	    int idx = (int)(curline - segs);
 	    unsigned char *st = (idx >= 0 && idx < SAT_SEG_MAX) ? &sat_seg_cpu[idx] : 0;
 	    sat_v1_mid = (s < SAT_WALL_CPU_V1) && !magnified;  /* magnified -> NO VDP1 quad (it squishes) */
 	    if (cpu_now)
 	    {
 		if (!sat_v1_mid) {   /* Phase-0: count only the FULLY-CPU tiers (not the [SPAN,V1] VDP1-also pre-warm) */
-		    if (s > SAT_WALL_CPU_SPAN) { sat_fb_clamp_t++; sat_fb_px += s * sx; }  /* clampable vertical span */
-		    else                         sat_fb_mag_t++;                            /* magnified-only residue  */
+		    if (magnified)                  sat_fb_mag_t++;                             /* squish -> clamp can't fix   */
+		    else if (span_close)            { sat_fb_clamp_t++; sat_fb_px += s * sx; }  /* pure span  -> clampable     */
 		}
 		sat_sw_mid = 1;  if (st) *st = 2;   /* CPU draws (close/magnified); arm 2 CPU exit-frames */
 	    }
@@ -449,7 +460,27 @@ void R_RenderSegLoop (void)
 	if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
 	    { /* entirely below the floor -> cull (neither VDP1 nor CPU draws it) */ }
 	else if (sat_floor_punch_here() && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
-	    { sat_sw_mid = 1; sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }  /* partially below -> CPU (clip to floor line); Phase-0: clampable */
+	{
+	    /* Phase-1b: this wall dips past the transparent RBG0 floor line -> a raw VDP1 quad would bleed
+	       through it (why it went to CPU).  When clamp is on AND the wall is NOT near (bspan<=SPAN, so
+	       no affine warp), CUT + ALIGN it at the floor line and keep it on VDP1: clamp yh to floorclip
+	       and re-derive the bottom texel THERE (world-anchored; the wall's z is ~constant per column so
+	       screen-y is LINEAR in v -> the visible texture keeps its true scale, no squish).  Near walls
+	       (bspan>SPAN) or clamp-off stay on the CPU as before. */
+	    int bspan = (yh1 - yl1 > yh2 - yl2) ? (yh1 - yl1) : (yh2 - yl2);
+	    if (sat_wall_clamp && bspan <= SAT_WALL_CPU_SPAN)
+	    {
+		int fc1 = floorclip[rw_x], fc2 = floorclip[rw_stopx - 1];
+		int nyh1 = (yh1 > fc1) ? fc1 : yh1;
+		int nyh2 = (yh2 > fc2) ? fc2 : yh2;
+		int den  = yh1 - yl1; if (den < 1) den = 1;
+		int nv1  = v0 + (int)((long long)(nyh1 - yl1) * (v1 - v0) / den);   /* texel AT the floor line */
+		if (sat_wall_hook (rw_x, yl1, nyh1, rw_stopx - 1, yl2, nyh2, midtexture, u1, u2, v0, nv1, cm))
+		    { sat_sw_mid = 1; sat_fb_starve_t++; }   /* VDP1 bank full -> CPU */
+	    }
+	    else
+		{ sat_sw_mid = 1; sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }  /* near / clamp-off -> CPU */
+	}
 	else if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, midtexture, u1, u2, v0, v1, cm))
 	    { sat_sw_mid = 1; sat_fb_starve_t++; }   /* VDP1 starved (command list full) -> draw this wall in SOFTWARE, not sky */
     }

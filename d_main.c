@@ -507,7 +507,7 @@ void D_Display (void)
 		static char dd_dbg[41];
 		sprintf(dd_dbg, "st%4u rp%4u hu%3u ot%3u bl%4u f%3u",
 			sum_st, sum_rp, sum_hu, sum_ot, sum_bl, dd_f);
-		dbg_print(0, 13, dd_dbg);   /* OVERLAY 2026-06-24: D_Display split below the critical-path block */
+		/* [overlay lean] dbg_print(0, 13, dd_dbg);  -- D_Display split st/rp/hu/ot/bl, off for wall/floor work */
 		sum_st = sum_rp = sum_hu = sum_ot = sum_bl = 0;
 		dd_f = 0;
 		dd_win = now;
@@ -715,10 +715,10 @@ void doomgeneric_Tick()
             /* row 2: T S D X/total  row 3: G(ap) I(ntra) */
             sprintf(dbg, "T%4u S%4u D%4u X%4u/%4u",
                     mt, ms, md, X, el);
-            dbg_print(0, 14, dbg);   /* tick budget T/S/D/X -> row 14 (critical-path took 3-5) */
+            /* [overlay lean] dbg_print(0, 14, dbg);  -- tick budget T/S/D/X, off for now */
             sprintf(dbg, "G%4u I%4u tk%4u",
                     mg, X > mg ? X - mg : 0, mtk);
-            dbg_print(0, 15, dbg);   /* G/I/tk -> row 15 */
+            /* [overlay lean] dbg_print(0, 15, dbg);  -- G/I/tk, off for now */
             sum_t = sum_s = sum_d = sum_gap = sum_tick = 0;
             win_start = now;
         }
