@@ -952,6 +952,13 @@ int sat_plane_border   = 0;    /* HORIZONTAL fill border px (from yaw)  -> L/R s
 int sat_plane_border_v = 0;    /* VERTICAL   fill border px (fwd+viewz) -> top/bottom edge       */
 int sat_plane_lag      = 2;    /* N = frames VDP1 trails NBG1 (owner-tunable)                    */
 int sat_plane_vscale   = 4;    /* vertical fill gain (owner-tuned to 4; pad R+Up/Down to adjust) */
+int sat_plane_border_max = 40; /* SATURN: platform-clampable px cap on BOTH borders.  Default 40 =
+                                  the legacy fast-spin guard -> byte-identical for DoomJo / any
+                                  platform that never sets it.  With TEXTURED VDP1 planes a fast
+                                  turn saturating the border at 40px paints the potato colour over
+                                  every plane narrower than 80px (fully covering its texture); the
+                                  platform caps this (pad R+Left/Right live) to trade a thin stale
+                                  strip for keeping the texture visible. */
 #define SAT_PLANE_LAG_MAX 8
 static angle_t sat_va_hist[SAT_PLANE_LAG_MAX];   /* yaw   history -> horizontal shift            */
 static fixed_t sat_vz_hist[SAT_PLANE_LAG_MAX];   /* viewz history -> vertical shift (stairs/bob) */
@@ -1009,9 +1016,10 @@ void R_SetupFrame (player_t* player)
 	else
 	{
 	    int old = (sat_va_head - N) % SAT_PLANE_LAG_MAX;
+	    int cap = sat_plane_border_max; if (cap > 40) cap = 40; if (cap < 0) cap = 0;
 	    int d = (int)(viewangle - sat_va_hist[old]); if (d < 0) d = -d;      /* signed wrap -> |dtheta| */
 	    long long px = ((long long)d * (long long)viewwidth) / (long long)ANG90;
-	    if (px > 40) px = 40;                                                /* guard a fast spin */
+	    if (px > cap) px = cap;                                              /* fast-spin guard + platform cap */
 	    sat_plane_border = (int)px;
 	    /* VERTICAL: the gap while WALKING comes from forward-motion perspective drift (walls grow as you
 	       approach -> the wall/ceiling & wall/floor junctions slide vertically), plus viewz for stairs/lifts/
@@ -1023,7 +1031,7 @@ void R_SetupFrame (player_t* player)
 	    fixed_t fwd = FixedMul(dvx, viewcos) + FixedMul(dvy, viewsin); if (fwd < 0) fwd = -fwd;
 	    long long mv = (long long)fwd + ((long long)dz << 4);
 	    int pv = (int)((mv * (long long)sat_plane_vscale) >> 20);
-	    if (pv > 40) pv = 40;
+	    if (pv > cap) pv = cap;                                              /* same platform cap as H */
 	    sat_plane_border_v = pv;
 	}
 	sat_va_head++;

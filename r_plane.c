@@ -930,6 +930,34 @@ int sat_floor_punch_here(void)
    leaves it index 0 (the VDP1 strips fill it below NBG1, like the walls) and skips the software
    span draw.  Hook NULL / flag 0 on DoomJo + the normal build => unchanged software floors. */
 int sat_vdp1_floor = 0;
+/* SATURN swept-region decrochage fill (fill mode 1, owner's design 2026-07-02): per-column
+   HISTORY of the claimed-plane region boundaries.  Instead of a uniform B-px perimeter (which
+   blankets any small plane during a turn), the CPU paints ONLY the swept band: the rows that
+   are plane NOW but were NOT claimed-plane sat_plane_lag frames ago = the exact gap the lagged
+   VDP1 content cannot cover (a diagonal band along a moving wall junction).  Platform-armed
+   via sat_plane_fill_mode=1; default 0 = the uniform-B legacy path (DoomJo untouched). */
+int sat_plane_fill_mode = 0;
+/* SATURN partial claim (hook returns 2): per-column VDP1/CPU split edge for the plane being
+   claimed, filled by the platform hook BEFORE returning.  For a FLOOR, rows [edge..bottom]
+   are punched (VDP1 tiles own them) and rows [top..edge-1] fall through to the normal
+   software span path (the far field AND the chunk-clip wedge triangles render as real
+   texels); for a CEILING the split mirrors ([top..edge] punched, [edge+1..bottom] software).
+   NULL (DoomJo / not armed) => return 2 degrades to a full claim. */
+short *sat_floor_punch_edge = NULL;
+/* SATURN: fired at the very END of R_DrawPlanes, when every visplane (claims, punch edges,
+   software residue) is final -- the platform builds + atomically chains its VDP1 floor bank
+   here, so the floors go live in the SAME frame as the walls instead of one frame later
+   (the forward/backward wall-vs-ceiling slip the owner reported).  NULL on DoomJo. */
+void (*sat_floors_done_hook)(void) = NULL;
+extern int sat_plane_lag;                        /* r_main.c: N frames of VDP1-vs-mask latency */
+extern int sat_split_active;                     /* split shares one fb: per-view histories would
+                                                    mix -> swept fill is 1p-only (like the legacy
+                                                    border, forced 0 in split by r_main.c) */
+static short sat_ceil_bot_cur[SCREENWIDTH];      /* this frame: lowest claimed-CEILING row per column */
+static short sat_floor_top_cur[SCREENWIDTH];     /* this frame: highest claimed-FLOOR row per column  */
+static short sat_ceil_bot_hist[2][SCREENWIDTH];  /* [0] = 1 frame ago, [1] = 2 frames ago             */
+static short sat_floor_top_hist[2][SCREENWIDTH];
+
 int (*sat_floor_vdp1_hook)(int picnum, int height, int minx, int maxx,
                            const unsigned char *top, const unsigned char *bottom,
                            int lightlevel) = NULL;
@@ -1024,7 +1052,24 @@ void R_DrawPlanes (void)
     int			stop;
     int			angle;
     int                 lumpnum;
-				
+
+    /* SATURN swept-fill history (fill mode 1): rotate the claimed-plane boundary arrays.
+       cur (last frame's fills) -> hist[0] -> hist[1]; reset cur to "nothing" so a column
+       with no claimed plane this frame reads as fully-new next frame (conservative fill). */
+    if (sat_plane_fill_mode)
+    {
+	int c;
+	for (c = 0; c < SCREENWIDTH; c++)
+	{
+	    sat_ceil_bot_hist[1][c]  = sat_ceil_bot_hist[0][c];
+	    sat_floor_top_hist[1][c] = sat_floor_top_hist[0][c];
+	    sat_ceil_bot_hist[0][c]  = sat_ceil_bot_cur[c];
+	    sat_floor_top_hist[0][c] = sat_floor_top_cur[c];
+	    sat_ceil_bot_cur[c]  = -1;
+	    sat_floor_top_cur[c] = (short)viewheight;
+	}
+    }
+
 #ifdef RANGECHECK
     if (ds_p - drawsegs > MAXDRAWSEGS)
 	I_Error ("R_DrawPlanes: drawsegs overflow (%i)",
@@ -1311,9 +1356,12 @@ void R_DrawPlanes (void)
 	   and SKIP the software span draw.  Placed AFTER RP_PlanePixels so the inc-0 profiler still
 	   counts it; releases the flat lock it would otherwise leak.  Hook NULL / flag 0 on
 	   DoomJo + the normal build => unchanged. */
-	if (sat_vdp1_floor && sat_floor_vdp1_hook
-	    && sat_floor_vdp1_hook(pl->picnum, (int)pl->height, pl->minx, pl->maxx,
-				   pl->top, pl->bottom, pl->lightlevel))
+	{
+	int fclaim = (sat_vdp1_floor && sat_floor_vdp1_hook)
+	    ? sat_floor_vdp1_hook(pl->picnum, (int)pl->height, pl->minx, pl->maxx,
+				  pl->top, pl->bottom, pl->lightlevel)
+	    : 0;
+	if (fclaim)
 	{
 	    /* SATURN rotation-decrochage fill (owner's spec): the CPU draws the plane's OWN colour, in
 	       software (NBG1 latency = aligned with THIS frame's mask), in a border sat_plane_border px
@@ -1328,41 +1376,216 @@ void R_DrawPlanes (void)
 	    int Bh = sat_plane_border;      /* horizontal shift (yaw)         */
 	    int Bv = sat_plane_border_v;    /* vertical   shift (fwd + viewz) */
 	    int B  = Bh > Bv ? Bh : Bv;     /* uniform border (sloped edges couple axes); 0 -> fast path */
-	    byte bc = B > 0 ? (byte)R_FlatPotatoColor(lumpnum) : 0;   /* plane colour ~ the VDP1 quad's */
+	    /* SWEPT mode (sat_plane_fill_mode=1): per-column band between the plane's CURRENT
+	       span and its claimed region sat_plane_lag frames ago -- the owner's "red band".
+	       The border colour is COLORMAP-SHADED (a mid zlight band) so it blends with the
+	       CRAM-lit VDP1 flat instead of glowing full-bright in dark rooms. */
+	    int swept = sat_plane_fill_mode && !sat_split_active;
+	    int is_ceil = (pl->height > viewz);
+	    int hist_i = (sat_plane_lag >= 2) ? 1 : 0;
+	    byte bc = 0;
+	    if (swept)
+	    {
+		int li = (pl->lightlevel >> LIGHTSEGSHIFT) + extralight;
+		if (li < 0) li = 0; else if (li >= LIGHTLEVELS) li = LIGHTLEVELS - 1;
+		bc = zlight[li][8][R_FlatPotatoColor(lumpnum)];
+	    }
+	    else if (B > 0)
+		bc = (byte)R_FlatPotatoColor(lumpnum);
 	    int lb = pl->minx + B, rb = pl->maxx - B;                 /* L/R margin columns -> whole span */
+	    /* PARTIAL claim (fclaim == 2, mode 3): the platform filled sat_floor_punch_edge[]
+	       with the per-column VDP1/CPU split; only [pb0..pb1] is punched, and top[]/bottom[]
+	       are trimmed to the SOFTWARE leftover (far field + chunk-clip wedges) which then
+	       falls through to the normal span draw below -- real texels, aligned latency. */
+	    int partial = (fclaim == 2 && sat_floor_punch_edge != NULL);
+	    int swband  = (fclaim == 3);   /* SOFTWARE plane + textured wall-lag catch-up band */
 	    for (x = pl->minx ; x <= pl->maxx ; x++)
 	    {
 		int yl = pl->top[x];
 		int yh = pl->bottom[x];
+		int pb0, pb1;
 		int n;
 		if (yl > yh) continue;
-		n = yh - yl + 1;
-		if (B <= 0)
+		if (swband)
+		{
+		    /* fclaim 3 (VDP1 walls + software planes): the plane itself falls through to
+		       the normal span draw untouched; here we paint ONLY the catch-up band -- the
+		       rows this plane covered sat_plane_lag frames ago that are WALL-punched now:
+		       during the wall-lag window VDP1 has nothing plotted there (black sliver at
+		       the moving junction).  Real plane texels at mask latency; at rest the band
+		       is empty and the walls show through untouched. */
+		    int e0, e1;
+		    if (is_ceil)
+		    {
+			int j_old = sat_ceil_bot_hist[hist_i][x];
+			if (yh > sat_ceil_bot_cur[x]) sat_ceil_bot_cur[x] = (short)yh;
+			e0 = yh + 1;
+			e1 = j_old; if (e1 > yh + 40) e1 = yh + 40;
+			if (e1 > viewheight - 1) e1 = viewheight - 1;
+		    }
+		    else
+		    {
+			int k_old = sat_floor_top_hist[hist_i][x];
+			if (yl < sat_floor_top_cur[x]) sat_floor_top_cur[x] = (short)yl;
+			e1 = yl - 1;
+			e0 = k_old; if (e0 < yl - 40) e0 = yl - 40;
+			if (e0 < 0) e0 = 0;
+		    }
+		    if (e0 <= e1)
+		    {
+			unsigned tang = (unsigned)(viewangle + xtoviewangle[x]) >> ANGLETOFINESHIFT;
+			fixed_t tcos = finecosine[tang], tsin = finesine[tang];
+			fixed_t tdsc = distscale[x];
+			int y2;
+			for (y2 = e0; y2 <= e1; y2++)
+			{
+			    fixed_t dist = FixedMul(planeheight, yslope[y2]);
+			    fixed_t len  = FixedMul(dist, tdsc);
+			    fixed_t xf   = viewx + FixedMul(tcos, len);
+			    fixed_t yf   = -viewy - FixedMul(tsin, len);
+			    int zi = dist >> LIGHTZSHIFT; if (zi >= MAXLIGHTZ) zi = MAXLIGHTZ - 1;
+			    byte v = (fixedcolormap ? fixedcolormap : planezlight[zi])
+				     [ds_source[((yf >> 10) & 0x0FC0) | ((xf >> 16) & 63)]];
+			    if (detailshift)
+			    {
+				int sx2 = x << 1;
+				ylookup[y2][columnofs[sx2]]     = v;
+				ylookup[y2][columnofs[sx2 + 1]] = v;
+			    }
+			    else
+				ylookup[y2][columnofs[x]] = v;
+			}
+		    }
+		    continue;      /* bounds untouched -> the plane renders fully in software */
+		}
+		pb0 = yl; pb1 = yh;
+		if (partial)
+		{
+		    int pe = (int)sat_floor_punch_edge[x];
+		    if (is_ceil)
+		    {
+			int nt;
+			if (pe < pb1) pb1 = pe;                       /* punch [yl..pb1]        */
+			nt = pb1 + 1; if (nt < yl) nt = yl;           /* leftover = [nt..yh]    */
+			pl->top[x] = (unsigned char)nt;
+		    }
+		    else
+		    {
+			int nb;
+			if (pe > pb0) pb0 = pe;                       /* punch [pb0..yh]        */
+			nb = pb0 - 1; if (nb > yh) nb = yh;           /* leftover = [yl..nb]    */
+			if (nb < 0) pl->top[x] = 0xff;                /* empty (byte-safe mark) */
+			else        pl->bottom[x] = (unsigned char)nb;
+		    }
+		    if (pb0 > pb1) continue;                          /* nothing punched here   */
+		}
+		n = pb1 - pb0 + 1;
+		if (swept)
+		{
+		    int fb2, fe;                    /* paint bc on [fb2..fe], punch 0 elsewhere */
+		    if (is_ceil)
+		    {
+			int j_old = sat_ceil_bot_hist[hist_i][x];
+			if (pb1 > sat_ceil_bot_cur[x]) sat_ceil_bot_cur[x] = (short)pb1;
+			fb2 = j_old + 1; if (fb2 < pb0) fb2 = pb0;  /* newly-ceiling rows only */
+			fe  = pb1;
+		    }
+		    else
+		    {
+			int k_old = sat_floor_top_hist[hist_i][x];
+			if (pb0 < sat_floor_top_cur[x]) sat_floor_top_cur[x] = (short)pb0;
+			fb2 = pb0;                                  /* newly-floor rows only */
+			fe  = k_old - 1; if (fe > pb1) fe = pb1;
+		    }
+		    {
+			int y = pb0;
+			/* fill_mode 2: the band gets the REAL flat texels (R_MapPlane's exact
+			   mapping + per-row zlight -- ds_source/planeheight/planezlight are
+			   already in scope, cached above the hook) instead of the potato
+			   colour: the decrochage cover becomes invisible texture.  Cost only
+			   on band rows, i.e. only during motion. */
+			int texband = (sat_plane_fill_mode >= 2 && fb2 <= fe);
+			unsigned tang = 0; fixed_t tcos = 0, tsin = 0, tdsc = 0;
+			if (texband)
+			{
+			    tang = (unsigned)(viewangle + xtoviewangle[x]) >> ANGLETOFINESHIFT;
+			    tcos = finecosine[tang]; tsin = finesine[tang];
+			    tdsc = distscale[x];
+			}
+			if (detailshift)
+			{
+			    int sx = x << 1;
+			    byte *d0 = ylookup[pb0] + columnofs[sx];
+			    byte *d1 = ylookup[pb0] + columnofs[sx + 1];
+			    do {
+				byte v = 0;
+				if (y >= fb2 && y <= fe)
+				{
+				    if (texband)
+				    {
+					fixed_t dist = FixedMul(planeheight, yslope[y]);
+					fixed_t len  = FixedMul(dist, tdsc);
+					fixed_t xf   = viewx + FixedMul(tcos, len);
+					fixed_t yf   = -viewy - FixedMul(tsin, len);
+					int zi = dist >> LIGHTZSHIFT; if (zi >= MAXLIGHTZ) zi = MAXLIGHTZ - 1;
+					v = (fixedcolormap ? fixedcolormap : planezlight[zi])
+					    [ds_source[((yf >> 10) & 0x0FC0) | ((xf >> 16) & 63)]];
+				    }
+				    else v = bc;
+				}
+				*d0 = v; *d1 = v; d0 += SCREENWIDTH; d1 += SCREENWIDTH; y++;
+			    } while (--n);
+			}
+			else
+			{
+			    byte *d = ylookup[pb0] + columnofs[x];
+			    do {
+				byte v = 0;
+				if (y >= fb2 && y <= fe)
+				{
+				    if (texband)
+				    {
+					fixed_t dist = FixedMul(planeheight, yslope[y]);
+					fixed_t len  = FixedMul(dist, tdsc);
+					fixed_t xf   = viewx + FixedMul(tcos, len);
+					fixed_t yf   = -viewy - FixedMul(tsin, len);
+					int zi = dist >> LIGHTZSHIFT; if (zi >= MAXLIGHTZ) zi = MAXLIGHTZ - 1;
+					v = (fixedcolormap ? fixedcolormap : planezlight[zi])
+					    [ds_source[((yf >> 10) & 0x0FC0) | ((xf >> 16) & 63)]];
+				    }
+				    else v = bc;
+				}
+				*d = v; d += SCREENWIDTH; y++;
+			    } while (--n);
+			}
+		    }
+		}
+		else if (B <= 0)
 		{
 		    if (detailshift)
 		    {
 			int sx = x << 1;
-			byte *d0 = ylookup[yl] + columnofs[sx];
-			byte *d1 = ylookup[yl] + columnofs[sx + 1];
+			byte *d0 = ylookup[pb0] + columnofs[sx];
+			byte *d1 = ylookup[pb0] + columnofs[sx + 1];
 			do { *d0 = 0; *d1 = 0; d0 += SCREENWIDTH; d1 += SCREENWIDTH; } while (--n);
 		    }
 		    else
 		    {
-			byte *d = ylookup[yl] + columnofs[x];
+			byte *d = ylookup[pb0] + columnofs[x];
 			do { *d = 0; d += SCREENWIDTH; } while (--n);
 		    }
 		}
 		else
 		{
 		    int col_edge = (x < lb || x > rb);   /* left/right margin -> entire column is border */
-		    int tb = yl + B;                      /* rows above this = top border    */
-		    int bb = yh - B;                      /* rows below this = bottom border  */
-		    int y  = yl;
+		    int tb = pb0 + B;                     /* rows above this = top border    */
+		    int bb = pb1 - B;                     /* rows below this = bottom border  */
+		    int y  = pb0;
 		    if (detailshift)
 		    {
 			int sx = x << 1;
-			byte *d0 = ylookup[yl] + columnofs[sx];
-			byte *d1 = ylookup[yl] + columnofs[sx + 1];
+			byte *d0 = ylookup[pb0] + columnofs[sx];
+			byte *d1 = ylookup[pb0] + columnofs[sx + 1];
 			do {
 			    byte v = (col_edge || y < tb || y > bb) ? bc : 0;
 			    *d0 = v; *d1 = v; d0 += SCREENWIDTH; d1 += SCREENWIDTH; y++;
@@ -1370,7 +1593,7 @@ void R_DrawPlanes (void)
 		    }
 		    else
 		    {
-			byte *d = ylookup[yl] + columnofs[x];
+			byte *d = ylookup[pb0] + columnofs[x];
 			do {
 			    *d = (col_edge || y < tb || y > bb) ? bc : 0;
 			    d += SCREENWIDTH; y++;
@@ -1378,8 +1601,15 @@ void R_DrawPlanes (void)
 		    }
 		}
 	    }
-	    W_ReleaseLumpNum(lumpnum);   /* we cached it above but skip the draw -> release the lock */
-	    continue;
+	    if (!partial && !swband)
+	    {
+		W_ReleaseLumpNum(lumpnum);   /* we cached it above but skip the draw -> release the lock */
+		continue;
+	    }
+	    /* partial/swband: FALL THROUGH -- the regular span path below draws the software part
+	       with the (possibly trimmed) top[]/bottom[] (the flat stays cached; released at the
+	       loop end). */
+	}
 	}
 
 #if SAT_PLANE_LOCAL
@@ -1445,4 +1675,8 @@ void R_DrawPlanes (void)
         dbg_print(0, 14, b);
     }
 #endif
+
+    /* SATURN: floors final -> platform builds/chains its VDP1 floor bank now (same frame). */
+    if (sat_floors_done_hook)
+	sat_floors_done_hook();
 }
