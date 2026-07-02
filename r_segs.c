@@ -237,6 +237,7 @@ extern int sat_split_vdp1;     /* ...unless Step 3 keeps walls on VDP1 per-view 
    VDP1 maps the full texture across the quad).  Off => no change (DoomJo, normal build). */
 extern int sat_vdp2_floor;
 extern int sat_floor_punch_here(void);   /* SATURN split: gate the floor cohesion sites per-viewport (1p: == sat_vdp2_floor) */
+extern int sat_vdp1_floor;               /* SATURN: secondary floors/ceilings deported to VDP1 (gates the above-ceiling wall clamp) */
 
 /* SATURN close-wall CPU fallback: a seg whose projected vertical span (px) exceeds this is so
    close/grazing that its VDP1 textured quad would explode the fill (VDP1 rasterises the whole
@@ -460,27 +461,20 @@ void R_RenderSegLoop (void)
 	if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
 	    { /* entirely below the floor -> cull (neither VDP1 nor CPU draws it) */ }
 	else if (sat_floor_punch_here() && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
-	{
-	    /* Phase-1b: this wall dips past the transparent RBG0 floor line -> a raw VDP1 quad would bleed
-	       through it (why it went to CPU).  When clamp is on AND the wall is NOT near (bspan<=SPAN, so
-	       no affine warp), CUT + ALIGN it at the floor line and keep it on VDP1: clamp yh to floorclip
-	       and re-derive the bottom texel THERE (world-anchored; the wall's z is ~constant per column so
-	       screen-y is LINEAR in v -> the visible texture keeps its true scale, no squish).  Near walls
-	       (bspan>SPAN) or clamp-off stay on the CPU as before. */
-	    int bspan = (yh1 - yl1 > yh2 - yl2) ? (yh1 - yl1) : (yh2 - yl2);
-	    if (sat_wall_clamp && bspan <= SAT_WALL_CPU_SPAN)
-	    {
-		int fc1 = floorclip[rw_x], fc2 = floorclip[rw_stopx - 1];
-		int nyh1 = (yh1 > fc1) ? fc1 : yh1;
-		int nyh2 = (yh2 > fc2) ? fc2 : yh2;
-		int den  = yh1 - yl1; if (den < 1) den = 1;
-		int nv1  = v0 + (int)((long long)(nyh1 - yl1) * (v1 - v0) / den);   /* texel AT the floor line */
-		if (sat_wall_hook (rw_x, yl1, nyh1, rw_stopx - 1, yl2, nyh2, midtexture, u1, u2, v0, nv1, cm))
-		    { sat_sw_mid = 1; sat_fb_starve_t++; }   /* VDP1 bank full -> CPU */
-	    }
-	    else
-		{ sat_sw_mid = 1; sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }  /* near / clamp-off -> CPU */
-	}
+	    /* Occluded below a NEARER floor (yh > floorclip): the CPU draws it, clipping EACH COLUMN to
+	       floorclip with the correct per-column texel.  The Phase-1b VDP1 clamp (attach the hidden
+	       bottom to floorclip via a 2-point edge + a single texel) squished the texture and left holes
+	       where the 2-point edge missed the real per-column floorclip (owner's red/purple 2026-07-02);
+	       DISTORSP can't clip per-column nor trim u.  A proper VDP1 version = decompose the bottom along
+	       floorclip like the FLOOR corridor -- a future increment; CPU is correct now. */
+	    { sat_sw_mid = 1; sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }
+	else if (sat_vdp1_floor && (yl1 <= ceilingclip[rw_x] || yl2 <= ceilingclip[rw_stopx - 1]))
+	    /* Occluded ABOVE a NEARER/lower ceiling (yl <= ceilingclip): symmetric to the below-floor case.
+	       A raw VDP1 quad drawn to its natural top covers the DEPORTED ceiling quad (painter order:
+	       ceilings emit BEFORE walls, same prio 5) -> the wall shows where the ceiling should be (owner
+	       2026-07-02).  The CPU draws it, clipping each column to ceilingclip+1 (r_segs.c ~545).  Only
+	       when ceilings are deported (sat_vdp1_floor); else the software ceiling (NBG1 prio 6) covered it. */
+	    { sat_sw_mid = 1; sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }
 	else if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, midtexture, u1, u2, v0, v1, cm))
 	    { sat_sw_mid = 1; sat_fb_starve_t++; }   /* VDP1 starved (command list full) -> draw this wall in SOFTWARE, not sky */
     }
@@ -513,6 +507,8 @@ void R_RenderSegLoop (void)
 		{ /* entirely below the floor -> cull */ }
 	    else if (sat_floor_punch_here() && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
 		{ sat_sw_up = 1; sat_fb_clamp_t++; }   /* partially below -> CPU (clip to floor); Phase-0: clampable */
+	    else if (sat_vdp1_floor && (yl1 <= ceilingclip[rw_x] || yl2 <= ceilingclip[rw_stopx - 1]))
+		{ sat_sw_up = 1; sat_fb_clamp_t++; }   /* above a nearer ceiling -> CPU (clip to ceilingclip; a VDP1 quad would cover the deported ceiling) */
 	    else
 		if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, toptexture, u1, u2, v0, v1, cm))
 		    { sat_sw_up = 1; sat_fb_starve_t++; }   /* VDP1 starved (list full) -> upper in SOFTWARE, not sky */
@@ -531,6 +527,8 @@ void R_RenderSegLoop (void)
 		{ /* entirely below the floor -> cull */ }
 	    else if (sat_floor_punch_here() && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
 		{ sat_sw_lo = 1; sat_fb_clamp_t++; }   /* partially below -> CPU (clip to floor); Phase-0: clampable */
+	    else if (sat_vdp1_floor && (yl1 <= ceilingclip[rw_x] || yl2 <= ceilingclip[rw_stopx - 1]))
+		{ sat_sw_lo = 1; sat_fb_clamp_t++; }   /* above a nearer ceiling -> CPU (clip to ceilingclip; a VDP1 quad would cover the deported ceiling) */
 	    else
 		if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, bottomtexture, u1, u2, v0, v1, cm))
 		    { sat_sw_lo = 1; sat_fb_starve_t++; }   /* VDP1 starved (list full) -> lower in SOFTWARE, not sky */
