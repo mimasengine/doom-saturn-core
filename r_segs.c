@@ -259,6 +259,30 @@ extern int sat_vdp1_floor;               /* SATURN: secondary floors/ceilings de
                                    test misses).  Grazing walls have LOW mag -> stay on VDP1.  Lower =
                                    more walls to CPU (safer, costlier); higher = fewer (risk squish). */
 
+/* PERSPECTIVE-CORRECT NEAR-WALL SUBDIVISION (owner 2026-07-02; workflow wbq3s2c52).  A magnified
+   (close/face-on) wall squishes on VDP1 because wall_emit_band inverts u->x LINEARLY -- a 2-point
+   affine chord through the true tangent curve u(x)=rw_offset-finetangent[..]*rw_distance.  Instead of
+   dumping it to the CPU, split it into N narrow SCREEN-COLUMN sub-segments and RE-SAMPLE u at each
+   boundary via that exact formula -> each affine tile is a local chord where the curve is ~linear ->
+   sub-pixel error, no squish; u is world-anchored so NO swim; yl/yh stay exact (linear in x).  N is
+   derived for free from the same mag quantity (columns-per-texel), capped so a few close walls can't
+   starve the far ones.  0 = old behaviour (magnified -> CPU), byte-identical (A/B). */
+#define SAT_WALL_SUBDIV      1
+#define SAT_WALL_SUBDIV_MAX  6   /* hard cap on sub-segments per magnified wall (budget guard) */
+
+/* EDGE FILL (owner 2026-07-02): a VDP1 wall is only visible through NBG1's index-0 mask, so in rotation
+   its VDP1 body (current) is offset from that lagged NBG1 mask -> a horizontal "decrochage" sky gap at
+   the wall's LEFT/RIGHT edges.  SOFTWARE pixels are at NBG1's OWN latency = aligned with the mask, so the
+   CPU drawing the wall's first/last N columns in software COVERS that gap (body stays VDP1/fast; only the
+   thin edge strips are CPU).  This is the horizontal analog of Topic-B, done on NBG1 so it aligns.
+   0 = off.  DoomJo-safe: gated on sat_wall_skip (0 on DoomJo -> inert). */
+#define SAT_WALL_EDGE_FILL   0    /* DISABLED (owner 2026-07-02): wrong target.  The rotation sky-gap is NOT at the
+                                     wall's L/R edges -- it is the deported CEILING/FLOOR VDP1 quad lagging its NBG1
+                                     silhouette mask.  Filling wall edges (textured, = the VDP1 wall visually) never
+                                     touched that region -> "identique".  The fix lives on the deported-quad emit
+                                     (dg_saturn sat_floor_vdp1_emit: HORIZONTAL overflow), not here.  Kept as an
+                                     inert A/B stub. */
+
 /* SATURN Phase-0 CPU-fallback profiler (measures the "walls handed to software" prize BEFORE
    building the VDP1 wall clamp of Phase 1).  By cause:
      clamp  = vertical SPAN (>V1, fully CPU) or partially-below-the-RBG0-floor-line -- a world-
@@ -303,6 +327,7 @@ void R_RenderSegLoop (void)
        sat_v1_* = the VDP1 hook draws it (VDP1 + transition zone).  Both true in [LOW,HIGH] = overlap. */
     int			sat_sw_mid = 0, sat_sw_up = 0, sat_sw_lo = 0;
     int			sat_v1_mid = 0, sat_v1_up = 0, sat_v1_lo = 0;
+    int			sat_v1_mid_sub = 0, sat_v1_up_sub = 0, sat_v1_lo_sub = 0;   /* magnified tier -> perspective-subdivide on VDP1 (not CPU) */
 
     /* Keep doors/switches (special lines) textured even in Potato walls, so they
        stay readable against the flat-shaded plain walls. */
@@ -360,6 +385,9 @@ void R_RenderSegLoop (void)
 	    int idx = (int)(curline - segs);
 	    unsigned char *st = (idx >= 0 && idx < SAT_SEG_MAX) ? &sat_seg_cpu[idx] : 0;
 	    sat_v1_mid = (s < SAT_WALL_CPU_V1) && !magnified;  /* magnified -> NO VDP1 quad (it squishes) */
+#if SAT_WALL_SUBDIV
+	    if (magnified && !span_close) { sat_v1_mid_sub = 1; cpu_now = 0; }  /* keep on VDP1 via perspective subdivision (emit site), not CPU */
+#endif
 	    if (cpu_now)
 	    {
 		if (!sat_v1_mid) {   /* Phase-0: count only the FULLY-CPU tiers (not the [SPAN,V1] VDP1-also pre-warm) */
@@ -398,7 +426,9 @@ void R_RenderSegLoop (void)
 		int cpu_now = cpu_up || cpu_lo || magnified;
 		if (cpu_up) sat_fb_clamp_t++;                        /* Phase-0: clampable span (upper door tier) */
 		if (cpu_lo) sat_fb_clamp_t++;                        /* Phase-0: clampable span (lower door tier) */
+#if !SAT_WALL_SUBDIV
 		if (magnified && !cpu_up && !cpu_lo) sat_fb_mag_t++; /* Phase-0: magnified-only door residue      */
+#endif
 		int idx = (int)(curline - segs);
 		unsigned char *st = (idx >= 0 && idx < SAT_SEG_MAX) ? &sat_seg_cpu[idx] : 0;
 		int overlap = 0;
@@ -408,8 +438,16 @@ void R_RenderSegLoop (void)
 		   squishing quad); the CPU draws it when close/magnified OR during the exit overlap. */
 		sat_v1_up = (toptexture    && !magnified && !cpu_up) ? 1 : 0;
 		sat_v1_lo = (bottomtexture && !magnified && !cpu_lo) ? 1 : 0;
+#if SAT_WALL_SUBDIV
+		/* magnified (not span-close) door tiers -> perspective-subdivide on VDP1 (emit site), not CPU */
+		sat_v1_up_sub = (toptexture    && magnified && !cpu_up) ? 1 : 0;
+		sat_v1_lo_sub = (bottomtexture && magnified && !cpu_lo) ? 1 : 0;
+		sat_sw_up = (toptexture    && (cpu_up || (magnified && !sat_v1_up_sub) || overlap)) ? 1 : 0;
+		sat_sw_lo = (bottomtexture && (cpu_lo || (magnified && !sat_v1_lo_sub) || overlap)) ? 1 : 0;
+#else
 		sat_sw_up = (toptexture    && (cpu_up || magnified || overlap)) ? 1 : 0;
 		sat_sw_lo = (bottomtexture && (cpu_lo || magnified || overlap)) ? 1 : 0;
+#endif
 	    }
 	}
     }
@@ -433,7 +471,7 @@ void R_RenderSegLoop (void)
     /* SATURN VDP1 world renderer (Step 2): one-sided (solid) walls -> the platform as
        a quad.  The 4 screen corners come from the same topfrac/bottomfrac the loop
        below steps; midtexture = the full-height wall texture. */
-    if (sat_wall_hook && SAT_WALL_VDP1_OK && midtexture && !curline->backsector && rw_stopx > rw_x && sat_v1_mid)
+    if (sat_wall_hook && SAT_WALL_VDP1_OK && midtexture && !curline->backsector && rw_stopx > rw_x && (sat_v1_mid || sat_v1_mid_sub))
     {
 	int n   = rw_stopx - 1 - rw_x;
 	int yl1 = (topfrac + HEIGHTUNIT - 1) >> HEIGHTBITS;
@@ -475,6 +513,38 @@ void R_RenderSegLoop (void)
 	       2026-07-02).  The CPU draws it, clipping each column to ceilingclip+1 (r_segs.c ~545).  Only
 	       when ceilings are deported (sat_vdp1_floor); else the software ceiling (NBG1 prio 6) covered it. */
 	    { sat_sw_mid = 1; sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }
+#if SAT_WALL_SUBDIV
+	else if (sat_v1_mid_sub && !sat_v1_mid)   /* normal path only (pot2 force-sets sat_v1_mid=1 -> single quad) */
+	{
+	    /* PERSPECTIVE SUBDIVISION of a magnified wall: split [rw_x, rw_stopx-1] into N narrow sub-segs,
+	       RE-SAMPLE u at each endpoint via the true tangent formula (perspective-correct) + EXACT linear
+	       yl/yh -> no squish, no swim.  Sub-segs abut column-for-column (no seam).  N ~ columns-per-texel
+	       (the same magnification quantity), capped.  Whole wall -> CPU on a bank-full reject. */
+	    int sx = rw_stopx - rw_x, mdu = u2 - u1; if (mdu < 0) mdu = -mdu; if (mdu < 1) mdu = 1;
+	    int N = 1 + sx / mdu; if (N < 2) N = 2; if (N > SAT_WALL_SUBDIV_MAX) N = SAT_WALL_SUBDIV_MAX;
+	    int prev_b = rw_x, k;
+	    for (k = 1; k <= N; k++)
+	    {
+		int b = rw_x + (sx * k) / N;               /* right boundary (exclusive) of sub-seg k */
+		int xl = prev_b, xr = b - 1; prev_b = b;
+		if (xr < xl) continue;                     /* degenerate (N > visible columns) */
+		{
+		    int dnl = xl - rw_x, dnr = xr - rw_x;
+		    int al  = (rw_centerangle + xtoviewangle[xl]) >> ANGLETOFINESHIFT;
+		    int ar  = (rw_centerangle + xtoviewangle[xr]) >> ANGLETOFINESHIFT;
+		    int ul  = (rw_offset - FixedMul(finetangent[al], rw_distance)) >> FRACBITS;  /* PERSP u */
+		    int ur  = (rw_offset - FixedMul(finetangent[ar], rw_distance)) >> FRACBITS;
+		    int yll = (topfrac    + topstep    * dnl + HEIGHTUNIT - 1) >> HEIGHTBITS;    /* EXACT */
+		    int ylr = (topfrac    + topstep    * dnr + HEIGHTUNIT - 1) >> HEIGHTBITS;
+		    int yhl = (bottomfrac + bottomstep * dnl) >> HEIGHTBITS;
+		    int yhr = (bottomfrac + bottomstep * dnr) >> HEIGHTBITS;
+		    int sv0, sv1; SAT_VROWS(rw_midtexturemid, yll, yhl, sv0, sv1);
+		    if (sat_wall_hook (xl, yll, yhl, xr, ylr, yhr, midtexture, ul, ur, sv0, sv1, cm))
+			{ sat_sw_mid = 1; sat_fb_starve_t++; break; }   /* bank full -> whole wall SW */
+		}
+	    }
+	}
+#endif
 	else if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, midtexture, u1, u2, v0, v1, cm))
 	    { sat_sw_mid = 1; sat_fb_starve_t++; }   /* VDP1 starved (command list full) -> draw this wall in SOFTWARE, not sky */
     }
@@ -493,7 +563,7 @@ void R_RenderSegLoop (void)
 	int _li = rw_scale >> LIGHTSCALESHIFT;   /* distance-correct light (was fixed mid-level) */
 	if (_li >= MAXLIGHTSCALE) _li = MAXLIGHTSCALE - 1; else if (_li < 0) _li = 0;
 	const lighttable_t *cm = walllights[_li];
-	if (toptexture && sat_v1_up)   /* ceiling -> top of the opening */
+	if (toptexture && (sat_v1_up || sat_v1_up_sub))   /* ceiling -> top of the opening */
 	{
 	    int yl1 = (topfrac + HEIGHTUNIT - 1) >> HEIGHTBITS;
 	    int yl2 = (topfrac + topstep * n + HEIGHTUNIT - 1) >> HEIGHTBITS;
@@ -509,6 +579,34 @@ void R_RenderSegLoop (void)
 		{ sat_sw_up = 1; sat_fb_clamp_t++; }   /* partially below -> CPU (clip to floor); Phase-0: clampable */
 	    else if (sat_vdp1_floor && (yl1 <= ceilingclip[rw_x] || yl2 <= ceilingclip[rw_stopx - 1]))
 		{ sat_sw_up = 1; sat_fb_clamp_t++; }   /* above a nearer ceiling -> CPU (clip to ceilingclip; a VDP1 quad would cover the deported ceiling) */
+#if SAT_WALL_SUBDIV
+	    else if (sat_v1_up_sub && !sat_v1_up)   /* magnified door LINTEL -> perspective subdivision (top=topfrac, bottom=pixhigh) */
+	    {
+		int sx = rw_stopx - rw_x, mdu = u2 - u1; if (mdu < 0) mdu = -mdu; if (mdu < 1) mdu = 1;
+		int N = 1 + sx / mdu; if (N < 2) N = 2; if (N > SAT_WALL_SUBDIV_MAX) N = SAT_WALL_SUBDIV_MAX;
+		int prev_b = rw_x, k;
+		for (k = 1; k <= N; k++)
+		{
+		    int b = rw_x + (sx * k) / N;
+		    int xl = prev_b, xr = b - 1; prev_b = b;
+		    if (xr < xl) continue;
+		    {
+			int dnl = xl - rw_x, dnr = xr - rw_x;
+			int al  = (rw_centerangle + xtoviewangle[xl]) >> ANGLETOFINESHIFT;
+			int ar  = (rw_centerangle + xtoviewangle[xr]) >> ANGLETOFINESHIFT;
+			int ul  = (rw_offset - FixedMul(finetangent[al], rw_distance)) >> FRACBITS;
+			int ur  = (rw_offset - FixedMul(finetangent[ar], rw_distance)) >> FRACBITS;
+			int yll = (topfrac + topstep     * dnl + HEIGHTUNIT - 1) >> HEIGHTBITS;
+			int ylr = (topfrac + topstep     * dnr + HEIGHTUNIT - 1) >> HEIGHTBITS;
+			int yhl = (pixhigh + pixhighstep * dnl) >> HEIGHTBITS;
+			int yhr = (pixhigh + pixhighstep * dnr) >> HEIGHTBITS;
+			int sv0, sv1; SAT_VROWS(rw_toptexturemid, yll, yhl, sv0, sv1);
+			if (sat_wall_hook (xl, yll, yhl, xr, ylr, yhr, toptexture, ul, ur, sv0, sv1, cm))
+			    { sat_sw_up = 1; sat_fb_starve_t++; break; }
+		    }
+		}
+	    }
+#endif
 	    else
 		if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, toptexture, u1, u2, v0, v1, cm))
 		    { sat_sw_up = 1; sat_fb_starve_t++; }   /* VDP1 starved (list full) -> upper in SOFTWARE, not sky */
@@ -529,6 +627,34 @@ void R_RenderSegLoop (void)
 		{ sat_sw_lo = 1; sat_fb_clamp_t++; }   /* partially below -> CPU (clip to floor); Phase-0: clampable */
 	    else if (sat_vdp1_floor && (yl1 <= ceilingclip[rw_x] || yl2 <= ceilingclip[rw_stopx - 1]))
 		{ sat_sw_lo = 1; sat_fb_clamp_t++; }   /* above a nearer ceiling -> CPU (clip to ceilingclip; a VDP1 quad would cover the deported ceiling) */
+#if SAT_WALL_SUBDIV
+	    else if (sat_v1_lo_sub && !sat_v1_lo)   /* magnified door SILL -> perspective subdivision (top=pixlow, bottom=bottomfrac) */
+	    {
+		int sx = rw_stopx - rw_x, mdu = u2 - u1; if (mdu < 0) mdu = -mdu; if (mdu < 1) mdu = 1;
+		int N = 1 + sx / mdu; if (N < 2) N = 2; if (N > SAT_WALL_SUBDIV_MAX) N = SAT_WALL_SUBDIV_MAX;
+		int prev_b = rw_x, k;
+		for (k = 1; k <= N; k++)
+		{
+		    int b = rw_x + (sx * k) / N;
+		    int xl = prev_b, xr = b - 1; prev_b = b;
+		    if (xr < xl) continue;
+		    {
+			int dnl = xl - rw_x, dnr = xr - rw_x;
+			int al  = (rw_centerangle + xtoviewangle[xl]) >> ANGLETOFINESHIFT;
+			int ar  = (rw_centerangle + xtoviewangle[xr]) >> ANGLETOFINESHIFT;
+			int ul  = (rw_offset - FixedMul(finetangent[al], rw_distance)) >> FRACBITS;
+			int ur  = (rw_offset - FixedMul(finetangent[ar], rw_distance)) >> FRACBITS;
+			int yll = (pixlow     + pixlowstep * dnl + HEIGHTUNIT - 1) >> HEIGHTBITS;
+			int ylr = (pixlow     + pixlowstep * dnr + HEIGHTUNIT - 1) >> HEIGHTBITS;
+			int yhl = (bottomfrac + bottomstep * dnl) >> HEIGHTBITS;
+			int yhr = (bottomfrac + bottomstep * dnr) >> HEIGHTBITS;
+			int sv0, sv1; SAT_VROWS(rw_bottomtexturemid, yll, yhl, sv0, sv1);
+			if (sat_wall_hook (xl, yll, yhl, xr, ylr, yhr, bottomtexture, ul, ur, sv0, sv1, cm))
+			    { sat_sw_lo = 1; sat_fb_starve_t++; break; }
+		    }
+		}
+	    }
+#endif
 	    else
 		if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, bottomtexture, u1, u2, v0, v1, cm))
 		    { sat_sw_lo = 1; sat_fb_starve_t++; }   /* VDP1 starved (list full) -> lower in SOFTWARE, not sky */
@@ -548,8 +674,20 @@ void R_RenderSegLoop (void)
         sw_draws = (toptexture    && (!sat_wall_skip || sat_sw_up))
                 || (bottomtexture && (!sat_wall_skip || sat_sw_lo));
 
+#if SAT_WALL_EDGE_FILL
+    int sat_ef_x0 = rw_x, sat_ef_x1 = rw_stopx - 1;   /* seg screen extent, for the edge-fill margin */
+#endif
     for ( ; rw_x < rw_stopx ; rw_x++)
     {
+#if SAT_WALL_EDGE_FILL
+	/* software-draw the wall's first/last SAT_WALL_EDGE_FILL columns even when VDP1 owns it -> the NBG1
+	   strips align with the lagged mask and fill the horizontal rotation decrochage.  sat_wall_skip==0
+	   (DoomJo / VDP1-off) -> is_edge is always 0 -> inert. */
+	int is_edge = sat_wall_skip && (rw_x - sat_ef_x0 < SAT_WALL_EDGE_FILL
+	                             || sat_ef_x1 - rw_x < SAT_WALL_EDGE_FILL);
+#else
+	enum { is_edge = 0 };
+#endif
 	// mark floor / ceiling areas
 	yl = (topfrac+HEIGHTUNIT-1)>>HEIGHTBITS;
 
@@ -597,7 +735,7 @@ void R_RenderSegLoop (void)
 	   (sw_draws==0 && !maskedtexture) it is dead work -- skip the per-column angle
 	   lookup + finetangent read + FixedMul + shift.  On DoomJo / VDP1-off, sat_wall_skip
 	   is 0 so sw_draws is always 1 -> the condition is always true -> byte-identical. */
-	if (segtextured && (sw_draws || maskedtexture))
+	if (segtextured && (sw_draws || is_edge || maskedtexture))
 	{
 	    // calculate texture offset
 	    angle = (rw_centerangle + xtoviewangle[rw_x])>>ANGLETOFINESHIFT;
@@ -606,7 +744,7 @@ void R_RenderSegLoop (void)
 	    /* SATURN PERF (lever C): the lighting lookup + the per-column dc_iscale divide
 	       feed only the software column draw (colfunc).  When VDP1 owns every tier this
 	       seg (sw_draws == 0) no colfunc runs -> skip them; the divide is the costly bit. */
-	    if (sw_draws)
+	    if (sw_draws || is_edge)
 	    {
 		// calculate lighting
 		index = rw_scale>>LIGHTSCALESHIFT;
@@ -635,7 +773,7 @@ void R_RenderSegLoop (void)
 	    /* SATURN: VDP1 owns this wall -> skip the software column draw, but KEEP the
 	       clip update so floors/ceilings/sprite occlusion stay correct.  EXCEPT a
 	       too-close OR transition wall (sat_sw_mid): the CPU draws it (no swim/explosion). */
-	    if (!sat_wall_skip || sat_sw_mid)
+	    if (!sat_wall_skip || sat_sw_mid || is_edge)
 	    {
 		dc_yl = yl;
 		dc_yh = yh;
@@ -663,7 +801,7 @@ void R_RenderSegLoop (void)
 
 		if (mid >= yl)
 		{
-		    if (!sat_wall_skip || sat_sw_up)   /* VDP1 owns it (unless close/transition) */
+		    if (!sat_wall_skip || sat_sw_up || is_edge)   /* VDP1 owns it (unless close/transition); is_edge = edge-fill */
 		    {
 			dc_yl = yl;
 			dc_yh = mid;
@@ -698,7 +836,7 @@ void R_RenderSegLoop (void)
 		
 		if (mid <= yh)
 		{
-		    if (!sat_wall_skip || sat_sw_lo)   /* VDP1 owns it (unless close/transition) */
+		    if (!sat_wall_skip || sat_sw_lo || is_edge)   /* VDP1 owns it (unless close/transition); is_edge = edge-fill */
 		    {
 			dc_yl = mid;
 			dc_yh = yh;

@@ -933,6 +933,11 @@ int sat_vdp1_floor = 0;
 int (*sat_floor_vdp1_hook)(int picnum, int height, int minx, int maxx,
                            const unsigned char *top, const unsigned char *bottom,
                            int lightlevel) = NULL;
+/* SATURN (owner 2026-07-02): px widths of the plane-colour fill border painted at the deported plane's
+   silhouette edge to hide the VDP1-lag gap (see r_main.c).  _border = horizontal (yaw) on the L/R edge,
+   _border_v = vertical (forward-motion + viewz) on the top/bottom edge.  Both 0 = pure punch (rest / DoomJo). */
+extern int sat_plane_border;
+extern int sat_plane_border_v;
 
 /* SATURN: the player's CURRENT floor (height + flat) -- the single floor RBG0 renders.
    Set each frame in R_DrawPlanes from the view sector.  The floor-skip leaves ONLY the
@@ -1310,6 +1315,21 @@ void R_DrawPlanes (void)
 	    && sat_floor_vdp1_hook(pl->picnum, (int)pl->height, pl->minx, pl->maxx,
 				   pl->top, pl->bottom, pl->lightlevel))
 	{
+	    /* SATURN rotation-decrochage fill (owner's spec): the CPU draws the plane's OWN colour, in
+	       software (NBG1 latency = aligned with THIS frame's mask), in a border sat_plane_border px
+	       wide at the silhouette edge -- exactly the strip between the wall's lagged VDP1 position and
+	       its current one.  The interior stays index 0 (the VDP1 quad still fills the bulk, fast).  At
+	       rest sat_plane_border==0 -> the original pure-punch fast path, byte-identical (and DoomJo). */
+	    /* One UNIFORM perimeter border = max(horizontal yaw shift, vertical viewz shift).  NOT split per
+	       axis: the silhouette edges are SLOPED, so a HORIZONTAL view shift moves a near-horizontal edge
+	       (the wall/ceiling junction) and opens a VERTICAL gap there -- the axes are coupled.  The border
+	       must therefore wrap the whole silhouette by the larger shift component (this is what the working
+	       horizontal-only build did, applying its single B to top/bottom too). */
+	    int Bh = sat_plane_border;      /* horizontal shift (yaw)         */
+	    int Bv = sat_plane_border_v;    /* vertical   shift (fwd + viewz) */
+	    int B  = Bh > Bv ? Bh : Bv;     /* uniform border (sloped edges couple axes); 0 -> fast path */
+	    byte bc = B > 0 ? (byte)R_FlatPotatoColor(lumpnum) : 0;   /* plane colour ~ the VDP1 quad's */
+	    int lb = pl->minx + B, rb = pl->maxx - B;                 /* L/R margin columns -> whole span */
 	    for (x = pl->minx ; x <= pl->maxx ; x++)
 	    {
 		int yl = pl->top[x];
@@ -1317,17 +1337,45 @@ void R_DrawPlanes (void)
 		int n;
 		if (yl > yh) continue;
 		n = yh - yl + 1;
-		if (detailshift)
+		if (B <= 0)
 		{
-		    int sx = x << 1;
-		    byte *d0 = ylookup[yl] + columnofs[sx];
-		    byte *d1 = ylookup[yl] + columnofs[sx + 1];
-		    do { *d0 = 0; *d1 = 0; d0 += SCREENWIDTH; d1 += SCREENWIDTH; } while (--n);
+		    if (detailshift)
+		    {
+			int sx = x << 1;
+			byte *d0 = ylookup[yl] + columnofs[sx];
+			byte *d1 = ylookup[yl] + columnofs[sx + 1];
+			do { *d0 = 0; *d1 = 0; d0 += SCREENWIDTH; d1 += SCREENWIDTH; } while (--n);
+		    }
+		    else
+		    {
+			byte *d = ylookup[yl] + columnofs[x];
+			do { *d = 0; d += SCREENWIDTH; } while (--n);
+		    }
 		}
 		else
 		{
-		    byte *d = ylookup[yl] + columnofs[x];
-		    do { *d = 0; d += SCREENWIDTH; } while (--n);
+		    int col_edge = (x < lb || x > rb);   /* left/right margin -> entire column is border */
+		    int tb = yl + B;                      /* rows above this = top border    */
+		    int bb = yh - B;                      /* rows below this = bottom border  */
+		    int y  = yl;
+		    if (detailshift)
+		    {
+			int sx = x << 1;
+			byte *d0 = ylookup[yl] + columnofs[sx];
+			byte *d1 = ylookup[yl] + columnofs[sx + 1];
+			do {
+			    byte v = (col_edge || y < tb || y > bb) ? bc : 0;
+			    *d0 = v; *d1 = v; d0 += SCREENWIDTH; d1 += SCREENWIDTH; y++;
+			} while (--n);
+		    }
+		    else
+		    {
+			byte *d = ylookup[yl] + columnofs[x];
+			do {
+			    *d = (col_edge || y < tb || y > bb) ? bc : 0;
+			    d += SCREENWIDTH; y++;
+			} while (--n);
+		    }
 		}
 	    }
 	    W_ReleaseLumpNum(lumpnum);   /* we cached it above but skip the draw -> release the lock */

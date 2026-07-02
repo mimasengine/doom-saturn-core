@@ -767,6 +767,110 @@ static void P_LoadReject(int lumpnum)
 // link (DoomJo leaves it 0 -> precache stays on, unchanged behaviour).
 int sat_streaming_mode = 0;
 
+// SATURN M5 (CRITICAL_PATH.md §4): BSP-geometry staging.  The runtime BSP arrays
+// (nodes/subsectors/vertexes/segs) are Z_Malloc'd into the LWRAM zone, which the
+// SH-2 reads ~2.1x slower than high work RAM (rL, REC_BENCHMARKS.md §C.2).  The
+// BSP walk (Bw), wall-prep (Bp) and P_PointInSubsector (every game tic) chase
+// these arrays all frame long, so after level load we COPY as many of them as
+// fit into a small high-RAM arena the platform donates (sat_bsp_stage_buf;
+// NULL = feature off, so DoomJo links and behaves unchanged) and repoint the
+// globals.  The arrays are immutable once P_GroupLines has run, so the LWRAM
+// originals stay valid and P_BspStageApply can swap either set live for an A/B.
+// Priority when the arena is too small for everything: nodes (hottest per byte)
+// -> subsectors -> vertexes -> segs (largest; wall-prep + R_AddLine).
+unsigned char *sat_bsp_stage_buf = 0;   /* platform-donated high-RAM arena (main.cxx) */
+int sat_bsp_stage_size = 0;             /* arena bytes (0 = off) */
+int sat_bsp_stage_on   = 1;             /* runtime A/B: 1 = staged copies live */
+int sat_bsp_stage_used = 0;             /* bytes staged this level (overlay row 1) */
+int sat_bsp_stage_want = 0;             /* bytes a full stage would have needed */
+
+static node_t      *nodes_lw,      *nodes_hw;
+static subsector_t *subsectors_lw, *subsectors_hw;
+static vertex_t    *vertexes_lw,   *vertexes_hw;
+static seg_t       *segs_lw,       *segs_hw;
+
+// Swap the renderer/game globals between the LWRAM originals (on=0) and the
+// staged high-RAM copies (on=1; arrays that did not fit stay on LWRAM).  Both
+// copies are identical and read-only, so swapping between frames is safe.
+void P_BspStageApply (int on)
+{
+    if (!nodes_lw)                      /* no level loaded/staged yet */
+        return;
+    nodes      = (on && nodes_hw)      ? nodes_hw      : nodes_lw;
+    subsectors = (on && subsectors_hw) ? subsectors_hw : subsectors_lw;
+    vertexes   = (on && vertexes_hw)   ? vertexes_hw   : vertexes_lw;
+    segs       = (on && segs_hw)       ? segs_hw       : segs_lw;
+    sat_bsp_stage_on = on;
+}
+
+/* Claim `bytes` from the arena and copy `src` there; NULL when it no longer fits
+   (the array then simply stays on LWRAM). */
+static void *P_StageTake (unsigned char **p, int *left, const void *src, int bytes)
+{
+    void *dst;
+    if (*left < bytes)
+        return 0;
+    dst = *p;
+    memcpy (dst, src, bytes);
+    *p    += bytes;
+    *left -= bytes;
+    return dst;
+}
+
+// Staging order A/B (HW 2026-07-02: vertex staging alone moved Bp -4.5/-9.2 ms
+// while Bw barely moved -> the seg/vertex reads dominate).  0 (default) = nodes
+// -> subsectors -> vertexes -> segs.  1 = vertexes (the seg fixup needs them
+// first) -> segs -> subsectors -> nodes: with a 32 KB arena this stages
+// everything Bp + R_AddLine read (~29 KB on E1M1) at the price of the nodes
+// (Bw + P_PointInSubsector) going back to LWRAM.
+#ifndef SAT_BSP_STAGE_SEGS_FIRST
+#define SAT_BSP_STAGE_SEGS_FIRST 0
+#endif
+
+static void P_StageBSP (void)
+{
+    unsigned char *p    = sat_bsp_stage_buf;
+    int            left = sat_bsp_stage_size;
+    int nb = numnodes      * (int)sizeof(node_t);
+    int sb = numsubsectors * (int)sizeof(subsector_t);
+    int vb = numvertexes   * (int)sizeof(vertex_t);
+    int gb = numsegs       * (int)sizeof(seg_t);
+
+    nodes_lw    = nodes;      subsectors_lw = subsectors;
+    vertexes_lw = vertexes;   segs_lw       = segs;
+    nodes_hw = 0;  subsectors_hw = 0;  vertexes_hw = 0;  segs_hw = 0;
+    sat_bsp_stage_used = 0;
+    sat_bsp_stage_want = nb + sb + vb + gb;
+
+    if (!p || left <= 0)
+        return;
+
+#if SAT_BSP_STAGE_SEGS_FIRST
+    vertexes_hw   = P_StageTake (&p, &left, vertexes_lw,   vb);
+    segs_hw       = P_StageTake (&p, &left, segs_lw,       gb);
+    subsectors_hw = P_StageTake (&p, &left, subsectors_lw, sb);
+    nodes_hw      = P_StageTake (&p, &left, nodes_lw,      nb);
+#else
+    nodes_hw      = P_StageTake (&p, &left, nodes_lw,      nb);
+    subsectors_hw = P_StageTake (&p, &left, subsectors_lw, sb);
+    vertexes_hw   = P_StageTake (&p, &left, vertexes_lw,   vb);
+    segs_hw       = P_StageTake (&p, &left, segs_lw,       gb);
+#endif
+
+    if (segs_hw && vertexes_hw)         /* staged segs read staged vertexes */
+    {
+        int i;
+        for (i = 0; i < numsegs; i++)
+        {
+            segs_hw[i].v1 = vertexes_hw + (segs_lw[i].v1 - vertexes_lw);
+            segs_hw[i].v2 = vertexes_hw + (segs_lw[i].v2 - vertexes_lw);
+        }
+    }
+    sat_bsp_stage_used = (int)(p - sat_bsp_stage_buf);
+
+    P_BspStageApply (sat_bsp_stage_on);
+}
+
 //
 // P_SetupLevel
 //
@@ -849,6 +953,10 @@ P_SetupLevel
 
     P_GroupLines ();
     P_LoadReject (lumpnum+ML_REJECT);
+
+    // SATURN M5: geometry is final after P_GroupLines -- stage the hot BSP
+    // arrays into the platform's high-RAM arena (no-op when none is donated).
+    P_StageBSP ();
 
     bodyqueslot = 0;
     deathmatch_p = deathmatchstarts;

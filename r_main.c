@@ -939,10 +939,30 @@ void sat_setup_view_p1 (void)
     viewcos = finecosine[viewangle>>ANGLETOFINESHIFT];
 }
 
+/* SATURN (owner 2026-07-02): deported-plane ROTATION-DECROCHAGE fill.  A secondary floor/ceiling is
+   deported to a VDP1 flat quad + an NBG1 index-0 silhouette mask.  VDP1 presents ~sat_plane_lag frames
+   behind NBG1, so under yaw the quad sits a few px sideways of the (current) mask -> the leading mask
+   edge exposes a strip with no quad and the sky/RBG0 shows through ("le ciel entre mur et plafond").
+   Owner's fix: have the CPU draw the plane's OWN colour, in SOFTWARE (NBG1 = the mask's own latency =
+   aligned by construction), in a border exactly as wide as that sideways offset -- i.e. the horizontal
+   screen shift over the last sat_plane_lag frames.  0 at rest (no yaw -> no offset -> no border -> no
+   cost); grows with turn speed.  sat_plane_lag is owner-tunable (the "nombre de frame de decalage").
+   DoomJo never sets sat_vdp1_floor, so R_DrawPlanes never reads sat_plane_border there. */
+int sat_plane_border   = 0;    /* HORIZONTAL fill border px (from yaw)  -> L/R silhouette edge   */
+int sat_plane_border_v = 0;    /* VERTICAL   fill border px (fwd+viewz) -> top/bottom edge       */
+int sat_plane_lag      = 2;    /* N = frames VDP1 trails NBG1 (owner-tunable)                    */
+int sat_plane_vscale   = 4;    /* vertical fill gain (owner-tuned to 4; pad R+Up/Down to adjust) */
+#define SAT_PLANE_LAG_MAX 8
+static angle_t sat_va_hist[SAT_PLANE_LAG_MAX];   /* yaw   history -> horizontal shift            */
+static fixed_t sat_vz_hist[SAT_PLANE_LAG_MAX];   /* viewz history -> vertical shift (stairs/bob) */
+static fixed_t sat_vx_hist[SAT_PLANE_LAG_MAX];   /* viewx history -> forward-motion drift        */
+static fixed_t sat_vy_hist[SAT_PLANE_LAG_MAX];   /* viewy history -> forward-motion drift        */
+static int     sat_va_head = 0;
+
 void R_SetupFrame (player_t* player)
 {
     int		i;
-    
+
     viewplayer = player;
     viewx = player->mo->x;
     viewy = player->mo->y;
@@ -970,6 +990,45 @@ void R_SetupFrame (player_t* player)
     else
 	fixedcolormap = 0;
 		
+    /* SATURN plane-decrochage: this frame's fill-border widths, each = the plane's screen shift over the
+       last sat_plane_lag frames (= the VDP1-vs-mask offset to hide).  HORIZONTAL from yaw (linear-at-centre
+       projection); VERTICAL from viewz (bob / stairs / lifts), px per world-unit tunable via sat_plane_vscale.
+       1p only -- split shares one framebuffer and the per-view history would be mixed. */
+    {
+	extern int sat_split_active, viewwidth;
+	int N = sat_plane_lag; if (N < 1) N = 1; else if (N > SAT_PLANE_LAG_MAX) N = SAT_PLANE_LAG_MAX;
+	int slot = sat_va_head % SAT_PLANE_LAG_MAX;
+	sat_va_hist[slot] = viewangle;
+	sat_vz_hist[slot] = viewz;
+	sat_vx_hist[slot] = viewx;
+	sat_vy_hist[slot] = viewy;
+	if (sat_split_active || sat_va_head < N)
+	{
+	    sat_plane_border = 0; sat_plane_border_v = 0;
+	}
+	else
+	{
+	    int old = (sat_va_head - N) % SAT_PLANE_LAG_MAX;
+	    int d = (int)(viewangle - sat_va_hist[old]); if (d < 0) d = -d;      /* signed wrap -> |dtheta| */
+	    long long px = ((long long)d * (long long)viewwidth) / (long long)ANG90;
+	    if (px > 40) px = 40;                                                /* guard a fast spin */
+	    sat_plane_border = (int)px;
+	    /* VERTICAL: the gap while WALKING comes from forward-motion perspective drift (walls grow as you
+	       approach -> the wall/ceiling & wall/floor junctions slide vertically), plus viewz for stairs/lifts/
+	       bob.  fwd = forward component of the translation; viewz shifts the screen far more per world-unit
+	       (it sits at the eye) -> weight it up (<<4).  One shared gain (sat_plane_vscale, owner-tuned to 4). */
+	    fixed_t dz = viewz - sat_vz_hist[old]; if (dz < 0) dz = -dz;
+	    fixed_t dvx = viewx - sat_vx_hist[old];
+	    fixed_t dvy = viewy - sat_vy_hist[old];
+	    fixed_t fwd = FixedMul(dvx, viewcos) + FixedMul(dvy, viewsin); if (fwd < 0) fwd = -fwd;
+	    long long mv = (long long)fwd + ((long long)dz << 4);
+	    int pv = (int)((mv * (long long)sat_plane_vscale) >> 20);
+	    if (pv > 40) pv = 40;
+	    sat_plane_border_v = pv;
+	}
+	sat_va_head++;
+    }
+
     framecount++;
     validcount++;
 }
