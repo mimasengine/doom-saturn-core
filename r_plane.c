@@ -1260,29 +1260,17 @@ void R_DrawPlanes (void)
 	    // count.  sat_vdp2_sky is 0 by default so DoomJo keeps its software sky.
 	    if (sat_vdp2_sky)
 	    {
+		/* SATURN CONTRACT (Mimas): the platform memsets the view rows to index 0 after
+		   EVERY blit (DG_DrawFrame layer-inversion clear), and visplane regions exclude
+		   wall columns -- so the sky region is ALREADY 0 here.  The old per-pixel zero
+		   loops were pure redundant bandwidth (up to ~26K px/frame outdoors, row-13 CLS)
+		   burning master P.  Only the classifier survives.  DoomJo: sat_vdp2_sky==0. */
 		for (x=pl->minx ; x <= pl->maxx ; x++)
 		{
 		    int yl = pl->top[x];
 		    int yh = pl->bottom[x];
-		    int n;
 		    if (yl > yh) continue;
-		    n = yh - yl + 1;
-		    sat_sky_px += (unsigned)n;   /* SATURN classifier: sky coverage (VDP2-sky path) */
-		    if (detailshift)
-		    {
-			/* low-detail: the visplane x is the halved column; each one
-			   covers two real screen pixels (x<<1, x<<1+1). */
-			int sx = x << 1;
-			byte *d0 = ylookup[yl] + columnofs[sx];
-			byte *d1 = ylookup[yl] + columnofs[sx + 1];
-			do { *d0 = 0; *d1 = 0; d0 += SCREENWIDTH; d1 += SCREENWIDTH; }
-			while (--n);
-		    }
-		    else
-		    {
-			byte *d = ylookup[yl] + columnofs[x];
-			do { *d = 0; d += SCREENWIDTH; } while (--n);
-		    }
+		    sat_sky_px += (unsigned)(yh - yl + 1);   /* classifier: sky coverage (VDP2-sky path) */
 		}
 		continue;
 	    }
@@ -1336,27 +1324,16 @@ void R_DrawPlanes (void)
 	    && pl->picnum == sat_vdp2_floor_pic
 	    && (pl->lightlevel >> LIGHTSEGSHIFT) == sat_vdp2_floor_band)
 	{
+	    /* SATURN CONTRACT (Mimas): same as the sky punch above -- the platform's per-frame
+	       clear already left this region index 0, so the old zero loops (flr = 20K+ px/frame
+	       on the row-13 CLS classifier) were redundant master bandwidth.  Trackers survive. */
 	    for (x=pl->minx ; x <= pl->maxx ; x++)
 	    {
 		int yl = pl->top[x];
 		int yh = pl->bottom[x];
-		int n;
 		if (yl > yh) continue;
 		{ int sr = yl + viewwindowy; if (sr < sat_vdp2_floor_top_y) sat_vdp2_floor_top_y = sr; }  /* track the floor's TOP screen row (its real horizon) */
-		n = yh - yl + 1;
-		sat_floor_px += (unsigned)n;   /* SATURN classifier: dominant-floor coverage */
-		if (detailshift)
-		{
-		    int sx = x << 1;
-		    byte *d0 = ylookup[yl] + columnofs[sx];
-		    byte *d1 = ylookup[yl] + columnofs[sx + 1];
-		    do { *d0 = 0; *d1 = 0; d0 += SCREENWIDTH; d1 += SCREENWIDTH; } while (--n);
-		}
-		else
-		{
-		    byte *d = ylookup[yl] + columnofs[x];
-		    do { *d = 0; d += SCREENWIDTH; } while (--n);
-		}
+		sat_floor_px += (unsigned)(yh - yl + 1);   /* classifier: dominant-floor coverage */
 	    }
 	    continue;
 	}
@@ -1549,13 +1526,19 @@ void R_DrawPlanes (void)
 			fe  = k_old - 1; if (fe > pb1) fe = pb1;
 		    }
 		    {
-			int y = pb0;
+			int y;
 			/* fill_mode 2: the band gets the REAL flat texels (R_MapPlane's exact
 			   mapping + per-row zlight -- ds_source/planeheight/planezlight are
 			   already in scope, cached above the hook) instead of the potato
 			   colour: the decrochage cover becomes invisible texture.  Cost only
 			   on band rows, i.e. only during motion. */
-			int texband = (sat_plane_fill_mode >= 2 && fb2 <= fe);
+			int texband = (sat_plane_fill_mode >= 2);
+			/* SATURN CONTRACT (Mimas): the punched interior is ALREADY index 0 (the
+			   platform memsets the view rows after EVERY blit; visplane regions exclude
+			   wall columns) -- so write ONLY the band rows.  The old full-height loop
+			   re-zeroed the whole span for nothing (master P bandwidth). */
+			if (fb2 > fe) continue;              /* band empty (at rest): nothing to write */
+			y = fb2; n = fe - fb2 + 1;
 			unsigned tang = 0; fixed_t tcos = 0, tsin = 0, tdsc = 0;
 			if (texband)
 			{
@@ -1566,11 +1549,10 @@ void R_DrawPlanes (void)
 			if (detailshift)
 			{
 			    int sx = x << 1;
-			    byte *d0 = ylookup[pb0] + columnofs[sx];
-			    byte *d1 = ylookup[pb0] + columnofs[sx + 1];
+			    byte *d0 = ylookup[fb2] + columnofs[sx];
+			    byte *d1 = ylookup[fb2] + columnofs[sx + 1];
 			    do {
-				byte v = 0;
-				if (y >= fb2 && y <= fe)
+				byte v;
 				{
 				    if (texband)
 				    {
@@ -1589,10 +1571,9 @@ void R_DrawPlanes (void)
 			}
 			else
 			{
-			    byte *d = ylookup[pb0] + columnofs[x];
+			    byte *d = ylookup[fb2] + columnofs[x];
 			    do {
-				byte v = 0;
-				if (y >= fb2 && y <= fe)
+				byte v;
 				{
 				    if (texband)
 				    {
@@ -1613,42 +1594,48 @@ void R_DrawPlanes (void)
 		}
 		else if (B <= 0)
 		{
-		    if (detailshift)
-		    {
-			int sx = x << 1;
-			byte *d0 = ylookup[pb0] + columnofs[sx];
-			byte *d1 = ylookup[pb0] + columnofs[sx + 1];
-			do { *d0 = 0; *d1 = 0; d0 += SCREENWIDTH; d1 += SCREENWIDTH; } while (--n);
-		    }
-		    else
-		    {
-			byte *d = ylookup[pb0] + columnofs[x];
-			do { *d = 0; d += SCREENWIDTH; } while (--n);
-		    }
+		    /* SATURN CONTRACT (Mimas): pure punch at rest -- the platform memsets the
+		       view rows to 0 after EVERY blit and visplane regions exclude wall columns,
+		       so the punched interior is ALREADY index 0.  The old zero loops re-wrote
+		       10-30K px/frame for nothing (the biggest single master-P bite after the
+		       slave F-build offload).  DoomJo never claims (hook NULL) -> never here. */
 		}
 		else
 		{
-		    int col_edge = (x < lb || x > rb);   /* left/right margin -> entire column is border */
-		    int tb = pb0 + B;                     /* rows above this = top border    */
-		    int bb = pb1 - B;                     /* rows below this = bottom border  */
-		    int y  = pb0;
+		    /* motion border: write ONLY the bc border cells -- the interior is already
+		       cleared-0 (platform per-frame clear).  Top band [pb0..t1], bottom band
+		       [b0..pb1]; L/R margin or band overlap = the whole column. */
+		    int col_edge = (x < lb || x > rb);
+		    int t1 = pb0 + B - 1;                 /* last row of the top border band     */
+		    int b0 = pb1 - B + 1;                 /* first row of the bottom border band */
+		    int m;
+		    if (col_edge || t1 >= b0 - 1) { t1 = pb1; b0 = pb1 + 1; }   /* whole column */
 		    if (detailshift)
 		    {
 			int sx = x << 1;
 			byte *d0 = ylookup[pb0] + columnofs[sx];
 			byte *d1 = ylookup[pb0] + columnofs[sx + 1];
-			do {
-			    byte v = (col_edge || y < tb || y > bb) ? bc : 0;
-			    *d0 = v; *d1 = v; d0 += SCREENWIDTH; d1 += SCREENWIDTH; y++;
-			} while (--n);
+			for (m = t1 - pb0 + 1; m > 0; --m)
+			{ *d0 = bc; *d1 = bc; d0 += SCREENWIDTH; d1 += SCREENWIDTH; }
+			if (b0 <= pb1)
+			{
+			    d0 = ylookup[b0] + columnofs[sx];
+			    d1 = ylookup[b0] + columnofs[sx + 1];
+			    for (m = pb1 - b0 + 1; m > 0; --m)
+			    { *d0 = bc; *d1 = bc; d0 += SCREENWIDTH; d1 += SCREENWIDTH; }
+			}
 		    }
 		    else
 		    {
 			byte *d = ylookup[pb0] + columnofs[x];
-			do {
-			    *d = (col_edge || y < tb || y > bb) ? bc : 0;
-			    d += SCREENWIDTH; y++;
-			} while (--n);
+			for (m = t1 - pb0 + 1; m > 0; --m)
+			{ *d = bc; d += SCREENWIDTH; }
+			if (b0 <= pb1)
+			{
+			    d = ylookup[b0] + columnofs[x];
+			    for (m = pb1 - b0 + 1; m > 0; --m)
+			    { *d = bc; d += SCREENWIDTH; }
+			}
 		    }
 		}
 	    }

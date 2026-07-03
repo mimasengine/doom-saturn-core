@@ -718,6 +718,8 @@ static int rp_wait(volatile int *flag)
    slave-resync (which our manual write-pointer-only reset omits). */
 #define RP_GBR_RESET 1
 
+void RP_AuxWait(void);   /* fwd: join the platform's aux slave job before any rewind */
+
 /* SATURN: THE ~1-2min freeze fix.  slSlaveFunc bump-allocates a 12-byte record
    {0x30, func, arg} from the SGL transient work buffer at GBR+72 and advances
    the pointer every call, but NEVER resets it -- SGL normally resets it once
@@ -730,6 +732,11 @@ static int rp_wait(volatile int *flag)
    slSynch would, so the single per-frame record always reuses the same slot. */
 void rp_sgl_workptr_reset(void)
 {
+    /* The rewind reuses SGL record slot 0, so it must never run while the slave still
+       owns a record: JOIN the platform's aux job first (RP_AuxDispatch).  Every dispatch
+       site funnels through this reset, so the slave job queue stays strictly sequential.
+       No aux job pending (DoomJo: always) => a single uncached read. */
+    RP_AuxWait();
     /* The SGL slave work area has TWO pointers that slSlaveFunc/the slave bump
        +12B per frame and that slSynch normally resets together: the WRITE pointer
        at GBR+72 and the slave's READ pointer at GBR+68 (confirmed on hardware via
@@ -865,6 +872,72 @@ static void rp_run_on_stack(void (*fn)(void))
         :
         : [ns]"r"(newsp), [fn]"r"(fn)
         : "r0","r1","r2","r3","r4","r5","r6","r7","pr","t","mach","macl","memory");
+}
+
+/* ------------------------------------------------------------------------------------------ *
+ * SATURN generic AUX slave job (platform end-of-frame work; Mimas: the VDP1 F-bank tile      *
+ * build, dg_saturn vdp1_ftex_flush -> ftex_slave_build).  ONE job at a time, dispatched by   *
+ * the platform AFTER its render-phase master work; every dispatcher funnels through           *
+ * rp_sgl_workptr_reset(), which now JOINS a pending aux job first, so the SGL slave record    *
+ * queue stays strictly sequential (the rewind reuses slot 0).  The job runs on the dedicated  *
+ * 4KB stack (the plane/masked jobs it shares it with are joined before any new dispatch).     *
+ * DoomJo: never dispatched -> the done flag stays 1 and every join is a single uncached read. */
+static volatile int rp_aux_done_v = 1;
+#define RP_AUX_DONE (*(volatile int *)((unsigned int)&rp_aux_done_v | 0x20000000u))
+static void (*rp_aux_fn)(void);
+
+void RP_AuxWait(void)
+{
+    int guard = 30000000;                     /* bounded: a dead slave costs a slow frame, not a hang */
+    while (!RP_AUX_DONE && --guard) ;
+    if (!guard) rp_timeout_count++;
+}
+
+static void rp_aux_body(void *param)
+{
+    (void)param;
+    master_cache_purge();                     /* slave: read the master's fresh accumulators/tables */
+    rp_run_on_stack(rp_aux_fn);
+    RP_AUX_DONE = 1;
+}
+
+void RP_AuxDispatch(void (*fn)(void))
+{
+    rp_sgl_workptr_reset();                   /* joins any pending aux + rewinds the SGL work slot */
+    rp_aux_fn = fn;                           /* write-through -> in RAM before the slave's purge+read */
+    RP_AUX_DONE = 0;
+    slSlaveFunc(rp_aux_body, 0);
+}
+
+/* ---- aux PIGGYBACK (Mimas, owner GO 2026-07-03): the platform ARMS the job at the end of
+   R_DrawPlanes; the masked slave body CLAIMS it after its sprite half and runs it right
+   after publishing MASK_DONE -- the build then overlaps the master's masked tail + the DG
+   pre-work instead of stalling in the pre-blit join.  No TAS needed: the arm (master, end
+   of P) strictly precedes the masked dispatch, and the DG fallback only runs after
+   RP_WaitMasked, by which time TAKEN (written BEFORE MASK_DONE; SH-2 write-through buffer
+   drains in order) is visible.  Masked not dispatched this frame (no sprites / toggle off /
+   menu) -> RP_AuxKick falls back to a plain aux dispatch.  ARMED never leaks a frame: the
+   platform always calls RP_AuxKick from DG.  DoomJo: never armed -> two one-read checks. */
+static volatile int rp_aux_armed_v = 0, rp_aux_taken_v = 0;
+#define RP_AUX_ARMED (*(volatile int *)((unsigned int)&rp_aux_armed_v | 0x20000000u))
+#define RP_AUX_TAKEN (*(volatile int *)((unsigned int)&rp_aux_taken_v | 0x20000000u))
+
+void RP_AuxArm(void (*fn)(void))
+{
+    RP_AuxWait();                  /* the previous job must be fully retired */
+    rp_aux_fn = fn;                /* DONE stays 1 (nothing runs yet) so the masked
+                                      dispatch's rewind-join cannot deadlock on the arm */
+    RP_AUX_TAKEN = 0;
+    RP_AUX_ARMED = 1;
+}
+
+int RP_AuxKick(void)               /* platform DG-entry consumer; 1 = a job was armed */
+{
+    if (!RP_AUX_ARMED) return 0;
+    RP_AUX_ARMED = 0;
+    if (!RP_AUX_TAKEN)
+        RP_AuxDispatch(rp_aux_fn); /* the masked body never took it -> plain aux job */
+    return 1;
 }
 
 static void rp_plane_steal_body(void *param)
@@ -1033,11 +1106,18 @@ static void rp_masked_noarg(void) { R_SlaveDrawMasked(rp_mask_x0, rp_mask_x1); }
 static void rp_masked_slave_body(void *param)
 {
     int packed = (int)(unsigned int)param;
+    int take;
     master_cache_purge();                    /* slave: read the master's fresh vissprites + drawsegs */
     rp_mask_x0 = (packed >> 16) & 0xffff;
     rp_mask_x1 = packed & 0xffff;
     rp_run_on_stack(rp_masked_noarg);
+    /* aux PIGGYBACK: claim the armed job BEFORE publishing MASK_DONE (in-order write-through
+       -> the master's DG fallback can never see MASK_DONE with an unclaimed job), run it
+       AFTER -- the master resumes its masked tail + DG pre while the build runs here. */
+    take = RP_AUX_ARMED;
+    if (take) { RP_AUX_TAKEN = 1; RP_AUX_DONE = 0; }
     MASK_DONE = 1;
+    if (take) { rp_run_on_stack(rp_aux_fn); RP_AUX_DONE = 1; }
 }
 
 void RP_DispatchMasked(int x0, int x1)
