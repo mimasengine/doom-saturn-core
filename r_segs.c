@@ -294,6 +294,7 @@ extern int sat_vdp1_floor;               /* SATURN: secondary floors/ceilings de
    AND renders unchanged: it never reads them, and every increment lives inside the sat_wall_skip
    hybrid routing, which is inert on DoomJo (sat_wall_skip == 0). */
 int sat_fb_clamp_t = 0, sat_fb_mag_t = 0, sat_fb_starve_t = 0, sat_fb_px = 0;
+int sat_fb_wclamp_t = 0;   /* Phase-1: tiers KEPT on VDP1 by the cut+wedge clamp this frame */
 
 /* SATURN Phase-1 wall clamp ([[wall-clamp-world-anchored]]): when set, a SPAN-close one-sided
    wall STAYS on VDP1 (clamped swim-free in wall_emit_band via the constant-z linear v->y map)
@@ -310,6 +311,199 @@ int sat_wall_clamp = 0;
    static level data -> stable pointer); 1 byte = CPU-exit-frame countdown. */
 #define SAT_SEG_MAX 4096
 static unsigned char sat_seg_cpu[SAT_SEG_MAX];
+
+/* SATURN Phase-1 wall clamp ([[wall-clamp-world-anchored]]), below-floor side.  The failed 1b
+   (owner's red/purple 2026-07-02) attached the quad bottom to floorclip = a SCREEN-anchored
+   sloped edge -> squish + holes.  This is the WORLD-anchored version: cut the tier at a WHOLE
+   texel row vcut -- its projection is a straight screen line (constant world height, linear in
+   x, EXACT at both ends because scale steps linearly) -- chosen so the line stays above
+   min(floorclip) over the whole span.  The VDP1 quad keeps its top corners and takes
+   (e-1, vcut) as bottom (the -1 absorbs the platform's 1px generous pad -> the painted edge
+   lands ON the line, never past floorclip).  The residual WEDGE between the line and the true
+   per-column floorclip stays SOFTWARE (the column loop below, its top raised to the line):
+   no hole, no bleed, a few rows of fill instead of the whole tier.
+   Returns 1 = VDP1 emitted (wedge armed unless the tier was already full-software, e.g. the
+   2-frame CPU-exit overlap, which must keep covering the WHOLE tier); 0 = no useful cut or
+   bank full -> caller keeps the status-quo CPU fallback. */
+static int sat_wall_cut_floor(fixed_t texmid, int v0, int yl1, int yl2,
+                              int texture, int u1, int u2, const lighttable_t *cm,
+                              int sw_already, fixed_t *w_ef, fixed_t *w_es, int *w_flag)
+{
+    int x, fcm = viewheight, ccm = -1;
+    int n = rw_stopx - 1 - rw_x;
+    fixed_t sc2 = rw_scale + rw_scalestep * n;
+    unsigned int is1, is2;
+    int ylim, vc1, vc2, vcut, e1, e2, tries;
+    fixed_t dv = 0;
+    for (x = rw_x; x < rw_stopx; x++)
+    {
+	if (floorclip[x]   < fcm) fcm = floorclip[x];
+	if (ceilingclip[x] > ccm) ccm = ceilingclip[x];
+    }
+    if (fcm <= 1) return 0;                        /* some column fully occluded -> not worth it */
+    /* SUBSET invariant (owner's Ymir z-order report 2026-07-03): the software tier painted on
+       NBG1 (above ALL VDP1) and per-column clipped, so it could never lose to a farther wall.
+       The VDP1 piece lives in painter order, and its UNCUT side keeps the RAW edge -- checked
+       against the clip at the END columns only by the claim chain.  An INTERIOR column with a
+       tighter ceilingclip (arch lintel, stair profile of a closer seg) would let a later
+       (farther) quad overpaint us -- "les murs de derriere devant".  Bound BOTH sides over the
+       WHOLE span (+1 row of margin for the platform's 1px pad): the piece is then a strict
+       SUBSET of the pixels the software fallback used to paint -> z-safe by construction. */
+    if (yl1 <= ccm + 1 || yl2 <= ccm + 1) return 0;
+    ylim = fcm - 1;                                /* deepest row the VDP1 piece may touch */
+    if (sc2 <= 0) return 0;
+    is1 = 0xffffffffu / (unsigned)rw_scale;        /* same reciprocal form as SAT_VROWS */
+    is2 = 0xffffffffu / (unsigned)sc2;
+    vc1 = (int)((texmid + (fixed_t)((ylim - centery) * (int)is1)) >> FRACBITS);
+    vc2 = (int)((texmid + (fixed_t)((ylim - centery) * (int)is2)) >> FRACBITS);
+    vcut = vc1 < vc2 ? vc1 : vc2;                  /* floor-round + min: line above ylim at BOTH ends */
+    e1 = e2 = 0;
+    for (tries = 0; tries < 3; tries++)            /* whole-texel granularity: back off if rounding overshoots */
+    {
+	if (vcut <= v0) return 0;                  /* cut at/above the tier top -> nothing useful on VDP1 */
+	dv = ((fixed_t)vcut << FRACBITS) - texmid;
+	e1 = centery + (int)(FixedMul(dv, rw_scale) >> FRACBITS);
+	e2 = centery + (int)(FixedMul(dv, sc2)      >> FRACBITS);
+	if (e1 <= ylim && e2 <= ylim) break;
+	vcut--;
+    }
+    if (tries == 3) return 0;
+    if (e1 - 1 < yl1 || e2 - 1 < yl2) return 0;    /* degenerate: the cut crosses the tier top */
+    if (sat_wall_hook (rw_x, yl1, e1 - 1, rw_stopx - 1, yl2, e2 - 1,
+                       texture, u1, u2, v0, vcut, cm))
+	return 0;                                  /* bank full -> caller falls back to full CPU */
+    if (!sw_already)
+    {
+	/* wedge edge(x) in the loop's HEIGHTBITS domain, 1 row above the line for a guaranteed
+	   overlap with the VDP1 piece's padded/interpolated bottom (gap impossible, overlap
+	   harmless: same texture, and VDP1 wins the composite over NBG1 anyway). */
+	*w_ef = (centeryfrac >> 4) + (FixedMul(dv, rw_scale) >> 4) - (1 << HEIGHTBITS);
+	*w_es = FixedMul(dv, rw_scalestep) >> 4;
+	*w_flag = 1;
+    }
+    sat_fb_wclamp_t++;
+    return 1;
+}
+
+/* Above-ceiling mirror (deported VDP1 ceilings, sat_vdp1_floor): cut the tier TOP at the
+   whole-texel line kept below max(ceilingclip); the wedge (rows above the line down from
+   ceilingclip+1) stays software.  Same guarantees as the floor side, all roundings mirrored
+   (ceil-round vcut up, verify the line sits at/below ylim, +1 pad absorption). */
+static int sat_wall_cut_ceil(fixed_t texmid, int v1, int yh1, int yh2,
+                             int texture, int u1, int u2, const lighttable_t *cm,
+                             int sw_already, fixed_t *w_ef, fixed_t *w_es, int *w_flag)
+{
+    int x, ccm = -1, fcm = viewheight;
+    int n = rw_stopx - 1 - rw_x;
+    fixed_t sc2 = rw_scale + rw_scalestep * n;
+    unsigned int is1, is2;
+    int ylim, vc1, vc2, vcut, e1, e2, tries;
+    fixed_t dv = 0;
+    for (x = rw_x; x < rw_stopx; x++)
+    {
+	if (ceilingclip[x] > ccm) ccm = ceilingclip[x];
+	if (floorclip[x]   < fcm) fcm = floorclip[x];
+    }
+    if (ccm >= viewheight - 2) return 0;           /* some column fully occluded -> not worth it */
+    /* SUBSET invariant, mirrored (see sat_wall_cut_floor): bound the UNCUT bottom against the
+       tightest interior floorclip too, so the piece never paints pixels the software tier
+       would not have -- a later quad can then never (newly) overpaint a nearer wall. */
+    if (yh1 >= fcm - 1 || yh2 >= fcm - 1) return 0;
+    ylim = ccm + 1;                                /* highest row the VDP1 piece may touch */
+    if (sc2 <= 0) return 0;
+    is1 = 0xffffffffu / (unsigned)rw_scale;
+    is2 = 0xffffffffu / (unsigned)sc2;
+    vc1 = (int)((texmid + (fixed_t)((ylim - centery) * (int)is1) + 0xFFFF) >> FRACBITS);
+    vc2 = (int)((texmid + (fixed_t)((ylim - centery) * (int)is2) + 0xFFFF) >> FRACBITS);
+    vcut = vc1 > vc2 ? vc1 : vc2;                  /* ceil-round + max: line below ylim at BOTH ends */
+    e1 = e2 = 0;
+    for (tries = 0; tries < 3; tries++)
+    {
+	if (vcut >= v1) return 0;                  /* cut at/below the tier bottom -> nothing useful */
+	dv = ((fixed_t)vcut << FRACBITS) - texmid;
+	e1 = centery + (int)(FixedMul(dv, rw_scale) >> FRACBITS);
+	e2 = centery + (int)(FixedMul(dv, sc2)      >> FRACBITS);
+	if (e1 >= ylim && e2 >= ylim) break;
+	vcut++;
+    }
+    if (tries == 3) return 0;
+    if (e1 + 1 > yh1 || e2 + 1 > yh2) return 0;    /* degenerate: the cut crosses the tier bottom */
+    if (sat_wall_hook (rw_x, e1 + 1, yh1, rw_stopx - 1, e2 + 1, yh2,
+                       texture, u1, u2, vcut, v1, cm))
+	return 0;
+    if (!sw_already)
+    {
+	*w_ef = (centeryfrac >> 4) + (FixedMul(dv, rw_scale) >> 4) + (1 << HEIGHTBITS);
+	*w_es = FixedMul(dv, rw_scalestep) >> 4;
+	*w_flag = 2;
+    }
+    sat_fb_wclamp_t++;
+    return 1;
+}
+
+/* Does the tier's linear BOTTOM edge cross floorclip ANYWHERE in the span?  The END columns
+   catch the common case (and are the whole pre-clamp test); the INTERIOR scan -- active only
+   under sat_wall_clamp, so clamp-off stays byte-identical -- catches the pedestal/stair
+   profile: a wall whose bottom is visible at BOTH ends but occluded mid-span used to emit a
+   FULL quad painting below the interior floorclip.  Invisible while its victims were software
+   (NBG1 above all VDP1), it became "les murs de derriere devant" (owner Ymir 2026-07-03) once
+   the clamp made the victims VDP1: the W bank paints near->far, later = farther WINS every
+   overlap.  Near-first is a deliberate law (an overrunning plot must cut the FARTHEST walls,
+   dg_saturn flush comment) -- so fix the overlap at the source: route these walls through the
+   same cut+wedge.  The edge is linear -> incremental 12-bit frac, adds+compare per column. */
+static int sat_wall_cross_lo(int yh1, int yh2)
+{
+    int x, n = rw_stopx - 1 - rw_x;
+    fixed_t f, s;
+    if (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]) return 1;
+    if (!sat_wall_clamp || n <= 1) return 0;
+    f = yh1 << 12; s = ((yh2 - yh1) << 12) / n;
+    for (x = rw_x; x < rw_stopx; x++)
+    {
+	if ((int)(f >> 12) >= floorclip[x]) return 1;
+	f += s;
+    }
+    return 0;
+}
+/* Mirror: does the tier's linear TOP edge cross ceilingclip anywhere in the span? */
+static int sat_wall_cross_hi(int yl1, int yl2)
+{
+    int x, n = rw_stopx - 1 - rw_x;
+    fixed_t f, s;
+    if (yl1 <= ceilingclip[rw_x] || yl2 <= ceilingclip[rw_stopx - 1]) return 1;
+    if (!sat_wall_clamp || n <= 1) return 0;
+    f = yl1 << 12; s = ((yl2 - yl1) << 12) / n;
+    for (x = rw_x; x < rw_stopx; x++)
+    {
+	if ((int)(f >> 12) <= ceilingclip[x]) return 1;
+	f += s;
+    }
+    return 0;
+}
+/* VISIBILITY audit of a tier over its whole span, BOTH clip arrays combined per column
+   (owner Ymir 2026-07-03, the outer-border question): a tier whose visible band
+   [max(yl,cc+1) .. min(yh,fc-1)] is EMPTY at EVERY column -- the level border behind an
+   upstairs window: lintel+sill close the band, the software renderer draws 0 px of it --
+   still passed both END-column tests and emitted a FULL quad: wasted commands AND, in the
+   near-first painter, a far wall painted over everything.  Returns 1 = some pixel visible
+   somewhere (claim normally), 0 = invisible everywhere (claim NOTHING, exactly like the
+   software).  Linear edges -> one incremental scan. */
+static int sat_wall_span_visible(int yl1, int yl2, int yh1, int yh2)
+{
+    int x, n = rw_stopx - 1 - rw_x;
+    fixed_t fl, fh, sl, sh;
+    fl = yl1 << 12; sl = n > 0 ? (fixed_t)((yl2 - yl1) << 12) / n : 0;
+    fh = yh1 << 12; sh = n > 0 ? (fixed_t)((yh2 - yh1) << 12) / n : 0;
+    for (x = rw_x; x < rw_stopx; x++)
+    {
+	int a = (int)(fl >> 12), b = (int)(fh >> 12);
+	if (b > floorclip[x] - 1)   b = floorclip[x] - 1;
+	if (a < ceilingclip[x] + 1) a = ceilingclip[x] + 1;
+	if (a <= b) return 1;
+	fl += sl; fh += sh;
+    }
+    return 0;
+}
 
 void R_RenderSegLoop (void)
 {
@@ -328,6 +522,14 @@ void R_RenderSegLoop (void)
     int			sat_sw_mid = 0, sat_sw_up = 0, sat_sw_lo = 0;
     int			sat_v1_mid = 0, sat_v1_up = 0, sat_v1_lo = 0;
     int			sat_v1_mid_sub = 0, sat_v1_up_sub = 0, sat_v1_lo_sub = 0;   /* magnified tier -> perspective-subdivide on VDP1 (not CPU) */
+    /* SATURN Phase-1 wall clamp: per-tier residual-WEDGE state.  0 = off (software draws the
+       full tier when sat_sw_* is set); 1 = below-floor cut, software draws only rows >= edge(x);
+       2 = above-ceiling cut, software draws only rows <= edge(x).  edge(x) steps linearly per
+       column exactly like bottomfrac (HEIGHTBITS domain), armed by sat_wall_cut_floor/_ceil. */
+    int			sat_wcl_mid = 0, sat_wcl_up = 0, sat_wcl_lo = 0;
+    fixed_t		sat_wcl_mid_ef = 0, sat_wcl_mid_es = 0;
+    fixed_t		sat_wcl_up_ef = 0,  sat_wcl_up_es = 0;
+    fixed_t		sat_wcl_lo_ef = 0,  sat_wcl_lo_es = 0;
 
     /* Keep doors/switches (special lines) textured even in Potato walls, so they
        stay readable against the flat-shaded plain walls. */
@@ -496,23 +698,41 @@ void R_RenderSegLoop (void)
 	     -> hand the tier to the SOFTWARE renderer, which clips each column to floorclip (no
 	     texture squish).  sat_sw_mid forces the column loop + sw_draws below.
 	   - fully above: VDP1 as usual. */
-	if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
+	if (sat_wall_clamp && !sat_wall_span_visible(yl1, yl2, yh1, yh2))
+	    { /* no visible pixel at ANY column (empty window band / full occlusion profile): the
+	         software draws 0 px of it -- claim NOTHING (the old full-quad claim painted it
+	         over nearer walls in the near-first painter; owner's outer-border capture). */ }
+	else if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
 	    { /* entirely below the floor -> cull (neither VDP1 nor CPU draws it) */ }
-	else if (sat_floor_punch_here() && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
-	    /* Occluded below a NEARER floor (yh > floorclip): the CPU draws it, clipping EACH COLUMN to
-	       floorclip with the correct per-column texel.  The Phase-1b VDP1 clamp (attach the hidden
-	       bottom to floorclip via a 2-point edge + a single texel) squished the texture and left holes
-	       where the 2-point edge missed the real per-column floorclip (owner's red/purple 2026-07-02);
-	       DISTORSP can't clip per-column nor trim u.  A proper VDP1 version = decompose the bottom along
-	       floorclip like the FLOOR corridor -- a future increment; CPU is correct now. */
-	    { sat_sw_mid = 1; sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }
-	else if (sat_vdp1_floor && (yl1 <= ceilingclip[rw_x] || yl2 <= ceilingclip[rw_stopx - 1]))
-	    /* Occluded ABOVE a NEARER/lower ceiling (yl <= ceilingclip): symmetric to the below-floor case.
-	       A raw VDP1 quad drawn to its natural top covers the DEPORTED ceiling quad (painter order:
-	       ceilings emit BEFORE walls, same prio 5) -> the wall shows where the ceiling should be (owner
-	       2026-07-02).  The CPU draws it, clipping each column to ceilingclip+1 (r_segs.c ~545).  Only
-	       when ceilings are deported (sat_vdp1_floor); else the software ceiling (NBG1 prio 6) covered it. */
-	    { sat_sw_mid = 1; sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }
+	else if (sat_floor_punch_here() && sat_wall_cross_lo(yh1, yh2))
+	{
+	    /* Occluded below a NEARER floor somewhere in the span (ends OR interior -- the pedestal
+	       profile).  Phase-1 clamp (sat_wall_clamp): cut the quad at a whole-texel WORLD-anchored
+	       line above min(floorclip) + software wedge below it (sat_wall_cut_floor above; the
+	       failed screen-anchored 1b is its header comment).  Not for magnified tiers
+	       (!sat_v1_mid: the cut can't fix the horizontal squish) nor when the tier ALSO crosses
+	       a deported ceiling (both-sides cut = two wedges; rare -> keep full CPU).
+	       Clamp off / no useful cut / bank full -> the status-quo full-software fallback. */
+	    if (!(sat_wall_clamp && sat_v1_mid
+	          && !(sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2))
+	          && sat_wall_cut_floor(rw_midtexturemid, v0, yl1, yl2, midtexture, u1, u2, cm,
+	                                sat_sw_mid, &sat_wcl_mid_ef, &sat_wcl_mid_es, &sat_wcl_mid)))
+	        { sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }
+	    sat_sw_mid = 1;   /* full tier on a failed clamp; only the WEDGE rows when sat_wcl_mid is armed */
+	}
+	else if (sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2))
+	{
+	    /* Occluded ABOVE a NEARER/lower ceiling (yl <= ceilingclip): a raw VDP1 quad drawn to its
+	       natural top covers the DEPORTED ceiling quad (painter order: ceilings emit BEFORE walls,
+	       same prio 5; owner 2026-07-02).  Only when ceilings are deported (sat_vdp1_floor); else
+	       the software ceiling (NBG1 prio 6) covered it.  Phase-1 clamp: mirrored top cut +
+	       software wedge above (sat_wall_cut_ceil); else full CPU as before. */
+	    if (!(sat_wall_clamp && sat_v1_mid
+	          && sat_wall_cut_ceil(rw_midtexturemid, v1, yh1, yh2, midtexture, u1, u2, cm,
+	                               sat_sw_mid, &sat_wcl_mid_ef, &sat_wcl_mid_es, &sat_wcl_mid)))
+	        { sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }
+	    sat_sw_mid = 1;   /* full tier on a failed clamp; only the WEDGE rows when sat_wcl_mid is armed */
+	}
 #if SAT_WALL_SUBDIV
 	else if (sat_v1_mid_sub && !sat_v1_mid)   /* normal path only (pot2 force-sets sat_v1_mid=1 -> single quad) */
 	{
@@ -573,12 +793,27 @@ void R_RenderSegLoop (void)
 	    /* SATURN: same floor handling as the other tiers -- cull an upper (toptexture) wall
 	       entirely below the RBG0 floor line; hand a partially-below one to the CPU (clips to
 	       floorclip).  (Rare for a ceiling-side tier, but completes the set.) */
-	    if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
+	    if (sat_wall_clamp && !sat_wall_span_visible(yl1, yl2, yh1, yh2))
+		{ /* invisible at every column -> claim nothing (see the mid tier) */ }
+	    else if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
 		{ /* entirely below the floor -> cull */ }
-	    else if (sat_floor_punch_here() && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
-		{ sat_sw_up = 1; sat_fb_clamp_t++; }   /* partially below -> CPU (clip to floor); Phase-0: clampable */
-	    else if (sat_vdp1_floor && (yl1 <= ceilingclip[rw_x] || yl2 <= ceilingclip[rw_stopx - 1]))
-		{ sat_sw_up = 1; sat_fb_clamp_t++; }   /* above a nearer ceiling -> CPU (clip to ceilingclip; a VDP1 quad would cover the deported ceiling) */
+	    else if (sat_floor_punch_here() && sat_wall_cross_lo(yh1, yh2))
+	    {   /* below the floor somewhere -> Phase-1 world-anchored cut + software wedge; else CPU */
+		if (!(sat_wall_clamp && sat_v1_up
+		      && !(sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2))
+		      && sat_wall_cut_floor(rw_toptexturemid, v0, yl1, yl2, toptexture, u1, u2, cm,
+		                            sat_sw_up, &sat_wcl_up_ef, &sat_wcl_up_es, &sat_wcl_up)))
+		    sat_fb_clamp_t++;
+		sat_sw_up = 1;
+	    }
+	    else if (sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2))
+	    {   /* above a nearer deported ceiling -> mirrored top cut + wedge; else CPU as before */
+		if (!(sat_wall_clamp && sat_v1_up
+		      && sat_wall_cut_ceil(rw_toptexturemid, v1, yh1, yh2, toptexture, u1, u2, cm,
+		                           sat_sw_up, &sat_wcl_up_ef, &sat_wcl_up_es, &sat_wcl_up)))
+		    sat_fb_clamp_t++;
+		sat_sw_up = 1;
+	    }
 #if SAT_WALL_SUBDIV
 	    else if (sat_v1_up_sub && !sat_v1_up)   /* magnified door LINTEL -> perspective subdivision (top=topfrac, bottom=pixhigh) */
 	    {
@@ -624,12 +859,27 @@ void R_RenderSegLoop (void)
 	    /* SATURN: same floor handling as the one-sided wall -- cull a lower (bottomtexture)
 	       wall entirely below the floor; hand a partially-below one to the CPU, which clips
 	       each column to floorclip (no VDP1 bleed-through, no squish). */
-	    if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
+	    if (sat_wall_clamp && !sat_wall_span_visible(yl1, yl2, yh1, yh2))
+		{ /* invisible at every column -> claim nothing (see the mid tier) */ }
+	    else if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
 		{ /* entirely below the floor -> cull */ }
-	    else if (sat_floor_punch_here() && (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]))
-		{ sat_sw_lo = 1; sat_fb_clamp_t++; }   /* partially below -> CPU (clip to floor); Phase-0: clampable */
-	    else if (sat_vdp1_floor && (yl1 <= ceilingclip[rw_x] || yl2 <= ceilingclip[rw_stopx - 1]))
-		{ sat_sw_lo = 1; sat_fb_clamp_t++; }   /* above a nearer ceiling -> CPU (clip to ceilingclip; a VDP1 quad would cover the deported ceiling) */
+	    else if (sat_floor_punch_here() && sat_wall_cross_lo(yh1, yh2))
+	    {   /* below the floor somewhere -> Phase-1 world-anchored cut + software wedge; else CPU */
+		if (!(sat_wall_clamp && sat_v1_lo
+		      && !(sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2))
+		      && sat_wall_cut_floor(rw_bottomtexturemid, v0, yl1, yl2, bottomtexture, u1, u2, cm,
+		                            sat_sw_lo, &sat_wcl_lo_ef, &sat_wcl_lo_es, &sat_wcl_lo)))
+		    sat_fb_clamp_t++;
+		sat_sw_lo = 1;
+	    }
+	    else if (sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2))
+	    {   /* above a nearer deported ceiling -> mirrored top cut + wedge; else CPU as before */
+		if (!(sat_wall_clamp && sat_v1_lo
+		      && sat_wall_cut_ceil(rw_bottomtexturemid, v1, yh1, yh2, bottomtexture, u1, u2, cm,
+		                           sat_sw_lo, &sat_wcl_lo_ef, &sat_wcl_lo_es, &sat_wcl_lo)))
+		    sat_fb_clamp_t++;
+		sat_sw_lo = 1;
+	    }
 #if SAT_WALL_SUBDIV
 	    else if (sat_v1_lo_sub && !sat_v1_lo)   /* magnified door SILL -> perspective subdivision (top=pixlow, bottom=bottomfrac) */
 	    {
@@ -780,6 +1030,12 @@ void R_RenderSegLoop (void)
 	    {
 		dc_yl = yl;
 		dc_yh = yh;
+		/* Phase-1 wedge: VDP1 owns the tier up to the cut line -> software draws only the
+		   residue past it (colfunc tolerates yl > yh, same as vanilla off-screen columns). */
+		if (sat_wcl_mid == 1)
+		    { int e = (int)(sat_wcl_mid_ef >> HEIGHTBITS); if (dc_yl < e) dc_yl = e; }
+		else if (sat_wcl_mid == 2)
+		    { int e = (int)(sat_wcl_mid_ef >> HEIGHTBITS); if (dc_yh > e) dc_yh = e; }
 		dc_texturemid = rw_midtexturemid;
 		if (wall_solid)
 		    sat_wall_color = R_WallPotatoColor(midtexture);
@@ -787,6 +1043,7 @@ void R_RenderSegLoop (void)
 		    dc_source = R_GetColumn(midtexture,texturecolumn);
 		colfunc ();
 	    }
+	    if (sat_wcl_mid) sat_wcl_mid_ef += sat_wcl_mid_es;
 	    ceilingclip[rw_x] = viewheight;
 	    floorclip[rw_x] = -1;
 	}
@@ -808,6 +1065,10 @@ void R_RenderSegLoop (void)
 		    {
 			dc_yl = yl;
 			dc_yh = mid;
+			if (sat_wcl_up == 1)      /* Phase-1 wedge: only the residue past the VDP1 cut line */
+			    { int e = (int)(sat_wcl_up_ef >> HEIGHTBITS); if (dc_yl < e) dc_yl = e; }
+			else if (sat_wcl_up == 2)
+			    { int e = (int)(sat_wcl_up_ef >> HEIGHTBITS); if (dc_yh > e) dc_yh = e; }
 			dc_texturemid = rw_toptexturemid;
 			if (wall_solid)
 			    sat_wall_color = R_WallPotatoColor(toptexture);
@@ -819,6 +1080,7 @@ void R_RenderSegLoop (void)
 		}
 		else
 		    ceilingclip[rw_x] = yl-1;
+		if (sat_wcl_up) sat_wcl_up_ef += sat_wcl_up_es;   /* step the wedge edge per column */
 	    }
 	    else
 	    {
@@ -843,6 +1105,10 @@ void R_RenderSegLoop (void)
 		    {
 			dc_yl = mid;
 			dc_yh = yh;
+			if (sat_wcl_lo == 1)      /* Phase-1 wedge: only the residue past the VDP1 cut line */
+			    { int e = (int)(sat_wcl_lo_ef >> HEIGHTBITS); if (dc_yl < e) dc_yl = e; }
+			else if (sat_wcl_lo == 2)
+			    { int e = (int)(sat_wcl_lo_ef >> HEIGHTBITS); if (dc_yh > e) dc_yh = e; }
 			dc_texturemid = rw_bottomtexturemid;
 			if (wall_solid)
 			    sat_wall_color = R_WallPotatoColor(bottomtexture);
@@ -855,6 +1121,7 @@ void R_RenderSegLoop (void)
 		}
 		else
 		    floorclip[rw_x] = yh+1;
+		if (sat_wcl_lo) sat_wcl_lo_ef += sat_wcl_lo_es;   /* step the wedge edge per column */
 	    }
 	    else
 	    {
