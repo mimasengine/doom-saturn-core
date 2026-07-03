@@ -944,6 +944,11 @@ int sat_plane_fill_mode = 0;
    texels); for a CEILING the split mirrors ([top..edge] punched, [edge+1..bottom] software).
    NULL (DoomJo / not armed) => return 2 degrades to a full claim. */
 short *sat_floor_punch_edge = NULL;
+int sat_floor_punch_nrow = 0;   /* SATURN partial claim, NEAR tile limit (a single screen row --
+                                   the near boundary is horizon-parallel): rows nearer the eye
+                                   than it are handed to the SOFTWARE spans (VDP1 magnified tiles
+                                   there cost ms of iteration for few px; CPU spans are cheap on
+                                   magnified rows).  <= 0 = no near limit (legacy behaviour). */
 /* SATURN: fired at the very END of R_DrawPlanes, when every visplane (claims, punch edges,
    software residue) is final -- the platform builds + atomically chains its VDP1 floor bank
    here, so the floors go live in the SAME frame as the walls instead of one frame later
@@ -1044,6 +1049,38 @@ static void sat_floor_cmap_from_band(int band)
 // R_DrawPlanes
 // At the end of each frame.
 //
+/* SATURN: draw rows [y0..y1] of column x of the CURRENT plane (ds_source/planeheight/
+   planezlight set by the R_DrawPlanes loop) with real per-pixel flat texels -- R_MapPlane's
+   exact mapping + per-row zlight.  Used for the residual bands the VDP1 tiles cannot serve
+   (the far sliver past the mip clamp in a partial claim).  Row counts there are small. */
+static void sat_plane_texcol(int x, int y0, int y1)
+{
+    unsigned tang = (unsigned)(viewangle + xtoviewangle[x]) >> ANGLETOFINESHIFT;
+    fixed_t tcos = finecosine[tang], tsin = finesine[tang];
+    fixed_t tdsc = distscale[x];
+    int y;
+    for (y = y0; y <= y1; y++)
+    {
+	fixed_t dist = FixedMul(planeheight, yslope[y]);
+	fixed_t len  = FixedMul(dist, tdsc);
+	fixed_t xf   = viewx + FixedMul(tcos, len);
+	fixed_t yf   = -viewy - FixedMul(tsin, len);
+	int zi = dist >> LIGHTZSHIFT; if (zi >= MAXLIGHTZ) zi = MAXLIGHTZ - 1;
+	{
+	    byte v = (fixedcolormap ? fixedcolormap : planezlight[zi])
+		     [ds_source[((yf >> 10) & 0x0FC0) | ((xf >> 16) & 63)]];
+	    if (detailshift)
+	    {
+		int sx = x << 1;
+		ylookup[y][columnofs[sx]]     = v;
+		ylookup[y][columnofs[sx + 1]] = v;
+	    }
+	    else
+		ylookup[y][columnofs[x]] = v;
+	}
+    }
+}
+
 void R_DrawPlanes (void)
 {
     visplane_t*		pl;
@@ -1461,23 +1498,37 @@ void R_DrawPlanes (void)
 		pb0 = yl; pb1 = yh;
 		if (partial)
 		{
+		    /* punch band = what the tiles can SERVE: [far edge pe .. near limit pn].
+		       The NEAR band (magnified -- ms of VDP1 iteration for few px, cheap for
+		       CPU spans) goes to the normal span path via the top/bottom trim; the
+		       FAR residue (few rows past the mip clamp) is drawn here per-pixel. */
 		    int pe = (int)sat_floor_punch_edge[x];
+		    int pn = sat_floor_punch_nrow;
+		    int f0, f1;                                       /* far residue -> texels */
 		    if (is_ceil)
 		    {
-			int nt;
-			if (pe < pb1) pb1 = pe;                       /* punch [yl..pb1]        */
-			nt = pb1 + 1; if (nt < yl) nt = yl;           /* leftover = [nt..yh]    */
-			pl->top[x] = (unsigned char)nt;
+			pb0 = (pn > 0 && pn > yl) ? pn : yl;          /* near rows excluded     */
+			pb1 = pe < yh ? pe : yh;
+			if (pb0 > pb1) continue;                      /* nothing tileable -> the
+			                                                 whole span stays software */
+			{ int nb = pb0 - 1;                           /* NEAR band -> span path  */
+			  if (nb < 0) pl->top[x] = 0xff;
+			  else        pl->bottom[x] = (unsigned char)nb; }
+			f0 = pb1 + 1; f1 = yh;                        /* FAR residue -> texels   */
 		    }
 		    else
 		    {
-			int nb;
-			if (pe > pb0) pb0 = pe;                       /* punch [pb0..yh]        */
-			nb = pb0 - 1; if (nb > yh) nb = yh;           /* leftover = [yl..nb]    */
-			if (nb < 0) pl->top[x] = 0xff;                /* empty (byte-safe mark) */
-			else        pl->bottom[x] = (unsigned char)nb;
+			pb0 = pe > yl ? pe : yl;
+			pb1 = (pn > 0 && pn < yh) ? pn : yh;          /* near rows excluded     */
+			if (pb0 > pb1) continue;
+			{ int nt = pb1 + 1; if (nt < yl) nt = yl;     /* NEAR band -> span path  */
+			  pl->top[x] = (unsigned char)nt; }
+			f0 = yl; f1 = pb0 - 1;                        /* FAR residue -> texels   */
 		    }
-		    if (pb0 > pb1) continue;                          /* nothing punched here   */
+		    if (f0 < yl) f0 = yl;
+		    if (f1 > yh) f1 = yh;
+		    if (f0 <= f1)
+			sat_plane_texcol(x, f0, f1);
 		}
 		n = pb1 - pb0 + 1;
 		if (swept)
