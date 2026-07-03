@@ -611,7 +611,10 @@ void R_RenderSegLoop (void)
 		if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, toptexture, u1, u2, v0, v1, cm))
 		    { sat_sw_up = 1; sat_fb_starve_t++; }   /* VDP1 starved (list full) -> upper in SOFTWARE, not sky */
 	}
-	if (bottomtexture && sat_v1_lo)   /* bottom of the opening -> floor */
+	if (bottomtexture && (sat_v1_lo || sat_v1_lo_sub))   /* bottom of the opening -> floor.
+	       sat_v1_lo_sub MUST be in this gate like the mid/top tiers: a magnified lower tier
+	       (face-on step riser) has sat_v1_lo==0 + sat_sw_lo==0 (the subdivision owns it), so
+	       without it NOBODY drew the tier -> invisible riser (owner capture 2026-07-03). */
 	{
 	    int yl1 = (pixlow + HEIGHTUNIT - 1) >> HEIGHTBITS;
 	    int yl2 = (pixlow + pixlowstep * n + HEIGHTUNIT - 1) >> HEIGHTBITS;
