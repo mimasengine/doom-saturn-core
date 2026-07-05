@@ -91,6 +91,26 @@ void (*sat_psprite_hook)(patch_t *patch, int lump, int sx, int sy, int flip,
    the late software psprite draw.  0 on DoomJo / when the weapon stays software. */
 int sat_psprite_early = 0;
 
+/* SATURN world-things-on-VDP1 (de-risk probe, platform gate SAT_WORLD_THINGS_VDP1): draw the
+   world sprites as prio-7 VDP1 quads (like the weapon) to offload the memory-bound masked FILL
+   off the two SH-2s.  The platform hook bakes the sprite patch (full-patch, cache key lump+cmap)
+   and emits a distorted quad into the screen rect computed here; it returns 1 if it took the
+   sprite, 0 if it declined (texture too big / command budget full) -> that sprite falls back to
+   the software masked draw.  Emitted at the post-BSP kick (vissprites + drawsegs ready, before
+   the end-of-planes VDP1 present), so it lands THIS frame -- same window the weapon uses.
+   NON-occlusion-clipped for now (viewport/system-clip only): a nearer wall does not yet hide a
+   farther thing (that is the FUNC_UserClip follow-up).  NULL on DoomJo -> pure software. */
+int (*sat_thing_hook)(patch_t *patch, int lump, const unsigned char *cmap,
+                      int x0, int y0, int x1, int y1,          /* sprite screen quad (full-res) */
+                      int cx0, int cy0, int cx1, int cy1,      /* visible clip rect (occlusion)  */
+                      int flip) = 0;
+int sat_things_emitted = 0;                 /* 1 = things went to VDP1 this view -> R_DrawMasked skips them */
+int sat_things_occ = 0;                     /* fully-occluded sprites skipped this frame (occlusion metric) */
+int sat_thing_cap = 4;                      /* platform sets = VDP1 thing slots/frame (VRAM cap); nearest win */
+int sat_things_hw = 1;                      /* platform (sat_apply_mode): 1 = world sprites on VDP1; 0 = software (M0/M6) */
+static char sat_thing_vdp1[MAXVISSPRITES];  /* per-vissprite (by array index): 1 = emitted on VDP1 */
+static char sat_thing_elig[MAXVISSPRITES];  /* 1 = selected (nearest sat_thing_cap) for VDP1 this frame */
+
 lighttable_t**	spritelights;
 
 // constant arrays
@@ -333,6 +353,7 @@ void R_ClearSprites (void)
 {
     extern void RP_SprReset(void);   /* SATURN sprite-cost profiler: zero the per-frame timers */
     RP_SprReset();
+    sat_things_emitted = 0;          /* SATURN: reset per view -> R_DrawMasked only skips when the kick emitted this view */
     vissprite_p = vissprites;
 }
 
@@ -782,16 +803,19 @@ void R_DrawPSprite (pspdef_t* psp)
     }
 
     /* SATURN: draw the weapon on VDP1 (hardware sprite layer, async, in parallel
-       with the SH-2s) instead of the software framebuffer.  Only the opaque,
-       non-translated case (vis->colormap != NULL); the rare invisibility "shadow"
-       (NULL colormap = fuzz) falls through to the software path below. */
-    if (sat_psprite_hook && vis->colormap)
+       with the SH-2s) instead of the software framebuffer.  Only when VDP1 is active
+       this view (sat_wall_skip) -- M0 / software-wall split MUST keep the SOFTWARE
+       weapon (else the always-set hook routes it to VDP1 even in M0).  Only the opaque,
+       non-translated case (vis->colormap != NULL); the invisibility "shadow" (NULL
+       colormap = fuzz) falls through to the software path below. */
+    { extern int sat_wall_skip;
+    if (sat_psprite_hook && sat_wall_skip && vis->colormap)
     {
 	int ytop = (centeryfrac - FixedMul(vis->texturemid, vis->scale)) >> FRACBITS;
 	patch_t *wp = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
 	sat_psprite_hook (wp, vis->patch, x1, ytop, (int)flip, vis->colormap);
 	return;
-    }
+    } }
 
     R_DrawVisSprite (vis, vis->x1, vis->x2);
 }
@@ -823,9 +847,13 @@ void R_DrawPlayerSprites (void)
     mfloorclip = screenheightarray;
     mceilingclip = negonearray;
 
-    /* SATURN: start a fresh VDP1 command list for this frame's player sprites */
-    if (sat_psprite_begin)
+    /* SATURN: start a fresh VDP1 command list for this frame's player sprites -- only when VDP1 is
+       active this view (sat_wall_skip); in M0 / software-wall split the weapon is software (no VDP1
+       clip command emitted either). */
+    { extern int sat_wall_skip;
+    if (sat_psprite_begin && sat_wall_skip)
 	sat_psprite_begin();
+    }
 
     // add all active psprites
     for (i=0, psp=viewplayer->psprites;
@@ -904,7 +932,10 @@ void R_SortVisSprites (void)
 //
 static short		clipbot[SCREENWIDTH];
 static short		cliptop[SCREENWIDTH];
-void R_DrawSprite (vissprite_t* spr)
+/* SATURN: split R_DrawSprite so the VDP1 world-things path can compute a sprite's per-column
+   clip (clipbot/cliptop) against the drawsegs WITHOUT drawing it or rendering masked mid-textures
+   (dorender=0).  The software path passes dorender=1 (identical to the old R_DrawSprite). */
+static void R_ClipSprite (vissprite_t* spr, int dorender)
 {
     drawseg_t*		ds;
     int			x;
@@ -950,8 +981,8 @@ void R_DrawSprite (vissprite_t* spr)
 	    || ( lowscale < spr->scale
 		 && !R_PointOnSegSide (spr->gx, spr->gy, ds->curline) ) )
 	{
-	    // masked mid texture?
-	    if (ds->maskedtexturecol)	
+	    // masked mid texture? (software draw only; the VDP1 clip pass passes dorender=0)
+	    if (dorender && ds->maskedtexturecol)
 		R_RenderMaskedSegRange (ds, r1, r2);
 	    // seg is behind sprite
 	    continue;			
@@ -1007,6 +1038,11 @@ void R_DrawSprite (vissprite_t* spr)
 	    cliptop[x] = -1;
     }
 		
+}
+
+void R_DrawSprite (vissprite_t* spr)
+{
+    R_ClipSprite (spr, 1);
     mfloorclip = clipbot;
     mceilingclip = cliptop;
     R_DrawVisSprite (spr, spr->x1, spr->x2);
@@ -1221,6 +1257,128 @@ void R_SlaveDrawMasked (int x0, int x1)
         R_SlaveDrawSprite (spr);
 }
 
+/* World-things min-size threshold: only offload a sprite to VDP1 when it is magnified enough that
+   the saved software FILL exceeds the VDP1 texture BAKE.  Estimate: bake ~ texture area
+   (patchw*patchh, distance-INDEPENDENT); fill saved ~ SCREEN area = texture area * magnification^2,
+   where magnification = spr->scale/FRACUNIT (screen px per texel).  Break-even magnification^2 ~=
+   bake_rate/fill_rate ~ 2 (VRAM writes ~2x the cached-framebuffer fill), i.e. magnification ~ 1.4.
+   Below it the per-frame bake costs more master time than the fill it removes -> keep it software.
+   Tunable (raise if HW shows the bake dominating; lower if VDP1 headroom is the only limit). */
+#define THING_MIN_MAG_PCT 140
+#define THING_MIN_SCALE   ((fixed_t)((long long)FRACUNIT * THING_MIN_MAG_PCT / 100))
+
+/* SATURN world-things-on-VDP1: emit the world sprites to the VDP1 prio-7 layer (platform
+   sat_thing_hook) at the post-BSP kick, before the end-of-planes present.  vissprites are
+   already projected (R_AddSprites ran during the BSP walk); drawsegs are complete too.  We
+   compute each sprite's full-resolution screen rect (matching the software R_DrawVisSprite
+   math: sprtopscreen for the top, spr->scale for the size) and the unclamped left edge
+   x1full, then hand it to the platform.  Sprites the platform takes are marked so R_DrawMasked
+   skips their software fill; fuzz/translated and platform-declined sprites stay software.
+   Called by the platform kick (extern "C").  1p only -- split clears sprites per view, so the
+   single post-loop kick would only see the last view's list (things stay software in split). */
+void R_EmitWorldThingsVDP1 (void)
+{
+    vissprite_t*	spr;
+    extern int		sat_wall_skip;
+    extern int		sat_split_active;
+    extern int		sat_things_hw;
+    extern int		viewwindowx, viewwindowy;
+
+    sat_things_emitted = 0;
+    sat_things_occ = 0;
+    if (!sat_thing_hook || !sat_wall_skip || !sat_things_hw || viewangleoffset || sat_split_active)
+	return;                                   /* path inactive this view -> software sprites.
+	   split: the single post-loop kick fires with sat_split_active still 1 and only the LAST
+	   view's sprites/window live -> emitting here would double + mis-place them, so 1p only. */
+    if (vissprite_p == vissprites)
+    { sat_things_emitted = 1; return; }           /* no sprites, but path active -> R_DrawMasked skips its (empty) loop */
+
+    R_SortVisSprites ();                           /* scale order: far (low scale) .. near (high scale) */
+    memset (sat_thing_vdp1, 0, (size_t)(vissprite_p - vissprites));
+    memset (sat_thing_elig, 0, (size_t)(vissprite_p - vissprites));
+
+    /* PASS 1 (NEAR -> far, reverse list): the VDP1 texture pool holds only sat_thing_cap sprites/
+       frame (VRAM), so spend them on the NEAREST (biggest on-screen fill = the real offload win);
+       mark them eligible.  Cheap filters only -- occlusion is resolved in pass 2. */
+    {
+	int n_elig = 0;
+	for (spr = vsprsortedhead.prev ; spr != &vsprsortedhead && n_elig < sat_thing_cap ; spr = spr->prev)
+	{
+	    int idx = spr - vissprites;
+	    /* min-size: below the break-even magnification the bake outweighs the fill saved.  The list
+	       is near->far here (scale descending) so once one is too small, all farther ones are too. */
+	    if ((spr->scale >> detailshift) < THING_MIN_SCALE) break;
+	    if (idx < 0 || idx >= MAXVISSPRITES) continue;
+	    if (!spr->colormap)                  continue;   /* fuzz/shadow -> software */
+	    if (spr->mobjflags & MF_TRANSLATION) continue;   /* other-player colour -> software */
+	    if ((spritewidth[spr->patch] >> FRACBITS) < 1) continue;
+	    sat_thing_elig[idx] = 1;
+	    n_elig++;
+	}
+    }
+
+    /* PASS 2 (far -> near = PAINTER order): emit the eligible sprites (nearer draws over farther). */
+    for (spr = vsprsortedhead.next ; spr != &vsprsortedhead ; spr = spr->next)
+    {
+	int	idx = spr - vissprites;
+	patch_t	*patch;
+	int	patchw, x1full, wpx, ytop, hpx, ybot, x0s, x1s, y0s, y1s;
+	int	cx0, cy0, cx1, cy1, xx, vx1, vx2, vtop, vbot;
+
+	if (idx < 0 || idx >= MAXVISSPRITES)   continue;
+	if (!sat_thing_elig[idx])              continue;   /* not among the nearest sat_thing_cap -> software */
+
+	patch  = W_CacheLumpNum (spr->patch+firstspritelump, PU_CACHE);
+	patchw = spritewidth[spr->patch] >> FRACBITS;
+	if (patchw < 1) continue;
+
+	/* unclamped left screen edge: invert startfrac = xiscale*(x1 - x1full) (see R_ProjectSprite).
+	   non-flip: frac 0 at the left edge; flip: frac (patchw<<FRACBITS) at the left edge. */
+	if (spr->xiscale >= 0)
+	    x1full = spr->x1 - (int)(spr->startfrac / spr->xiscale);
+	else
+	    x1full = spr->x1 - (int)((((fixed_t)patchw << FRACBITS) - spr->startfrac) / (-spr->xiscale));
+
+	wpx  = (int)(((long long)patchw * spr->scale) >> FRACBITS);          /* detailshift baked into spr->scale */
+	if (wpx < 1) wpx = 1;
+	ytop = (centeryfrac - FixedMul (spr->texturemid, spr->scale)) >> FRACBITS;   /* == software sprtopscreen */
+	hpx  = (int)(((long long)SHORT(patch->height) * spr->scale) >> FRACBITS);
+	if (hpx < 1) hpx = 1;
+
+	ybot = ytop + hpx - 1;
+	x0s = (x1full << detailshift) + viewwindowx;
+	x1s = (((x1full + wpx) << detailshift) - 1) + viewwindowx;
+	y0s = ytop + viewwindowy;
+	y1s = ybot + viewwindowy;
+
+	/* OCCLUSION: per-column clip vs the drawsegs (no draw/no masked-seg render), reduced to the
+	   visible bounding box.  A nearer wall/floor edge shrinks the box; a fully-hidden sprite gives
+	   an empty box -> skip it entirely (correct = invisible).  The box is EXACT for the common
+	   single vertical/horizontal cut; a jagged (diagonal-wall) cut over-shows its bbox sliver. */
+	R_ClipSprite (spr, 0);
+	vx1 = 32767; vx2 = -1; vtop = 32767; vbot = -1;
+	for (xx = spr->x1 ; xx <= spr->x2 ; xx++)
+	{
+	    int ct = cliptop[xx] + 1;  if (ct < ytop) ct = ytop;
+	    int cb = clipbot[xx] - 1;  if (cb > ybot) cb = ybot;
+	    if (ct > cb) continue;                          /* nothing of the sprite visible in this column */
+	    if (xx < vx1) vx1 = xx;   if (xx > vx2) vx2 = xx;
+	    if (ct < vtop) vtop = ct; if (cb > vbot) vbot = cb;
+	}
+	if (vx2 < vx1) { sat_thing_vdp1[idx] = 1; sat_things_occ++; continue; }   /* fully occluded -> hidden, skip software too */
+	cx0 = (vx1 << detailshift) + viewwindowx;
+	cx1 = (((vx2 + 1) << detailshift) - 1) + viewwindowx;
+	cy0 = vtop + viewwindowy;
+	cy1 = vbot + viewwindowy;
+
+	if (sat_thing_hook (patch, spr->patch, spr->colormap,
+			    x0s, y0s, x1s, y1s, cx0, cy0, cx1, cy1, (int)(spr->xiscale < 0)))
+	    sat_thing_vdp1[idx] = 1;
+    }
+    sat_things_emitted = 1;
+}
+
+
 void R_DrawMasked (void)
 {
     vissprite_t*	spr;
@@ -1236,7 +1394,10 @@ void R_DrawMasked (void)
 	/* SATURN masked-by-half: dispatch the slave to draw the RIGHT-half vissprites while the
 	   master draws the LEFT half (g_mask_x1).  Masked walls + psprites stay on the master,
 	   full width, after the wait. */
-	if (sat_masked_parallel)
+	/* SATURN world-things-on-VDP1: when the kick emitted the sprites to VDP1, the masked-by-half
+	   slave split is off (most sprites are skipped below, and the slave path does not honour the
+	   per-sprite marks) -- the few software-fallback sprites draw full-width on the master. */
+	if (sat_masked_parallel && !sat_things_emitted)
 	{
 	    int half = viewwidth >> 1;
 	    /* pre-cache every sprite patch on the master so the slave's W_CacheLumpNum only ever
@@ -1253,7 +1414,13 @@ void R_DrawMasked (void)
 	     spr != &vsprsortedhead ;
 	     spr=spr->next)
 	{
-
+	    /* SATURN: skip the sprites the platform already drew on the VDP1 prio-7 layer. */
+	    if (sat_things_emitted)
+	    {
+		int idx = spr - vissprites;
+		if (idx >= 0 && idx < MAXVISSPRITES && sat_thing_vdp1[idx])
+		    continue;
+	    }
 	    R_DrawSprite (spr);
 	}
 	if (masked_split)
