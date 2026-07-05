@@ -1270,14 +1270,14 @@ void R_DrawMasked (void)
     
     // draw the psprites on top of everything
     //  but does not draw on side views
-    /* SATURN: skip the (late) SOFTWARE psprite draw only when the VDP1 weapon path will actually
-       emit it this frame -- sat_psprite_early AND (1p, always kicked | split with VDP1 walls on,
-       which is the only split path that runs sat_walls_kick).  A SOFTWARE-wall split (sat_split_vdp1
-       off) never kicks VDP1, so it MUST keep the software weapon here -> no missing weapon when
-       SAT_WPN_VDP1 is default-on. */
+    /* SATURN: draw the weapon in SOFTWARE unless the VDP1 weapon path will actually emit it -- which
+       is exactly when this frame/view uses VDP1 walls (sat_wall_skip).  So M0 software mode (and a
+       software-wall split) keep the SOFTWARE weapon -> M0 stays a clean pure-software reference; the
+       VDP1 modes (M1-M4, VDP1 split) get the VDP1 weapon.  sat_psprite_early keeps DoomJo/off on the
+       software path. */
     {
-	extern int sat_split_active, sat_split_vdp1;
-	int vdp1_will_emit = sat_psprite_early && (!sat_split_active || sat_split_vdp1);
+	extern int sat_wall_skip;
+	int vdp1_will_emit = sat_psprite_early && sat_wall_skip;
 	if (!viewangleoffset && !vdp1_will_emit)
 	    R_DrawPlayerSprites ();
     }
