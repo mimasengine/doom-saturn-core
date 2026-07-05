@@ -270,9 +270,17 @@
 
 // graphics are drawn to a backing screen and blitted to the real screen
 byte                   *st_backing_screen;
-	    
+
+// SATURN W5 (docs/BLIT_DMA_PLAN.md): set to 1 whenever the status-bar/HUD region of the
+// framebuffer is (re)drawn -- by the STlib widgets (st_lib.c, only when a value actually
+// changes now that STlib_drawNum has its missing diff) and by ST_refreshBackground below.
+// The Saturn platform reads+clears it in DG_DrawFrame to blit the HUD rows only when they
+// changed (the 3D-view rows always blit), skipping ~14% of the copy when the HUD is static.
+// Starts 1 so the first frame blits it.  DoomJo links it (never reads it) -> harmless.
+int			sat_hud_dirty = 1;
+
 // main player in game
-static player_t*	plyr; 
+static player_t*	plyr;
 
 // ST_Start() has just been called
 static boolean		st_firsttime;
@@ -437,6 +445,8 @@ void ST_refreshBackground(void)
         V_RestoreBuffer();
 
 	V_CopyRect(ST_X, 0, st_backing_screen, ST_WIDTH, ST_HEIGHT, ST_X, ST_Y);
+
+	sat_hud_dirty = 1;   // SATURN W5: the full HUD background was repainted
     }
 
 }
@@ -1150,6 +1160,33 @@ static int hud2p_face(player_t *p)
     painlevel = ((100 - h) * ST_NUMPAINFACES) / 101;
     if (painlevel >= ST_NUMPAINFACES) painlevel = ST_NUMPAINFACES - 1;
     return painlevel * ST_FACESTRIDE + 1;   // +1 = neutral straight-ahead face
+}
+
+// SATURN W5: a cheap signature of everything the 2p/4p compact HUD draws, so the platform
+// can skip repainting + reblitting the HUD band when no active player's HUD changed -- incl.
+// the damage/pickup flash, via damagecount/bonuscount.  Covers the active players only.
+unsigned int ST_SplitHudSig(void)
+{
+    extern int sat_local_players;
+    unsigned int s = 2166136261u;   // FNV-1a offset
+    int n = sat_local_players; if (n > 4) n = 4; if (n < 1) n = 1;
+    int p, i;
+    for (p = 0; p < n; ++p)
+    {
+        player_t *pl = &players[p];
+        int aidx = weaponinfo[pl->readyweapon].ammo;
+        unsigned int bits = 0;
+        s ^= (unsigned int)pl->health;         s *= 16777619u;
+        s ^= (unsigned int)pl->armorpoints;    s *= 16777619u;
+        s ^= (unsigned int)pl->readyweapon;    s *= 16777619u;
+        s ^= (unsigned int)((aidx != am_noammo) ? pl->ammo[aidx] : 0); s *= 16777619u;
+        for (i = 1; i <= 6; ++i) bits = (bits << 1) | (pl->weaponowned[i] ? 1u : 0u);
+        for (i = 0; i < NUMCARDS; ++i) bits = (bits << 1) | (pl->cards[i] ? 1u : 0u);
+        s ^= bits;                             s *= 16777619u;
+        s ^= (unsigned int)pl->damagecount;    s *= 16777619u;
+        s ^= (unsigned int)pl->bonuscount;     s *= 16777619u;
+    }
+    return s;
 }
 
 void ST_DrawCompactWidgets(int pnum, int ox, int oy)

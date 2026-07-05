@@ -37,7 +37,10 @@
 
 
 // in AM_map.c
-extern boolean		automapactive; 
+extern boolean		automapactive;
+
+// SATURN W5 (st_stuff.c): 1 when the HUD framebuffer region was (re)drawn this frame.
+extern int		sat_hud_dirty;
 
 
 
@@ -95,7 +98,17 @@ STlib_drawNum
     
     int		neg;
 
+    // SATURN W5: the vanilla drawNum sets n->oldnum but never TESTS it, so the HUD numbers
+    // are cleared+redrawn every frame -> the HUD framebuffer never goes static.  Add the
+    // intended diff: on a plain (non-refresh) update, skip when the value is unchanged.  This
+    // makes the HUD region static when idle (so the Saturn platform can skip its blit) AND is
+    // a small win on its own; refresh (st_firsttime / full repaint) still forces the redraw.
+    if (!refresh && num == n->oldnum)
+	return;
+
     n->oldnum = *n->num;
+
+    sat_hud_dirty = 1;   // a number is about to be (re)drawn into the HUD framebuffer
 
     neg = num < 0;
 
@@ -175,8 +188,11 @@ STlib_updatePercent
   int			refresh )
 {
     if (refresh && *per->n.on)
+    {
 	V_DrawPatch(per->n.x, per->n.y, per->p);
-    
+	sat_hud_dirty = 1;   // SATURN W5: the '%' glyph was drawn
+    }
+
     STlib_updateNum(&per->n, refresh);
 }
 
@@ -227,6 +243,7 @@ STlib_updateMultIcon
 	}
 	V_DrawPatch(mi->x, mi->y, mi->p[*mi->inum]);
 	mi->oldinum = *mi->inum;
+	sat_hud_dirty = 1;   // SATURN W5: a multi-icon (face / arms / keys) changed
     }
 }
 
@@ -278,6 +295,7 @@ STlib_updateBinIcon
 	    V_CopyRect(x, y-ST_Y, st_backing_screen, w, h, x, y);
 
 	bi->oldval = *bi->val;
+	sat_hud_dirty = 1;   // SATURN W5: a binary icon (arms background) changed
     }
 
 }
