@@ -63,6 +63,7 @@
 #include "hu_stuff.h"
 #include "wi_stuff.h"
 #include "st_stuff.h"
+#include "hud4p_layout.h"  // SATURN: HUD4P_H -- 3/4p quadrant HUD band height (view = SCREENHEIGHT/2 - HUD4P_H)
 #include "am_map.h"
 #include "net_client.h"
 #include "net_dedicated.h"
@@ -345,7 +346,10 @@ void D_Display (void)
 	    int n    = sat_local_players; if (n > 4) n = 4;
 	    int twop = (n == 2);
 	    int hw   = SCREENWIDTH / 2;                                /* 160 */
-	    int fh   = twop ? (SCREENHEIGHT - 64) : (SCREENHEIGHT / 2);/* 2p:160  3/4p:112 */
+	    /* 2p: 160 view + 64 HUD panel.  3/4p: each 160x112 quadrant is a 160x96 view + a
+	       HUD4P_H(16) compact HUD band at its bottom (drawn by the platform).  Shrinking the
+	       view reclaims ~14% of the per-quadrant pixel cost (walls/spans/sprites/VDP1 fill). */
+	    int fh   = twop ? (SCREENHEIGHT - 64) : (SCREENHEIGHT / 2 - HUD4P_H);/* 2p:160  3/4p:96 */
 	    static const short vpx[4] = { 0, 160, 0,   160 };
 	    static const short vpy[4] = { 0, 0,   112, 112 };          /* y only used for 3/4p quadrants */
 	    int sws = sat_wall_skip;
@@ -633,6 +637,12 @@ void V_Canary (const char* where);
 /* SATURN: phase indicator for the debug overlay (defined in dg_saturn.c). */
 extern volatile int game_phase;
 
+/* SATURN: last-tick master-composition sub-costs (ms), read by the platform overlay to
+   decompose MST = REC + T(game-tic) + S(sound) + blit + present + other.  Set each tick
+   under SATURN_TICK_DEBUG (below); stay 0 when that is off (DoomJo links either way). */
+int sat_tic_ms = 0;   /* TryRunTics  (thinkers, P_Ticker, P_CheckSights) */
+int sat_snd_ms = 0;   /* S_UpdateSounds (positional sound update)        */
+
 void doomgeneric_Tick()
 {
 #if SATURN_TICK_DEBUG
@@ -666,6 +676,7 @@ void doomgeneric_Tick()
 
 #if SATURN_TICK_DEBUG
     t1 = d_ms();
+    sat_tic_ms = (int)(t1 - t0);   /* SATURN: game-tic ms -> overlay master-composition */
 #endif
 
     game_phase = 2; /* S_UpdateSounds */
@@ -675,6 +686,7 @@ void doomgeneric_Tick()
 
 #if SATURN_TICK_DEBUG
     t2 = d_ms();
+    sat_snd_ms = (int)(t2 - t1);   /* SATURN: sound-update ms -> overlay master-composition */
 #endif
 
     game_phase = 3; /* D_Display */

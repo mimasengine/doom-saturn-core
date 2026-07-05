@@ -1428,7 +1428,8 @@ void AM_DrawMiniMap(int ox, int oy, int w, int h)
     if (!fb || numvertexes <= 0 || numlines <= 0)
         return;
 
-    // allocate the baked panel once (w,h are the fixed 160x112 quadrant); rebuild its
+    // allocate the baked panel once (w,h = the quadrant sub-view, 160x96 with the compact
+    // HUD band below it -- constant for the whole run); rebuild its
     // contents on a new level (lines[] reallocated) OR when more lines have been revealed.
     // The revealed count is monotonic within a level, so it is a faithful, cheap dirty key.
     {
