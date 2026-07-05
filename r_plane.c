@@ -745,7 +745,7 @@ static void R_DrawVisplanePotato (visplane_t *pl, int color,
    native 320 render); low-detail keeps the global path.  Render-identical to R_MapPlane +
    R_DrawSpan (basexscale/baseyscale/distscale/viewangle are shared read-only). */
 static inline void R_TexturedSpan (int y, int x1, int x2, fixed_t plheight,
-                                   lighttable_t **plzlight, byte *src)
+                                   lighttable_t **plzlight, byte *src, int ld)
 {
     fixed_t       distance, length, xfrac, yfrac, xstep, ystep;
     angle_t       angle;
@@ -780,7 +780,7 @@ static inline void R_TexturedSpan (int y, int x1, int x2, fixed_t plheight,
     dest = ylookup[y] + columnofs[x1];
     count = x2 - x1;
 
-    if (sat_floor_ld)   /* pot0.5: low-detail floors -- 1 texel fetch per 2 screen px */
+    if (ld)   /* SQ low-detail (per-plane): 1 texel fetch per 2 screen px */
     {
         step <<= 1;     /* advance two source steps between fetches */
         do {
@@ -807,7 +807,7 @@ static inline void R_TexturedSpan (int y, int x1, int x2, fixed_t plheight,
 
 static void R_DrawVisplaneTextured (visplane_t *pl, byte *src,
                                     lighttable_t **plzlight, fixed_t plheight,
-                                    int row_lo, int row_hi)   /* SATURN row-split: only fill spans whose row is in [row_lo,row_hi) */
+                                    int row_lo, int row_hi, int ld)   /* SATURN row-split [row_lo,row_hi) + per-plane SQ low-detail (ld) */
 {
     int spanstart_l[256];   /* per-CPU, on the stack.  SATURN BUGFIX: [256] not
                                [SCREENHEIGHT(224)] -- this is indexed by pl->top[x]/
@@ -823,8 +823,8 @@ static void R_DrawVisplaneTextured (visplane_t *pl, byte *src,
         int t1 = pl->top[x-1], b1 = pl->bottom[x-1];
         int t2 = pl->top[x],   b2 = pl->bottom[x];
 
-        while (t1 < t2 && t1 <= b1) { if (t1 >= row_lo && t1 < row_hi) R_TexturedSpan (t1, spanstart_l[t1], x-1, plheight, plzlight, src); t1++; }
-        while (b1 > b2 && b1 >= t1) { if (b1 >= row_lo && b1 < row_hi) R_TexturedSpan (b1, spanstart_l[b1], x-1, plheight, plzlight, src); b1--; }
+        while (t1 < t2 && t1 <= b1) { if (t1 >= row_lo && t1 < row_hi) R_TexturedSpan (t1, spanstart_l[t1], x-1, plheight, plzlight, src, ld); t1++; }
+        while (b1 > b2 && b1 >= t1) { if (b1 >= row_lo && b1 < row_hi) R_TexturedSpan (b1, spanstart_l[b1], x-1, plheight, plzlight, src, ld); b1--; }
         while (t2 < t1 && t2 <= b2) { spanstart_l[t2] = x; t2++; }
         while (b2 > b1 && b2 >= t2) { spanstart_l[b2] = x; b2--; }
     }
@@ -837,7 +837,7 @@ static void R_DrawVisplaneTextured (visplane_t *pl, byte *src,
    stack: there is no BSP recursion here).  Disjoint visplanes -> disjoint framebuffer (Doom
    has no plane overdraw), so the two halves are race-free. */
 typedef struct { visplane_t *pl; byte *src; lighttable_t **plzlight;
-                 fixed_t plheight; int potato, lumpnum, color; } planework_t;
+                 fixed_t plheight; int potato, ld, lumpnum, color; } planework_t;   /* ld: per-plane SQ low-detail (independent floor/ceiling) */
 planework_t plane_worklist[MAXVISPLANES];
 int         plane_worklist_n;
 /* master gate: 0 = old global record/parity path (DoomJo + the working baseline, byte-
@@ -858,7 +858,7 @@ void R_DrawPlaneWorklistRows (int from, int to, int row_lo, int row_hi)
         if (w->potato)
             R_DrawVisplanePotato   (w->pl, w->color, w->plzlight, w->plheight, row_lo, row_hi);
         else
-            R_DrawVisplaneTextured (w->pl, w->src, w->plzlight, w->plheight, row_lo, row_hi);
+            R_DrawVisplaneTextured (w->pl, w->src, w->plzlight, w->plheight, row_lo, row_hi, w->ld);
     }
 }
 /* SATURN row-split (the universal balancer): both CPUs draw ALL planes but only the spans whose ROW
@@ -1021,6 +1021,12 @@ unsigned char *sat_vdp2_floor_data(void)
    platform; default 0 (vanilla textured floors, incl. DoomJo). */
 int sat_potato_floors = 0;
 int sat_floor_ld = 0;   /* pot0.5: half-rate textured-floor fill (forward-declared above) */
+/* SATURN: independent CEILING software quality (M/SQ refactor).  sat_potato_floors/sat_floor_ld
+   above act on floors; these mirror them for ceilings so SQ_ceil can differ from SQ_floor.
+   Resolved per-plane at enqueue time via is_ceil (see R_DrawPlanes worklist tag).  Default 0
+   (ceilings follow the textured path, incl. DoomJo which never sets them). */
+int sat_ceil_potato = 0;
+int sat_ceil_ld = 0;
 /* SATURN: Potato walls -- opaque wall columns drawn as a single distance-shaded
    colour (a fixed texel), in rp_exec_col.  Sprites (masked RP_COL) stay textured.
    Default 0.  Aimed at the future 2/4-player split-screen builds (more views,
@@ -1340,7 +1346,14 @@ void R_DrawPlanes (void)
 
 	// regular flat
         lumpnum = firstflat + flattranslation[pl->picnum];
-	if (sat_potato_floors) sat_floor_color = R_FlatPotatoColor(lumpnum);  /* dominant/avg, cached */
+	/* SATURN M/SQ: independent floor vs ceiling software quality.  is_ceil = height>viewz.
+	   eff_potato/eff_ld pick the floor or ceiling SQ flag, carried per-plane on the worklist
+	   (w->potato/w->ld) so the master+slave draw halves read no shared per-plane global.
+	   DoomJo never sets sat_ceil_* (default 0) -> byte-identical there. */
+	int is_ceil = (pl->height > viewz);
+	int eff_potato = is_ceil ? sat_ceil_potato : sat_potato_floors;
+	int eff_ld     = is_ceil ? sat_ceil_ld     : sat_floor_ld;
+	if (eff_potato) sat_floor_color = R_FlatPotatoColor(lumpnum);  /* dominant/avg, cached */
 	RP_FlatCacheEnter();   /* SATURN PERF Phase-0a: per-visplane flat allocator cost (c P) */
 	ds_source = W_CacheLumpNum(lumpnum, PU_STATIC);
 	RP_FlatCacheLeave();
@@ -1655,16 +1668,17 @@ void R_DrawPlanes (void)
 	   visplane split after the loop (R_DrawPlaneWorklist).  The flat is ALREADY cached, so
 	   the slave never touches the zone allocator; the lump release is DEFERRED (the slave
 	   reads src during the draw) -> done post-loop.  Low-detail keeps the global path. */
-	if ((sat_potato_floors || !detailshift) && plane_worklist_n < MAXVISPLANES)
+	if ((eff_potato || !detailshift) && plane_worklist_n < MAXVISPLANES)
 	{
 	    planework_t *w = &plane_worklist[plane_worklist_n++];
 	    w->pl = pl; w->src = ds_source; w->plzlight = planezlight;
-	    w->plheight = planeheight; w->potato = sat_potato_floors; w->lumpnum = lumpnum;
+	    w->plheight = planeheight; w->potato = eff_potato; w->ld = eff_ld; w->lumpnum = lumpnum;
 	    w->color = sat_floor_color;
 	    continue;
 	}
 #endif
 	RP_MakeSpansEnter();   /* SATURN PERF Phase-0a: R_MakeSpans walk + R_MapPlane (c P) */
+	{ int _save_pf = sat_potato_floors; sat_potato_floors = eff_potato;  /* SATURN M/SQ: per-plane potato for the inline R_MapPlane fallback (worklist-full / low-detail) */
 	for (x=pl->minx ; x<= stop ; x++)
 	{
 	    R_MakeSpans(x,pl->top[x-1],
@@ -1672,6 +1686,7 @@ void R_DrawPlanes (void)
 			pl->top[x],
 			pl->bottom[x]);
 	}
+	sat_potato_floors = _save_pf; }
 	RP_MakeSpansLeave();
 
 	RP_FlatCacheEnter();

@@ -1217,6 +1217,17 @@ int sat_floor_vq_peak = 0;
 /* pari A sizing (per-subsector "all floors/ceilings as VDP1 quads"), surfaced to the overlay. */
 int sat_prof_ss_n = 0, sat_prof_ss_q = 0, sat_prof_ss_qpk = 0, sat_prof_ss_q4pct = 0;
 
+/* SATURN overlay cost control (written by the platform pad; defined here so both ports link).
+   sat_dbg_overlay_mode: 0 = full perf overlay / 1 = fps-only / 2 = off.  Gates the per-frame
+   profiler PRINTS (rows below) AND the expensive RP_PlanePixels rescan, so the fps-only mode
+   measures the TRUE overlay tax (not just the display).
+   sat_prof_planepix: runtime gate for RP_PlanePixels -- a per-visplane, per-COLUMN rescan inside
+   R_DrawPlanes that feeds only the FLR/CLS floor sizer (off the default overlay), and which the
+   code notes "inflates P".  Default 0 = no rescan in normal play; set 1 (pad) only when sizing the
+   non-dominant-floor lever. */
+int sat_dbg_overlay_mode = 0;
+int sat_prof_planepix    = 0;
+
 #if RP_PROF
 /* Read the SH-2 free-running timer (FRC @ 0xFFFFFE12/13).  Read H then L so the
    low byte is latched coherently. */
@@ -1353,6 +1364,10 @@ void RP_PlanePixels(int picnum, int height, int minx, int maxx,
 {
 #if RP_PROF
     unsigned int pix = 0u, vq = 0u;
+    /* SATURN: this per-visplane, per-column rescan is a pure floor-SIZER stat (FLR/CLS) that is
+       off the default overlay and inflates the P it measures.  Skip it unless the sizer is armed
+       AND the overlay is in full mode -- reclaims the rescan every frame in normal play. */
+    if (!sat_prof_planepix || sat_dbg_overlay_mode != 0) return;
     int x, ymin = 255, ymax = -1;
     for (x = minx; x <= maxx; x++)
     {
@@ -1794,9 +1809,14 @@ static void rp_p3_prof_show(void)
     unsigned int bp10 = (sat_wallprep_slave ? prof_wpwait : prof_wallprep) * 10u / 224u;
     unsigned int bw10 = (b10 > bp10) ? (b10 - bp10) : 0u;
     char p[44];
-    snprintf(p, sizeof p, "Bw%u.%u Bp%u.%u P%u.%u M%u.%u        ",
-             bw10/10,bw10%10, bp10/10,bp10%10, p10/10,p10%10, m10/10,m10%10);
-    dbg_print(0, 5, p);
+    /* row 2: render phase split Bw/Bp/P/M (the memory-bound generation breakdown).  Printed only
+       in the full overlay (mode 0) -- this runs EVERY frame, so gating it is part of the fps-only
+       overlay-cost measurement.  The histogram/peak folding below stays unconditional (cheap FRT). */
+    if (sat_dbg_overlay_mode == 0) {
+        snprintf(p, sizeof p, "Bw%u.%u Bp%u.%u P%u.%u M%u.%u        ",
+                 bw10/10,bw10%10, bp10/10,bp10%10, p10/10,p10%10, m10/10,m10%10);
+        dbg_print(0, 2, p);
+    }
     /* SATURN PERF (2026-06-24): fold this frame into the window.  Per-PHASE peaks are
        tracked INDEPENDENTLY (Bp and P do not peak on the same frame -> the right basis
        to size each offload); the REC histogram feeds p50/p95 (RP_ProfPercentile); the
@@ -1829,14 +1849,13 @@ static void rp_p3_prof_show(void)
     /* w = master idle waiting for the slave (master FRT): w~0 => the slave keeps up / balanced.
        idle% = the slave's idle share of the render: it works in P, sits idle in B+M -> this is
        the slack masked + wall-prep will fill (it should DROP as each phase is offloaded). */
-    /* nr = MST - render(B+P+M) = the NON-render master cost (blit / game-tic / sound / VDP1 present).
-       Surfaces whether a heavy frame is render-bound (small nr) or dominated by non-render (big nr,
-       seen ~140ms on heavy Doom II maps).  rend is tenths-ms; rp_master_ms is ms. */
-    unsigned int rend_ms = rend / 10u;
-    unsigned int nr_ms   = (rp_master_ms > rend_ms) ? (rp_master_ms - rend_ms) : 0u;
-    snprintf(p, sizeof p, "MST%ums w%u.%u SLVidle%u%% nr%u ",
-             rp_master_ms, w10/10, w10%10, idle, nr_ms);
-    dbg_print(0, 3, p);   /* OVERLAY 2026-06-24: critical-path packed to rows 3-5 */
+    /* row 5: slave occupancy -- SLVidle = the slave's idle share of the render (works in P, idles
+       in B+M), w = master idle waiting for the slave at the plane barrier.  MST and the nr
+       decomposition moved to the platform overlay (rows 0-1, window-averaged).  Full mode only. */
+    if (sat_dbg_overlay_mode == 0) {
+        snprintf(p, sizeof p, "SLVi%u%% w%u.%u        ", idle, w10/10, w10%10);
+        dbg_print(0, 5, p);
+    }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one
        that actually runs (parity disabled), so the setter MUST live here too -- not only in
        the rp_active block.  The full FLAT line (row 13) is hidden behind split viewports, so
