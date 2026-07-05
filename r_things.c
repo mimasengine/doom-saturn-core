@@ -1257,23 +1257,42 @@ void R_SlaveDrawMasked (int x0, int x1)
         R_SlaveDrawSprite (spr);
 }
 
-/* World-things min-size threshold: only offload a sprite to VDP1 when it is magnified enough that
-   the saved software FILL exceeds the VDP1 texture BAKE.  Estimate: bake ~ texture area
-   (patchw*patchh, distance-INDEPENDENT); fill saved ~ SCREEN area = texture area * magnification^2,
-   where magnification = spr->scale/FRACUNIT (screen px per texel).  Break-even magnification^2 ~=
-   bake_rate/fill_rate ~ 2 (VRAM writes ~2x the cached-framebuffer fill), i.e. magnification ~ 1.4.
-   Below it the per-frame bake costs more master time than the fill it removes -> keep it software.
-   Tunable (raise if HW shows the bake dominating; lower if VDP1 headroom is the only limit).
-   HW A/B verdict (E1M2, Ymir): at 140 the path never fires in shareware (scenes have ~0 sprites
-   past 1.4x, THp n0/2).  Dropped to 100 to force it: it then fires cleanly (THp n0/4, occlusion
-   o0.1, no tearing, VDP1 headroom w30%) BUT cannot move the frame -- the whole software sprite
-   fill (SPR fl) is only ~12ms of a ~114ms frame (~11%), the cap is 4, and the median offload is 0,
-   so even a perfect sprite offload tops out ~1 fps; the shareware frame is BSP-prep + present bound
-   (Bp~40 + P~30).  Restored to 140 (net-win-only, never a regression) -- the feature is a HORDE
-   lever, dormant-but-ready: re-measure on a close-range Doom II swarm where the fill can 3-4x and
-   the cap would actually decline (d>0). */
-#define THING_MIN_MAG_PCT 140
-#define THING_MIN_SCALE   ((fixed_t)((long long)FRACUNIT * THING_MIN_MAG_PCT / 100))
+/* World-things offload gate.  Two questions, two different metrics:
+     (a) "is each pixel of this sprite worth offloading?"  -> the VDP1 texture BAKE vs the software
+         FILL it removes.  With the platform TEXTURE CACHE (bake once per lump/colormap/flip, reused
+         while the sprite stays on screen) the bake amortises over the sprite's dwell, so any on-screen
+         sprite is a net win -- the old magnification threshold (bake paid EVERY frame) is obsolete.
+     (b) "does this sprite deserve one of the scarce VDP1 slots (cap/VRAM/cmd)?"  -> its ABSOLUTE
+         on-screen AREA (= software fill it saves = wpx*hpx).  A tiny close pickup (armour helmet)
+         passes any magnification test but covers ~nothing, yet would steal a slot from a big monster
+         behind it.  So the gate is: area >= a %-of-view FLOOR.
+     (c) "how many enemies can we take?"  -> the cache made the scarce resource DISTINCT TEXTURES,
+         not sprite count: N enemies of the same type+facing share ONE (lump,cmap) = ONE slot.  So
+         the sat_thing_cap slots are GRANTED to the distinct textures with the largest sprite, and
+         then EVERY above-floor sprite using a granted texture rides free -> a horde of one type
+         offloads WHOLESALE for a few bakes.  THIS is what turns "more enemies" into a win.
+   THING_MIN_SCREEN_PCT = min sprite area as a percent of the view area (excludes tiny pickups).
+   THING_TEX_TRACK      = max distinct (lump,cmap) textures tracked per frame for the slot grant. */
+#define THING_MIN_SCREEN_PCT 2
+#define THING_TEX_TRACK      32
+
+/* On-screen area (wpx*hpx = the software fill this sprite would cost) or -1 if it must stay
+   software (fuzz/shadow, other-player translation, degenerate).  Shared by the two selection
+   passes; W_CacheLumpNum here is a cheap cache hit (the patch is (re)cached for the software draw
+   anyway). */
+static long R_ThingScreenArea (vissprite_t *spr)
+{
+    int      patchw, wpx, hpx;
+    patch_t *patch;
+    if (!spr->colormap)                  return -1;   /* fuzz/shadow -> software */
+    if (spr->mobjflags & MF_TRANSLATION) return -1;   /* other-player colour -> software */
+    patchw = spritewidth[spr->patch] >> FRACBITS;
+    if (patchw < 1) return -1;
+    patch = W_CacheLumpNum (spr->patch+firstspritelump, PU_CACHE);
+    wpx = (int)(((long long)patchw * spr->scale) >> FRACBITS);                if (wpx < 1) wpx = 1;
+    hpx = (int)(((long long)SHORT(patch->height) * spr->scale) >> FRACBITS);  if (hpx < 1) hpx = 1;
+    return (long)wpx * hpx;
+}
 
 /* SATURN world-things-on-VDP1: emit the world sprites to the VDP1 prio-7 layer (platform
    sat_thing_hook) at the post-BSP kick, before the end-of-planes present.  vissprites are
@@ -1305,23 +1324,51 @@ void R_EmitWorldThingsVDP1 (void)
     memset (sat_thing_vdp1, 0, (size_t)(vissprite_p - vissprites));
     memset (sat_thing_elig, 0, (size_t)(vissprite_p - vissprites));
 
-    /* PASS 1 (NEAR -> far, reverse list): the VDP1 texture pool holds only sat_thing_cap sprites/
-       frame (VRAM), so spend them on the NEAREST (biggest on-screen fill = the real offload win);
-       mark them eligible.  Cheap filters only -- occlusion is resolved in pass 2. */
+    /* PASS 1: GRANT the sat_thing_cap slots to the distinct (lump,cmap) TEXTURES with the largest
+       sprite, then mark eligible EVERY above-floor sprite using a granted texture (the platform
+       cache shares one baked slot across all of them).  A horde of one enemy type -> a few bakes,
+       the whole crowd off the software fill.  Sprites below the %-view floor (tiny pickups) stay
+       software.  Occlusion is resolved per-sprite in pass 2. */
     {
-	int n_elig = 0;
-	for (spr = vsprsortedhead.prev ; spr != &vsprsortedhead && n_elig < sat_thing_cap ; spr = spr->prev)
+	int           cap = sat_thing_cap;  if (cap > THING_TEX_TRACK) cap = THING_TEX_TRACK;
+	long          area_floor = (long)viewwidth * viewheight * THING_MIN_SCREEN_PCT / 100;
+	int           tk_lump[THING_TEX_TRACK];
+	lighttable_t *tk_cmap[THING_TEX_TRACK];
+	long          tk_area[THING_TEX_TRACK];        /* largest sprite area seen per distinct texture */
+	char          tk_grant[THING_TEX_TRACK];
+	int           ntk = 0, i, g;
+
+	/* fold every above-floor sprite into its distinct-texture record (keep the max area) */
+	for (spr = vsprsortedhead.next ; spr != &vsprsortedhead ; spr = spr->next)
 	{
-	    int idx = spr - vissprites;
-	    /* min-size: below the break-even magnification the bake outweighs the fill saved.  The list
-	       is near->far here (scale descending) so once one is too small, all farther ones are too. */
-	    if ((spr->scale >> detailshift) < THING_MIN_SCALE) break;
+	    long area = R_ThingScreenArea (spr);
+	    int  j;
+	    if (area < area_floor) continue;             /* ineligible (-1) or below the floor -> software */
+	    for (j = 0 ; j < ntk ; j++)
+		if (tk_lump[j] == spr->patch && tk_cmap[j] == spr->colormap) break;
+	    if (j < ntk) { if (area > tk_area[j]) tk_area[j] = area; }
+	    else if (ntk < THING_TEX_TRACK)
+	    { tk_lump[ntk] = spr->patch; tk_cmap[ntk] = spr->colormap; tk_area[ntk] = area; tk_grant[ntk] = 0; ntk++; }
+	}
+	/* grant the cap distinct textures with the largest sprite (biggest fill per slot) */
+	for (g = 0 ; g < cap ; g++)
+	{
+	    int best = -1;
+	    for (i = 0 ; i < ntk ; i++)
+		if (!tk_grant[i] && (best < 0 || tk_area[i] > tk_area[best])) best = i;
+	    if (best < 0) break;
+	    tk_grant[best] = 1;
+	}
+	/* mark eligible every above-floor sprite whose texture was granted */
+	for (spr = vsprsortedhead.next ; spr != &vsprsortedhead ; spr = spr->next)
+	{
+	    int  idx = spr - vissprites, j;
+	    long area = R_ThingScreenArea (spr);
 	    if (idx < 0 || idx >= MAXVISSPRITES) continue;
-	    if (!spr->colormap)                  continue;   /* fuzz/shadow -> software */
-	    if (spr->mobjflags & MF_TRANSLATION) continue;   /* other-player colour -> software */
-	    if ((spritewidth[spr->patch] >> FRACBITS) < 1) continue;
-	    sat_thing_elig[idx] = 1;
-	    n_elig++;
+	    if (area < area_floor) continue;
+	    for (j = 0 ; j < ntk ; j++)
+		if (tk_lump[j] == spr->patch && tk_cmap[j] == spr->colormap) break;
+	    if (j < ntk && tk_grant[j]) sat_thing_elig[idx] = 1;
 	}
     }
 
