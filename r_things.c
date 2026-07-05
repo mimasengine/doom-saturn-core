@@ -86,6 +86,10 @@ int		sat_psprite_yoff = 0;
 void (*sat_psprite_begin)(void) = 0;
 void (*sat_psprite_hook)(patch_t *patch, int lump, int sx, int sy, int flip,
                          const unsigned char *cmap) = 0;
+/* SATURN: 1 = the platform calls R_DrawPlayerSprites EARLY (before the VDP1 end-of-planes
+   present) so the weapon lands on the VDP1 sprite layer this frame; R_DrawMasked then skips
+   the late software psprite draw.  0 on DoomJo / when the weapon stays software. */
+int sat_psprite_early = 0;
 
 lighttable_t**	spritelights;
 
@@ -327,6 +331,8 @@ void R_InitSprites (char** namelist)
 //
 void R_ClearSprites (void)
 {
+    extern void RP_SprReset(void);   /* SATURN sprite-cost profiler: zero the per-frame timers */
+    RP_SprReset();
     vissprite_p = vissprites;
 }
 
@@ -422,8 +428,10 @@ R_DrawVisSprite
     int			texturecolumn;
     fixed_t		frac;
     patch_t*		patch;
-	
-	
+    /* SATURN sprite-cost profiler: bracket the per-column masked FILL (master half). */
+    extern void RP_SprFillEnter(void); extern void RP_SprFillLeave(void);
+    RP_SprFillEnter();
+
     patch = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
 
     dc_colormap = vis->colormap;
@@ -467,6 +475,7 @@ R_DrawVisSprite
     }   /* end g_mask_x1 block */
 
     colfunc = basecolfunc;
+    RP_SprFillLeave();
 }
 
 
@@ -662,8 +671,15 @@ void R_AddSprites (sector_t* sec)
 	spritelights = scalelight[lightnum];
 
     // Handle all things in sector.
-    for (thing = sec->thinglist ; thing ; thing = thing->snext)
-	R_ProjectSprite (thing);
+    /* SATURN sprite-cost profiler: bracket the projection (folded into Bw today). */
+    {
+	extern void RP_SprProjEnter(void); extern void RP_SprProjLeave(int);
+	int _n = 0;
+	RP_SprProjEnter();
+	for (thing = sec->thinglist ; thing ; thing = thing->snext)
+	{ R_ProjectSprite (thing); _n++; }
+	RP_SprProjLeave(_n);
+    }
 }
 
 
@@ -1254,7 +1270,10 @@ void R_DrawMasked (void)
     
     // draw the psprites on top of everything
     //  but does not draw on side views
-    if (!viewangleoffset)		
+    /* SATURN: when sat_psprite_early is set, the platform draws the player sprites EARLY (right
+       after the BSP walk, before the VDP1 present at end-of-planes) via the sat_psprite_hook so
+       the weapon lands on the VDP1 layer this frame -- skip the (late) software draw here. */
+    if (!viewangleoffset && !sat_psprite_early)
 	R_DrawPlayerSprites ();
 }
 

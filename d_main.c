@@ -182,6 +182,34 @@ unsigned int sat_spl_sw = 0, sat_spl_v0 = 0, sat_spl_v1 = 0, sat_spl_kick = 0;
 unsigned int sat_spl_v2 = 0, sat_spl_v3 = 0;   /* SATURN: per-view render ms for views 2/3 (3/4p) */
 int sat_split_view = 0;                         /* SATURN: current split view index (0..3); set in D_Display */
 
+/* SATURN (VDP1 weapon, split-screen): emit EVERY split view's player weapon into the shared VDP1
+   command bank.  The platform calls this from sat_walls_kick -- after the accumulated walls are
+   drained into the bank, before the closing JUMP -- so all views' weapons ride the ONE split
+   present.  Geometry MIRRORS the split render loop in D_Display (keep in sync).  Each view points
+   viewplayer at players[i] + R_SetViewWindow(its viewport); R_DrawPlayerSprites then emits via the
+   VDP1 hook, which adds the per-view framebuffer offset (viewwindowx/y) + a FUNC_UserClip so the
+   weapon stays inside its quadrant.  1p uses R_DrawPlayerSprites directly -- this is split-only. */
+void R_DrawSplitPlayerSprites (void)
+{
+    extern player_t *viewplayer;
+    extern void R_SetViewWindow (int wx, int wy, int w, int h);
+    void R_DrawPlayerSprites (void);
+    int n = sat_local_players; if (n > 4) n = 4;
+    int twop = (n == 2);
+    int hw = SCREENWIDTH / 2;
+    int fh = twop ? (SCREENHEIGHT - 64) : (SCREENHEIGHT / 2 - HUD4P_H);
+    static const short vpx[4] = { 0, 160, 0, 160 };
+    static const short vpy[4] = { 0, 0, 112, 112 };
+    int i;
+    for (i = 0; i < n; i++)
+    {
+        if (!players[i].mo) continue;
+        viewplayer = &players[i];
+        R_SetViewWindow (vpx[i], twop ? 0 : vpy[i], hw, fh);
+        R_DrawPlayerSprites ();
+    }
+}
+
 void D_Display (void)
 {
     static  boolean		viewactivestate = false;

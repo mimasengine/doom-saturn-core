@@ -1347,6 +1347,59 @@ void RP_MakeSpansLeave(void) {
 #endif
 }
 
+/* SATURN sprite-cost profiler (SCU-DSP feasibility study, deliverable #1): isolate
+   sprite PROJECTION (R_ProjectSprite -- folded into Bw during the BSP walk today)
+   from sprite FILL (R_DrawVisSprite -- folded into M with masked walls today).  These
+   are the two halves the DSP question hinges on: the DSP could only do the arithmetic
+   PROJECTION, never the memory-bound FILL.  MASTER-side only (rp_frt clock, 224 ticks/
+   ms).  With sat_masked_parallel=1 (ship) the fill number is the master's LEFT-HALF
+   share; the slave draws the right half untimed here -- so total fill ~= 2x prof_spr_fill
+   (or read the existing M row).  Projection is master-only always, so it is complete.
+   All bodies compile out unless RP_PROF -> DoomJo and shipping builds link empty stubs. */
+static unsigned int   prof_spr_proj, prof_spr_fill;   /* accumulated FRT ticks, this frame */
+static unsigned short prof_spr_pj0,  prof_spr_fl0;
+static int            prof_spr_n, prof_spr_draw;       /* things projected / vissprites filled */
+void RP_SprReset(void) {
+#if RP_PROF
+    prof_spr_proj = prof_spr_fill = 0; prof_spr_n = prof_spr_draw = 0;
+#endif
+}
+void RP_SprProjEnter(void) {
+#if RP_PROF
+    prof_spr_pj0 = rp_frt();
+#endif
+}
+void RP_SprProjLeave(int nthings) {
+#if RP_PROF
+    prof_spr_proj += (unsigned short)(rp_frt() - prof_spr_pj0);
+    prof_spr_n += nthings;
+#else
+    (void)nthings;
+#endif
+}
+void RP_SprFillEnter(void) {
+#if RP_PROF
+    prof_spr_fl0 = rp_frt();
+#endif
+}
+void RP_SprFillLeave(void) {
+#if RP_PROF
+    prof_spr_fill += (unsigned short)(rp_frt() - prof_spr_fl0);
+    prof_spr_draw++;
+#endif
+}
+/* getter for the platform overlay: tenths-ms (proj, fill) + counts (things, draws). */
+void RP_SprStats(int *proj10, int *fill10, int *nproj, int *ndraw) {
+#if RP_PROF
+    *proj10 = (int)(prof_spr_proj * 10u / 224u);
+    *fill10 = (int)(prof_spr_fill * 10u / 224u);
+    *nproj  = prof_spr_n;
+    *ndraw  = prof_spr_draw;
+#else
+    *proj10 = *fill10 = *nproj = *ndraw = 0;
+#endif
+}
+
 /* SATURN PERF (RBG0 candidate sizing, profiler).  Walk the visplane's span pixels
    (O(width) per visplane -- bounded by, and cheaper than, its R_MakeSpans cost) and
    fold them into the total + the running same-(picnum,height) group.  A key change

@@ -49,6 +49,13 @@ sector_t*	backsector;
 drawseg_t	drawsegs[MAXDRAWSEGS];
 drawseg_t*	ds_p;
 
+/* SATURN: running high-water of drawsegs used (ds_p - drawsegs), folded once per pass in
+   R_ClearDrawSegs -- a mirror of r_visplane_peak.  Read + zeroed each window by the platform
+   "limits" overlay (dg_saturn.cxx) to catch how close a big WAD gets to the MAXDRAWSEGS
+   I_Error hard-halt (see docs/ENDGAME_ROADMAP.md Axis 2).  Running max, reset at the overlay
+   window boundary; harmless when unread (0). */
+int		r_drawseg_peak = 0;
+
 
 void
 R_StoreWallRange
@@ -68,6 +75,8 @@ void RP_FlushWalls (void);
 //
 void R_ClearDrawSegs (void)
 {
+    int n = (int)(ds_p - drawsegs);          /* SATURN: fold the prior pass's count into the peak */
+    if (n > r_drawseg_peak) r_drawseg_peak = n;
     ds_p = drawsegs;
 }
 
