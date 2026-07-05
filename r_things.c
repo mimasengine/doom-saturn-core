@@ -1263,7 +1263,15 @@ void R_SlaveDrawMasked (int x0, int x1)
    where magnification = spr->scale/FRACUNIT (screen px per texel).  Break-even magnification^2 ~=
    bake_rate/fill_rate ~ 2 (VRAM writes ~2x the cached-framebuffer fill), i.e. magnification ~ 1.4.
    Below it the per-frame bake costs more master time than the fill it removes -> keep it software.
-   Tunable (raise if HW shows the bake dominating; lower if VDP1 headroom is the only limit). */
+   Tunable (raise if HW shows the bake dominating; lower if VDP1 headroom is the only limit).
+   HW A/B verdict (E1M2, Ymir): at 140 the path never fires in shareware (scenes have ~0 sprites
+   past 1.4x, THp n0/2).  Dropped to 100 to force it: it then fires cleanly (THp n0/4, occlusion
+   o0.1, no tearing, VDP1 headroom w30%) BUT cannot move the frame -- the whole software sprite
+   fill (SPR fl) is only ~12ms of a ~114ms frame (~11%), the cap is 4, and the median offload is 0,
+   so even a perfect sprite offload tops out ~1 fps; the shareware frame is BSP-prep + present bound
+   (Bp~40 + P~30).  Restored to 140 (net-win-only, never a regression) -- the feature is a HORDE
+   lever, dormant-but-ready: re-measure on a close-range Doom II swarm where the fill can 3-4x and
+   the cap would actually decline (d>0). */
 #define THING_MIN_MAG_PCT 140
 #define THING_MIN_SCALE   ((fixed_t)((long long)FRACUNIT * THING_MIN_MAG_PCT / 100))
 
