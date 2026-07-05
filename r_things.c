@@ -1270,11 +1270,17 @@ void R_DrawMasked (void)
     
     // draw the psprites on top of everything
     //  but does not draw on side views
-    /* SATURN: when sat_psprite_early is set, the platform draws the player sprites EARLY (right
-       after the BSP walk, before the VDP1 present at end-of-planes) via the sat_psprite_hook so
-       the weapon lands on the VDP1 layer this frame -- skip the (late) software draw here. */
-    if (!viewangleoffset && !sat_psprite_early)
-	R_DrawPlayerSprites ();
+    /* SATURN: skip the (late) SOFTWARE psprite draw only when the VDP1 weapon path will actually
+       emit it this frame -- sat_psprite_early AND (1p, always kicked | split with VDP1 walls on,
+       which is the only split path that runs sat_walls_kick).  A SOFTWARE-wall split (sat_split_vdp1
+       off) never kicks VDP1, so it MUST keep the software weapon here -> no missing weapon when
+       SAT_WPN_VDP1 is default-on. */
+    {
+	extern int sat_split_active, sat_split_vdp1;
+	int vdp1_will_emit = sat_psprite_early && (!sat_split_active || sat_split_vdp1);
+	if (!viewangleoffset && !vdp1_will_emit)
+	    R_DrawPlayerSprites ();
+    }
 }
 
 
