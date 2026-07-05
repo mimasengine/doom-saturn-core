@@ -1273,16 +1273,23 @@ void R_SlaveDrawMasked (int x0, int x1)
          offloads WHOLESALE for a few bakes.  THIS is what turns "more enemies" into a win.
    THING_MIN_SCREEN_PCT = min sprite area as a percent of the view area (excludes tiny pickups).
    THING_TEX_TRACK      = max distinct (lump,cmap) textures tracked per frame for the slot grant.
-   THING_EMIT_MAX       = max THINGS emitted to VDP1 per frame.  This is the VDP1 RASTER bound, NOT
-     the VRAM/texture bound: the VDP1 (1-cycle-auto) plots the whole command list in one frame and
-     DROPS the tail if it overruns -- and a dropped thing VANISHES (the software fill was already
-     skipped when the platform accepted it) = enemy flicker.  The wall list already uses ~40% of the
-     VDP1 raster, so only a handful of thing quads fit before overrun.  Cap the emitted count (the
-     largest-area sprites win the slots) so the rest stay software = drawn correctly, no flicker.
-     Tunable: raise while D% (VDP1 done-rate) stays >=90% and no flicker; lower if enemies drop. */
+   THING_EMIT_MAX       = HARD max THINGS emitted to VDP1 per frame (array bound + outdoor ceiling).
+     This is the VDP1 RASTER bound, NOT the VRAM/texture bound: the VDP1 (1-cycle-auto) plots the
+     whole command list in one frame and DROPS the tail if it overruns -- and a dropped thing
+     VANISHES (the software fill was already skipped when the platform accepted it) = enemy flicker.
+     The walls SHARE that raster, and their share varies wildly (open outdoor = few segs, spare VDP1;
+     tech room = dense architecture = VDP1 already near full -- flickered at only th4!).  So the
+     ACTUAL per-frame cap is sat_thing_emit_cap, which the platform AIMD-adapts on the real overrun
+     signal (grow when the plot finished, back off when it overran): it climbs outdoors and shrinks
+     below the flicker threshold in the tech room automatically.  THING_EMIT_MAX just bounds the top
+     end (and the selection scratch arrays); the rest stay software = drawn correctly, no flicker. */
 #define THING_MIN_SCREEN_PCT 2
 #define THING_TEX_TRACK      32
-#define THING_EMIT_MAX       6
+#define THING_EMIT_MAX       16
+
+/* Per-frame VDP1 things budget -- AIMD-adapted by the platform on the VDP1 overrun signal
+   (sat_walls_kick), clamped to [0, THING_EMIT_MAX] by PASS 1.  Shared with the platform. */
+int sat_thing_emit_cap = 4;
 
 /* On-screen area (wpx*hpx = the software fill this sprite would cost) or -1 if it must stay
    software (fuzz/shadow, other-player translation, degenerate).  Shared by the two selection
@@ -1367,14 +1374,18 @@ void R_EmitWorldThingsVDP1 (void)
 	    if (best < 0) break;
 	    tk_grant[best] = 1;
 	}
-	/* mark eligible the THING_EMIT_MAX LARGEST sprites among the granted textures (VDP1 raster
-	   bound -- see THING_EMIT_MAX).  Top-N insertion by area; the rest stay software (drawn
-	   correctly, no flicker).  A same-type horde still shares one baked slot for its emitted few. */
+	/* mark eligible the emax LARGEST sprites among the granted textures, where emax is the
+	   platform's adaptive VDP1-raster budget (sat_thing_emit_cap, clamped to THING_EMIT_MAX).
+	   Top-N insertion by area; the rest stay software (drawn correctly, no flicker).  A same-type
+	   horde still shares one baked slot for its emitted few. */
 	{
+	    int  emax = sat_thing_emit_cap;
+	    if (emax > THING_EMIT_MAX) emax = THING_EMIT_MAX;
+	    if (emax < 0)              emax = 0;
 	    int  em_idx[THING_EMIT_MAX];
 	    long em_area[THING_EMIT_MAX];
 	    int  nem = 0, k;
-	    for (spr = vsprsortedhead.next ; spr != &vsprsortedhead ; spr = spr->next)
+	    for (spr = vsprsortedhead.next ; emax > 0 && spr != &vsprsortedhead ; spr = spr->next)
 	    {
 		int  idx = spr - vissprites, j;
 		long area = R_ThingScreenArea (spr);
@@ -1383,12 +1394,12 @@ void R_EmitWorldThingsVDP1 (void)
 		for (j = 0 ; j < ntk ; j++)
 		    if (tk_lump[j] == spr->patch && tk_cmap[j] == spr->colormap) break;
 		if (j >= ntk || !tk_grant[j]) continue;   /* texture not granted -> software */
-		if (nem < THING_EMIT_MAX) {               /* insert (ascending, em_area[0] = smallest) */
+		if (nem < emax) {                         /* insert (ascending, em_area[0] = smallest) */
 		    for (k = nem ; k > 0 && em_area[k-1] > area ; k--)
 		    { em_area[k] = em_area[k-1]; em_idx[k] = em_idx[k-1]; }
 		    em_area[k] = area; em_idx[k] = idx; nem++;
 		} else if (area > em_area[0]) {           /* drop the smallest, insert */
-		    for (k = 1 ; k < THING_EMIT_MAX && em_area[k] < area ; k++)
+		    for (k = 1 ; k < emax && em_area[k] < area ; k++)
 		    { em_area[k-1] = em_area[k]; em_idx[k-1] = em_idx[k]; }
 		    em_area[k-1] = area; em_idx[k-1] = idx;
 		}
