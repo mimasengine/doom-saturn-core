@@ -156,14 +156,18 @@ static boolean BuildNewTic(void)
 
     if (new_sync)
     {
-       // If playing single player, do not allow tics to buffer
-       // up very far
+       // SATURN: single-player used to hard-cap here at gametic+2, which throttled
+       // TryRunTics (new_sync: counts = availabletics = maketic - gametic) to ~2 tics
+       // per FRAME.  Below ~17 fps (2 tics x 17 < 35 tics/s) the game clock then falls
+       // permanently behind real time -- and after a render spike (a 260ms frame = ~9
+       // elapsed tics, run 2) it loses the rest for good -- so the WHOLE GAME runs in
+       // SLOW MOTION, worse the lower the fps, invisible to the fps counter.  Use the
+       // general +8 cap so the game runs the actual elapsed tics per frame and holds
+       // true 35Hz speed down to ~4 fps (choppier at low fps, but CORRECT SPEED).  It
+       // never runs AHEAD (maketic tracks real time, never exceeds it); the realtics>10
+       // clamp in TryRunTics -- not this cap -- is the hang-guard against a garbage clock.
 
-       if (!net_client_connected && maketic - gameticdiv > 2)
-           return false;
-
-       // Never go more than ~200ms ahead
-
+       // Never go more than ~200ms (8 tics) ahead
        if (maketic - gameticdiv > 8)
            return false;
     }
