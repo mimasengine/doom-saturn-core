@@ -1180,6 +1180,18 @@ static void R_RenderViewPass (int last_pass)
        In split-screen (sat_split_active) the VDP1 hybrid is off (it is single-view) -> no kick. */
     if (last_pass && sat_walls_done_hook && !sat_split_active) sat_walls_done_hook ();
 
+    /* SATURN split world-things-on-VDP1: in split the kick above is skipped (d_main.c kicks ONCE
+       after ALL views), but vissprites/drawsegs/view window are per-view state that is gone by
+       then -- so emit THIS view's world sprites NOW.  The platform hook queues them (and bakes
+       their textures into the tear-safe next-parity slots); the d_main kick flushes the queue
+       AFTER the walls, keeping the 1p painter order (walls -> things -> weapon).  Gated like the
+       split wall emit (sat_split_vdp1); R_EmitWorldThingsVDP1 re-checks hook/skip/hw itself. */
+    if (last_pass && sat_split_active && sat_split_vdp1)
+    {
+	extern void R_EmitWorldThingsVDP1 (void);
+	R_EmitWorldThingsVDP1 ();
+    }
+
     V_Canary ("bsp");
 
     // Check for new console commands.

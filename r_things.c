@@ -1485,22 +1485,23 @@ static long R_ThingScreenArea (vissprite_t *spr)
    math: sprtopscreen for the top, spr->scale for the size) and the unclamped left edge
    x1full, then hand it to the platform.  Sprites the platform takes are marked so R_DrawMasked
    skips their software fill; fuzz/translated and platform-declined sprites stay software.
-   Called by the platform kick (extern "C").  1p only -- split clears sprites per view, so the
-   single post-loop kick would only see the last view's list (things stay software in split). */
+   1p: called by the platform kick (extern "C") after the walls flush -> direct emit.
+   VDP1-split: called PER VIEW from R_RenderViewPass (the walls flush only at the d_main.c
+   post-loop kick) while THIS view's vissprites/drawsegs/window are live; the platform hook
+   detects split and QUEUES the commands (bake immediate, tear-safe next-parity slots), then
+   flushes them after the walls at the kick -- painter order stays walls -> things -> weapon. */
 void R_EmitWorldThingsVDP1 (void)
 {
     vissprite_t*	spr;
     extern int		sat_wall_skip;
-    extern int		sat_split_active;
     extern int		sat_things_hw;
     extern int		viewwindowx, viewwindowy;
 
     sat_things_emitted = 0;
     sat_things_occ = 0;
-    if (!sat_thing_hook || !sat_wall_skip || !sat_things_hw || viewangleoffset || sat_split_active)
+    if (!sat_thing_hook || !sat_wall_skip || !sat_things_hw || viewangleoffset)
 	return;                                   /* path inactive this view -> software sprites.
-	   split: the single post-loop kick fires with sat_split_active still 1 and only the LAST
-	   view's sprites/window live -> emitting here would double + mis-place them, so 1p only. */
+	   (split: sat_wall_skip is 0 unless sat_split_vdp1, so software-split stays software) */
     if (vissprite_p == vissprites)
     { sat_things_emitted = 1; return; }           /* no sprites, but path active -> R_DrawMasked skips its (empty) loop */
 
