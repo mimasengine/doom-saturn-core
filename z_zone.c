@@ -267,14 +267,33 @@ Z_Malloc
             //   st = unpurgeable PU_STATIC bytes, lv = PU_LEVEL bytes (the floor)  -> fr<size = EXHAUSTION
             memblock_t* b;
             int st = 0, lv = 0;
+            /* SATURN forensics (regression hunt): while summing residents, capture the 8
+               biggest so a wall that GREW/APPEARED stands out next to the halt (printed to
+               the boot console).  ra on the halt line = the caller that requested `size`
+               (resolve against build/Mimas.map to name the victim alloc).  Tags:
+               1=STATIC 2=SOUND 3=MUSIC 50=LEVEL 51=LEVSPEC. */
+            int t_sz[8] = {0}, t_tag[8] = {0}, t_off[8] = {0};
             for (b = mainzone->blocklist.next ; b != &mainzone->blocklist ; b = b->next)
             {
                 if (b->tag == PU_FREE || b->tag >= PU_PURGELEVEL)   continue;
                 else if (b->tag == PU_LEVEL || b->tag == PU_LEVSPEC) lv += b->size;
                 else                                                 st += b->size;
+                if (b->size > t_sz[7])   /* insertion into the descending top-8 */
+                {
+                    int j = 7;
+                    while (j > 0 && t_sz[j-1] < b->size)
+                    { t_sz[j]=t_sz[j-1]; t_tag[j]=t_tag[j-1]; t_off[j]=t_off[j-1]; j--; }
+                    t_sz[j]  = b->size;
+                    t_tag[j] = b->tag;
+                    t_off[j] = (int)((char*)b - (char*)mainzone);
+                }
             }
-            I_Error ("Z_Malloc fail %i (fr%dK lg%dK st%dK lv%dK)",
-                     size, Z_FreeMemory()>>10, Z_LargestAllocatable()>>10,
+            printf("ZONE top8 resident (KB t=tag @KB from base):\n");
+            for (int i = 0 ; i < 8 && t_sz[i] ; i++)
+                printf(" %2dK t%d @%dK\n", t_sz[i]>>10, t_tag[i], t_off[i]>>10);
+            I_Error ("Zmalloc fail %i t%d ra=%p (fr%dK lg%dK st%dK lv%dK)",
+                     size, tag, __builtin_return_address(0),
+                     Z_FreeMemory()>>10, Z_LargestAllocatable()>>10,
                      st>>10, lv>>10);
         }
 

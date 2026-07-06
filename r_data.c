@@ -222,6 +222,10 @@ R_DrawColumnInCache
 
 
 //
+// SATURN R4: build a texture's per-column directory lazily + purgeable (defined below,
+// after R_GenerateLookup, which it drives).  Replaces the ~157K PU_STATIC upfront directory.
+static void R_EnsureLookup (int tex);
+
 // R_GenerateComposite
 // Using the texture definition,
 //  the composite texture is created from the patches,
@@ -243,6 +247,13 @@ void R_GenerateComposite (int texnum)
     unsigned short*	colofs;
 	
     texture = textures[texnum];
+
+    // SATURN R4: build the column directory + compositesize if never built or purged, then
+    // PIN it PU_STATIC across the composite alloc below (which can purge PU_CACHE) -- we read
+    // collump/colofs from it after the alloc.  Unpinned at the end.
+    R_EnsureLookup (texnum);
+    Z_ChangeTag (texturecolumnlump[texnum], PU_STATIC);
+    Z_ChangeTag (texturecolumnofs[texnum],  PU_STATIC);
 
     // SATURN: in CD-streaming mode build the composite into the bounded LRU
     // texture cache (recency-evicted, capped) instead of the main zone, so the
@@ -305,6 +316,10 @@ void R_GenerateComposite (int texnum)
     // zone purger, so they are left alone here.
     if (!cached)
 	Z_ChangeTag (block, PU_CACHE);
+
+    // SATURN R4: unpin the directory -- purgeable again.
+    Z_ChangeTag (texturecolumnlump[texnum], PU_CACHE);
+    Z_ChangeTag (texturecolumnofs[texnum],  PU_CACHE);
 }
 
 
@@ -395,6 +410,29 @@ void R_GenerateLookup (int texnum)
 }
 
 
+// SATURN R4 (memory diet): lazily build ONE texture's per-column directory.  The full set
+// (texturecolumnlump[]/texturecolumnofs[], 4*Sum(width) ~= 157K on Doom II) used to be built
+// PU_STATIC at R_InitTextures -- a permanent zone wall that fragmented big-WAD level loads
+// (Doom II MAP13 P_LoadSegs OOM: 245K free but no 57K contiguous run).  Now each texture's
+// directory is built on first R_GetColumn/R_GenerateComposite and left PU_CACHE (purgeable),
+// so Z_Malloc reclaims it under pressure.  Kept PU_STATIC only while R_GenerateLookup fills it
+// (its patchcount alloc must not purge the half-built directory), then demoted to PU_CACHE.
+static void R_EnsureLookup (int tex)
+{
+    texture_t* t;
+    if (texturecolumnlump[tex] && texturecolumnofs[tex])
+	return;					  // already resident
+    t = textures[tex];
+    if (!texturecolumnlump[tex])
+	texturecolumnlump[tex] = Z_Malloc (t->width*sizeof(**texturecolumnlump), PU_STATIC, &texturecolumnlump[tex]);
+    if (!texturecolumnofs[tex])
+	texturecolumnofs[tex]  = Z_Malloc (t->width*sizeof(**texturecolumnofs),  PU_STATIC, &texturecolumnofs[tex]);
+    R_GenerateLookup (tex);			  // fills both + compositesize; safe while PU_STATIC
+    Z_ChangeTag (texturecolumnlump[tex], PU_CACHE);
+    Z_ChangeTag (texturecolumnofs[tex],  PU_CACHE);
+}
+
+
 
 
 //
@@ -409,6 +447,7 @@ R_GetColumn
     int		ofs;
 	
     col &= texturewidthmask[tex];
+    R_EnsureLookup (tex);   // SATURN R4: build the directory on first use (or after a purge)
     lump = texturecolumnlump[tex][col];
     ofs = texturecolumnofs[tex][col];
     
@@ -733,8 +772,13 @@ void R_InitTextures (void)
 			 texture->name);
 	    }
 	}		
-	texturecolumnlump[i] = Z_Malloc (texture->width*sizeof(**texturecolumnlump), PU_STATIC,0);
-	texturecolumnofs[i] = Z_Malloc (texture->width*sizeof(**texturecolumnofs), PU_STATIC,0);
+	// SATURN R4 (memory diet): the per-texture column directory (4*Sum(width) ~= 157K PU_STATIC
+	// on Doom II) is NOT built up front any more -- it fragmented big-WAD level loads
+	// (P_LoadSegs OOM).  Left lazy; built purgeable on first use by R_EnsureLookup.
+	texturecolumnlump[i]    = 0;
+	texturecolumnofs[i]     = 0;
+	texturecomposite[i]     = 0;
+	texturecompositesize[i] = 0;
 
 	j = 1;
 	while (j*2 <= texture->width)
@@ -761,8 +805,8 @@ void R_InitTextures (void)
     
     // Precalculate whatever possible.	
 
-    for (i=0 ; i<numtextures ; i++)
-	R_GenerateLookup (i);
+    // SATURN R4: per-texture column directories are built lazily now (R_EnsureLookup, on first
+    // R_GetColumn/R_GenerateComposite), not all up front -- see the per-texture init above.
     
     // Create translation table for global animation.
     texturetranslation = Z_Malloc ((numtextures+1)*sizeof(*texturetranslation), PU_STATIC, 0);
