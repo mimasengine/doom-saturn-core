@@ -433,6 +433,66 @@ void R_DrawMaskedColumn (column_t* column)
     dc_texturemid = basetexturemid;
 }
 
+/* SATURN sprite-SQ (independent 4th axis, platform sat_sprite_ld / pad R+B): draw ONE masked sprite
+   column with the horizontal WRITE decoupled from the CLIP.  `clip_x` is the projection column whose
+   silhouette clips this run (mfloorclip/mceilingclip[clip_x]); `write_x` is the SCREEN column written;
+   `wide` also writes write_x+1 (the same texels).  Geometry and OCCLUSION stay in the projection's
+   column space -- R_DrawSprite / the drawseg clip / mfloorclip are UNCHANGED -- so the sprite's
+   horizontal resolution is decoupled from the wall/floor detailshift.  Two callers use it:
+     - walls FULL + sprite LD (detailshift==0): step the projection column by 2, wide=1 -> half-res
+       fill (one vertical pass per 2 screen columns), clip shared (<=1px silhouette approx, invisible).
+     - walls LD + sprite FULL (detailshift==1): the projection is halved, so per projection column we
+       write the two screen columns [c<<1, c<<1+1] with DISTINCT texels (two wide=0 calls) -> a full-res
+       sprite over low-detail walls.  Both screen columns legitimately share the half-column clip.
+   NORMAL (light-shaded) columns only; fuzz/translated fall back to full-res in the caller.  Mirrors the
+   master R_DrawColumn inner loop (frac&127 texel, dc_iscale step).  Pure C (DoomJo builds it, never
+   sets sat_sprite_ld). */
+int sat_sprite_ld = 0;   /* 1 = LD software sprites; combines with detailshift for the 4 wall/sprite
+                            quality combos (platform sat_apply_mode). */
+static void R_DrawSpriteCol (column_t* column, int write_x, int clip_x, int wide)
+{
+    extern int   centery;
+    extern byte *ylookup[];
+    extern int   columnofs[];
+    int     topscreen, bottomscreen, count;
+    fixed_t basetexturemid = dc_texturemid;
+    for ( ; column->topdelta != 0xff ; )
+    {
+        topscreen    = sprtopscreen + spryscale*column->topdelta;
+        bottomscreen = topscreen + spryscale*column->length;
+        dc_yl = (topscreen+FRACUNIT-1)>>FRACBITS;
+        dc_yh = (bottomscreen-1)>>FRACBITS;
+        if (dc_yh >= mfloorclip[clip_x])   dc_yh = mfloorclip[clip_x]-1;
+        if (dc_yl <= mceilingclip[clip_x]) dc_yl = mceilingclip[clip_x]+1;
+        if (dc_yh >= viewheight)           dc_yh = viewheight - 1;   /* split-viewport clamp (see R_DrawMaskedColumn) */
+        if (dc_yl < 0)                     dc_yl = 0;
+        if (dc_yl <= dc_yh)
+        {
+            byte   *src  = (byte *)column + 3;
+            byte   *cmap = dc_colormap;
+            fixed_t tm   = basetexturemid - (column->topdelta<<FRACBITS);
+            fixed_t fracstep = dc_iscale;
+            fixed_t frac = tm + (dc_yl-centery)*fracstep;
+            byte   *d0 = ylookup[dc_yl] + columnofs[write_x];
+            count = dc_yh - dc_yl + 1;
+            if (wide)
+            {
+                byte *d1 = ylookup[dc_yl] + columnofs[write_x+1];
+                while (count-- > 0)
+                { byte c = cmap[src[(frac>>FRACBITS)&127]]; *d0 = c; *d1 = c;
+                  d0 += SCREENWIDTH; d1 += SCREENWIDTH; frac += fracstep; }
+            }
+            else
+            {
+                while (count-- > 0)
+                { *d0 = cmap[src[(frac>>FRACBITS)&127]]; d0 += SCREENWIDTH; frac += fracstep; }
+            }
+        }
+        column = (column_t *)((byte *)column + column->length + 4);
+    }
+    dc_texturemid = basetexturemid;
+}
+
 
 
 //
@@ -477,6 +537,45 @@ R_DrawVisSprite
 
     {
     extern int g_mask_x1;   /* SATURN masked-by-half: the master draws sprite columns [0,x1) */
+    /* SATURN sprite-SQ: the sprite's horizontal detail is decoupled from the wall/floor detailshift.
+       NORMAL (light-shaded) columns only -- fuzz/translated keep the full-res colfunc path (rare).
+       Four combos of (walls detailshift, sprite sat_sprite_ld):
+         !ds,!sld -> full  : R_DrawMaskedColumn (colfunc, byte-identical to vanilla)
+         !ds, sld -> LD     : step the projection column by 2, wide -> half-res fill
+          ds,!sld -> FULL over LD walls : per half-column, write the 2 screen cols with distinct texels
+          ds, sld -> LD (rides the low-detail colfunc) : R_DrawMaskedColumn */
+    int normal = dc_colormap && !(vis->mobjflags & MF_TRANSLATION);
+    if (normal && !detailshift && sat_sprite_ld)
+    {   /* walls full, sprite LD: downsample (fill saved) */
+	for (dc_x=vis->x1 ; dc_x<=vis->x2 ; dc_x+=2, frac += (vis->xiscale<<1))
+	{
+	    int wide;
+	    if (dc_x >= g_mask_x1) break;
+	    texturecolumn = frac>>FRACBITS;
+	    if ((unsigned)texturecolumn >= (unsigned)SHORT(patch->width))
+		continue;
+	    column = (column_t *) ((byte *)patch +
+				   LONG(patch->columnofs[texturecolumn]));
+	    wide = (dc_x+1 <= vis->x2) && (dc_x+1 < g_mask_x1);   /* don't spill into the slave's half / off the sprite */
+	    R_DrawSpriteCol (column, dc_x, dc_x, wide);
+	}
+    }
+    else if (normal && detailshift && !sat_sprite_ld)
+    {   /* walls LD, sprite FULL: upsample -- 2 distinct texels per (halved) projection column */
+	for (dc_x=vis->x1 ; dc_x<=vis->x2 ; dc_x++, frac += vis->xiscale)
+	{
+	    int sx, tcL, tcR;
+	    if (dc_x >= g_mask_x1) break;
+	    sx  = dc_x << 1;                                      /* left screen column of this half-column */
+	    tcL = frac >> FRACBITS;
+	    tcR = (frac + (vis->xiscale>>1)) >> FRACBITS;         /* half a projection-column further into the patch */
+	    if ((unsigned)tcL < (unsigned)SHORT(patch->width))
+		R_DrawSpriteCol ((column_t *)((byte *)patch + LONG(patch->columnofs[tcL])), sx,   dc_x, 0);
+	    if ((unsigned)tcR < (unsigned)SHORT(patch->width))
+		R_DrawSpriteCol ((column_t *)((byte *)patch + LONG(patch->columnofs[tcR])), sx+1, dc_x, 0);
+	}
+    }
+    else
     for (dc_x=vis->x1 ; dc_x<=vis->x2 ; dc_x++, frac += vis->xiscale)
     {
 	if (dc_x >= g_mask_x1) break;
@@ -1186,6 +1285,44 @@ static void R_SlaveDrawMaskedColumn (column_t* column)
     s_dc_texturemid = basetexturemid;
 }
 
+/* SATURN sprite-SQ (slave half): the R_DrawSpriteCol twin -- write decoupled from clip (see the master
+   version for the 4-combo rationale).  Normal columns only (s_coltype==0); clip in projection column
+   space (s_mfloorclip/s_mceilingclip[clip_x]).  `wide` also writes write_x+1. */
+static void R_SlaveDrawSpriteCol (column_t* column, int write_x, int clip_x, int wide)
+{
+    int topscreen, bottomscreen, count;
+    fixed_t basetexturemid = s_dc_texturemid;
+    for ( ; column->topdelta != 0xff ; )
+    {
+        topscreen    = s_sprtopscreen + s_spryscale*column->topdelta;
+        bottomscreen = topscreen + s_spryscale*column->length;
+        s_dc_yl = (topscreen+FRACUNIT-1)>>FRACBITS;
+        s_dc_yh = (bottomscreen-1)>>FRACBITS;
+        if (s_dc_yh >= s_mfloorclip[clip_x])   s_dc_yh = s_mfloorclip[clip_x]-1;
+        if (s_dc_yl <= s_mceilingclip[clip_x]) s_dc_yl = s_mceilingclip[clip_x]+1;
+        if (s_dc_yh >= viewheight)             s_dc_yh = viewheight - 1;
+        if (s_dc_yl < 0)                       s_dc_yl = 0;
+        if (s_dc_yl <= s_dc_yh)
+        {
+            byte     *source   = (byte *)column + 3, *colormap = (byte *)s_dc_colormap;
+            unsigned  fracstep = s_dc_iscale<<9;
+            unsigned  frac     = ((basetexturemid - (column->topdelta<<FRACBITS)) + (s_dc_yl-centery)*s_dc_iscale)<<9;
+            byte     *d0 = ylookup[s_dc_yl] + columnofs[write_x];
+            count = s_dc_yh - s_dc_yl + 1;
+            if (wide)
+            {
+                byte *d1 = ylookup[s_dc_yl] + columnofs[write_x+1];
+                while (count-- > 0) { byte c = colormap[source[frac>>25]]; *d0 = c; *d1 = c;
+                                      d0 += SCREENWIDTH; d1 += SCREENWIDTH; frac += fracstep; }
+            }
+            else
+                while (count-- > 0) { *d0 = colormap[source[frac>>25]]; d0 += SCREENWIDTH; frac += fracstep; }
+        }
+        column = (column_t *)((byte *)column + column->length + 4);
+    }
+    s_dc_texturemid = basetexturemid;
+}
+
 static void R_SlaveDrawVisSprite (vissprite_t* vis)
 {
     column_t *column; int texturecolumn; fixed_t frac; patch_t *patch;
@@ -1206,6 +1343,37 @@ static void R_SlaveDrawVisSprite (vissprite_t* vis)
     frac = vis->startfrac;
     s_spryscale = vis->scale;
     s_sprtopscreen = centeryfrac - FixedMul(s_dc_texturemid,s_spryscale);
+    {
+    int normal = (s_coltype == 0);   /* fuzz/translated keep the full-res masked path */
+    if (normal && !detailshift && sat_sprite_ld)
+    {   /* walls full, sprite LD: downsample */
+        for (s_dc_x=vis->x1 ; s_dc_x<=vis->x2 ; s_dc_x+=2, frac += (vis->xiscale<<1))
+        {
+            int wide;
+            if (s_dc_x < s_x0 || s_dc_x >= s_x1) continue;
+            texturecolumn = frac>>FRACBITS;
+            if ((unsigned)texturecolumn >= (unsigned)SHORT(patch->width)) continue;
+            column = (column_t *) ((byte *)patch + LONG(patch->columnofs[texturecolumn]));
+            wide = (s_dc_x+1 <= vis->x2) && (s_dc_x+1 < s_x1);
+            R_SlaveDrawSpriteCol (column, s_dc_x, s_dc_x, wide);
+        }
+    }
+    else if (normal && detailshift && !sat_sprite_ld)
+    {   /* walls LD, sprite FULL: upsample -- 2 distinct texels per half-column */
+        for (s_dc_x=vis->x1 ; s_dc_x<=vis->x2 ; s_dc_x++, frac += vis->xiscale)
+        {
+            int sx, tcL, tcR;
+            if (s_dc_x < s_x0 || s_dc_x >= s_x1) continue;
+            sx  = s_dc_x << 1;
+            tcL = frac >> FRACBITS;
+            tcR = (frac + (vis->xiscale>>1)) >> FRACBITS;
+            if ((unsigned)tcL < (unsigned)SHORT(patch->width))
+                R_SlaveDrawSpriteCol ((column_t *)((byte *)patch + LONG(patch->columnofs[tcL])), sx,   s_dc_x, 0);
+            if ((unsigned)tcR < (unsigned)SHORT(patch->width))
+                R_SlaveDrawSpriteCol ((column_t *)((byte *)patch + LONG(patch->columnofs[tcR])), sx+1, s_dc_x, 0);
+        }
+    }
+    else
     for (s_dc_x=vis->x1 ; s_dc_x<=vis->x2 ; s_dc_x++, frac += vis->xiscale)
     {
         if (s_dc_x < s_x0 || s_dc_x >= s_x1) continue;    /* this CPU's x-half only */
@@ -1213,6 +1381,7 @@ static void R_SlaveDrawVisSprite (vissprite_t* vis)
         if ((unsigned)texturecolumn >= (unsigned)SHORT(patch->width)) continue;
         column = (column_t *) ((byte *)patch + LONG(patch->columnofs[texturecolumn]));
         R_SlaveDrawMaskedColumn (column);
+    }
     }
 }
 
