@@ -39,6 +39,24 @@ fixed_t		t2y;
 
 int		sightcounts[2];
 
+// SATURN: temporal sight cache -- P_CheckSight(t1,t2) for the SAME pair is re-issued every few
+// tics (A_Chase / P_LookForPlayers re-check monster->player) and REJECT is NULL in the big-WAD
+// streaming mode, so each is a full division-heavy BSP walk (~1200 walks/s on Doom II MAP15).
+// Cache the result keyed by (t1,t2) for SIGHT_CACHE_TICS tics -> the repeats collapse to O(1).
+// Fixed direct-mapped table = CONSTANT ram (the endgame-safe alternative to the numsectors^2
+// REJECT matrix, which is fragmentation-fatal on big maps).  Staleness bounded to a few tics ->
+// AI reacts 1-4 tics late, imperceptible.  Zero-init BSS -> all-miss at boot; leveltime resets
+// per level so stale cross-level entries miss (unsigned wrap on leveltime-c->tic).
+extern int	leveltime;
+#define SIGHT_CACHE_N		128
+#define SIGHT_CACHE_TICS	4
+#define SIGHT_HASH(a,b)		((unsigned)(((unsigned long)(a) >> 4) ^ ((unsigned long)(b) >> 3)) & (SIGHT_CACHE_N - 1))
+typedef struct { void *t1, *t2; int tic; byte result; byte valid; } sightcache_t;
+static sightcache_t	sight_cache[SIGHT_CACHE_N];
+int		sat_sight_cache = 1;	// runtime toggle (default on); its effect shows as a drop in the overlay 'walk' count
+int		sat_sight_cachehit = 0;	// telemetry (cumulative cache hits)
+int		sat_sight_maxdist = 0;	// distance early-out in map units, 0 = off (behaviour-changing; opt-in A/B)
+
 
 //
 // P_DivlineSide
@@ -329,6 +347,25 @@ P_CheckSight
 	return false;
     }
 
+    // SATURN: temporal sight cache -- reuse a recent full-walk result for this (t1,t2) pair
+    // (staleness bounded to SIGHT_CACHE_TICS tics).  Collapses the repeated A_Chase /
+    // LookForPlayers monster->player checks that, with REJECT NULL in streaming, each full-walk.
+    if (sat_sight_cache)
+    {
+	sightcache_t *c = &sight_cache[SIGHT_HASH(t1, t2)];
+	if (c->valid && c->t1 == (void*)t1 && c->t2 == (void*)t2
+	    && (unsigned)(leveltime - c->tic) < (unsigned)SIGHT_CACHE_TICS)
+	{
+	    sat_sight_cachehit++;
+	    return c->result;
+	}
+    }
+    // SATURN: optional distance early-out (sat_sight_maxdist units; 0 = off).  Kills the
+    // pathological long-range walks without walking the BSP.  Behaviour-changing -> off by default.
+    if (sat_sight_maxdist
+	&& P_AproxDistance (t2->x - t1->x, t2->y - t1->y) > sat_sight_maxdist)
+	return false;
+
     // An unobstructed LOS is possible.
     // Now look from eyes of t1 to any part of t2.
     sightcounts[1]++;
@@ -347,7 +384,16 @@ P_CheckSight
     strace.dy = t2->y - t1->y;
 
     // the head node is the last node output
-    return P_CrossBSPNode (numnodes-1);	
+    {
+	boolean res = P_CrossBSPNode (numnodes-1);
+	if (sat_sight_cache)
+	{
+	    sightcache_t *c = &sight_cache[SIGHT_HASH(t1, t2)];
+	    c->t1 = (void*)t1; c->t2 = (void*)t2;
+	    c->tic = leveltime; c->result = (byte)res; c->valid = 1;
+	}
+	return res;
+    }	
 }
 
 
