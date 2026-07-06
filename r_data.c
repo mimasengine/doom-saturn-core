@@ -386,7 +386,8 @@ void R_GenerateLookup (int texnum)
 	{
 	    printf ("R_GenerateLookup: column without a patch (%s)\n",
 		    texture->name);
-	    return;
+	    Z_Free (patchcount);   // SATURN R4: the vanilla early-return leaked this PU_STATIC temp;
+	    return;                // under lazy rebuilds (M4 purge churn) that leak accretes + fragments
 	}
 	// I_Error ("R_GenerateLookup: column without a patch");
 	
@@ -423,10 +424,20 @@ static void R_EnsureLookup (int tex)
     if (texturecolumnlump[tex] && texturecolumnofs[tex])
 	return;					  // already resident
     t = textures[tex];
+    // Pin BOTH dirs PU_STATIC across R_GenerateLookup.  lump[] and ofs[] are SEPARATE blocks:
+    // a purge can free one while the other stays resident (PU_CACHE), so we can arrive here with
+    // one NULL and one still live.  The live survivor must ALSO be pinned -- otherwise
+    // R_GenerateLookup's internal allocs (patchcount, patch caches) purge it mid-build and the
+    // demote-to-PU_CACHE below runs Z_ChangeTag on a freed (nulled) block -> the "block without a
+    // ZONEID" fatal seen after running M4 a while (mixed partial-purge state).
     if (!texturecolumnlump[tex])
 	texturecolumnlump[tex] = Z_Malloc (t->width*sizeof(**texturecolumnlump), PU_STATIC, &texturecolumnlump[tex]);
+    else
+	Z_ChangeTag (texturecolumnlump[tex], PU_STATIC);
     if (!texturecolumnofs[tex])
 	texturecolumnofs[tex]  = Z_Malloc (t->width*sizeof(**texturecolumnofs),  PU_STATIC, &texturecolumnofs[tex]);
+    else
+	Z_ChangeTag (texturecolumnofs[tex],  PU_STATIC);
     R_GenerateLookup (tex);			  // fills both + compositesize; safe while PU_STATIC
     Z_ChangeTag (texturecolumnlump[tex], PU_CACHE);
     Z_ChangeTag (texturecolumnofs[tex],  PU_CACHE);
