@@ -205,6 +205,8 @@ void R_DrawSplitPlayerSprites (void)
     {
         if (!players[i].mo) continue;
         viewplayer = &players[i];
+        sat_split_view = i;    /* SATURN: the platform weapon cache partitions its VRAM slots
+                                  per view (multi firing-tear fix) -- tell it whose weapon this is */
         R_SetViewWindow (vpx[i], twop ? 0 : vpy[i], hw, fh);
         R_DrawPlayerSprites ();
     }
