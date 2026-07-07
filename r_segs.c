@@ -209,6 +209,7 @@ extern int  sat_wall_nocpu;     /* SATURN: banded/flat VDP1 modes skip the close
 extern int  sat_wall_color;
 extern int  sat_wall_textured;
 extern int  R_WallPotatoColor (int tex);
+extern int* texturewidthmask;   /* r_data.c: texture u-period, for the subdiv squish guards */
 
 /* SATURN: hand one-sided (solid) walls to a platform VDP1 world renderer.  NULL on
    DoomJo / when unused -> normal software wall.  Called per seg with the wall's 4
@@ -742,6 +743,7 @@ void R_RenderSegLoop (void)
 	       (the same magnification quantity), capped.  Whole wall -> CPU on a bank-full reject. */
 	    int sx = rw_stopx - rw_x, mdu = u2 - u1; if (mdu < 0) mdu = -mdu; if (mdu < 1) mdu = 1;
 	    int N = 1 + sx / mdu; if (N < 2) N = 2; if (N > SAT_WALL_SUBDIV_MAX) N = SAT_WALL_SUBDIV_MAX;
+	    int tw = texturewidthmask[midtexture] + 1;
 	    int prev_b = rw_x, k;
 	    for (k = 1; k <= N; k++)
 	    {
@@ -754,6 +756,15 @@ void R_RenderSegLoop (void)
 		    int ar  = (rw_centerangle + xtoviewangle[xr]) >> ANGLETOFINESHIFT;
 		    int ul  = (rw_offset - FixedMul(finetangent[al], rw_distance)) >> FRACBITS;  /* PERSP u */
 		    int ur  = (rw_offset - FixedMul(finetangent[ar], rw_distance)) >> FRACBITS;
+		    /* per-SUB-SEG squish guard, LOCAL slope (the wall-average sx/mdu underestimates the
+		       closest sub-seg of a perspective-skewed seg): if this sub-seg's texture tile would
+		       extrapolate past the platform's coordinate allowance, the emitter could only draw
+		       it as a clamp+squish quad -> route the whole wall to SOFTWARE instead.  sdu < 1
+		       also catches the du==0 degenerate (full-char single quad = worst squish).  1024
+		       mirrors the platform bound (view width + 2*wall_ext, conservatively). */
+		    int sdu = ur - ul; if (sdu < 0) sdu = -sdu;
+		    if (sdu < 1 || (long long)tw * (xr - xl + 1) > 1024LL * sdu)
+			{ sat_sw_mid = 1; sat_fb_mag_t++; break; }
 		    int yll = (topfrac    + topstep    * dnl + HEIGHTUNIT - 1) >> HEIGHTBITS;    /* EXACT */
 		    int ylr = (topfrac    + topstep    * dnr + HEIGHTUNIT - 1) >> HEIGHTBITS;
 		    int yhl = (bottomfrac + bottomstep * dnl) >> HEIGHTBITS;
@@ -819,6 +830,7 @@ void R_RenderSegLoop (void)
 	    {
 		int sx = rw_stopx - rw_x, mdu = u2 - u1; if (mdu < 0) mdu = -mdu; if (mdu < 1) mdu = 1;
 		int N = 1 + sx / mdu; if (N < 2) N = 2; if (N > SAT_WALL_SUBDIV_MAX) N = SAT_WALL_SUBDIV_MAX;
+		int tw = texturewidthmask[toptexture] + 1;
 		int prev_b = rw_x, k;
 		for (k = 1; k <= N; k++)
 		{
@@ -831,6 +843,10 @@ void R_RenderSegLoop (void)
 			int ar  = (rw_centerangle + xtoviewangle[xr]) >> ANGLETOFINESHIFT;
 			int ul  = (rw_offset - FixedMul(finetangent[al], rw_distance)) >> FRACBITS;
 			int ur  = (rw_offset - FixedMul(finetangent[ar], rw_distance)) >> FRACBITS;
+			/* per-sub-seg squish guard, local slope (see the mid tier) */
+			int sdu = ur - ul; if (sdu < 0) sdu = -sdu;
+			if (sdu < 1 || (long long)tw * (xr - xl + 1) > 1024LL * sdu)
+			    { sat_sw_up = 1; sat_fb_mag_t++; break; }
 			int yll = (topfrac + topstep     * dnl + HEIGHTUNIT - 1) >> HEIGHTBITS;
 			int ylr = (topfrac + topstep     * dnr + HEIGHTUNIT - 1) >> HEIGHTBITS;
 			int yhl = (pixhigh + pixhighstep * dnl) >> HEIGHTBITS;
@@ -885,6 +901,7 @@ void R_RenderSegLoop (void)
 	    {
 		int sx = rw_stopx - rw_x, mdu = u2 - u1; if (mdu < 0) mdu = -mdu; if (mdu < 1) mdu = 1;
 		int N = 1 + sx / mdu; if (N < 2) N = 2; if (N > SAT_WALL_SUBDIV_MAX) N = SAT_WALL_SUBDIV_MAX;
+		int tw = texturewidthmask[bottomtexture] + 1;
 		int prev_b = rw_x, k;
 		for (k = 1; k <= N; k++)
 		{
@@ -897,6 +914,10 @@ void R_RenderSegLoop (void)
 			int ar  = (rw_centerangle + xtoviewangle[xr]) >> ANGLETOFINESHIFT;
 			int ul  = (rw_offset - FixedMul(finetangent[al], rw_distance)) >> FRACBITS;
 			int ur  = (rw_offset - FixedMul(finetangent[ar], rw_distance)) >> FRACBITS;
+			/* per-sub-seg squish guard, local slope (see the mid tier) */
+			int sdu = ur - ul; if (sdu < 0) sdu = -sdu;
+			if (sdu < 1 || (long long)tw * (xr - xl + 1) > 1024LL * sdu)
+			    { sat_sw_lo = 1; sat_fb_mag_t++; break; }
 			int yll = (pixlow     + pixlowstep * dnl + HEIGHTUNIT - 1) >> HEIGHTBITS;
 			int ylr = (pixlow     + pixlowstep * dnr + HEIGHTUNIT - 1) >> HEIGHTBITS;
 			int yhl = (bottomfrac + bottomstep * dnl) >> HEIGHTBITS;
