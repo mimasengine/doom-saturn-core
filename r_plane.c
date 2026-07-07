@@ -116,6 +116,37 @@ static byte *R_PoolSlice (void)
 }
 #endif
 
+/* SATURN P0 (crash-proofing, endgame): graceful visplane-COUNT overflow.  When the visplane
+   array fills (count == MAXVISPLANES) R_FindPlane / R_CheckPlane used to I_Error -- a hard
+   freeze, fatal on a wide-open big-WAD vista.  Instead hand out this shared write-sink plane:
+   it is NOT in [visplanes, lastvisplane), so R_DrawPlanes never draws it, and it is never
+   inserted in the hash (its array index would be OOB).  The excess flat then silently fails to
+   render (a localised HOM on a pathologically plane-dense frame), the same graceful degrade as
+   overflowsprite and the vp_fallback span slice -- no crash.  Its own static slices keep the
+   caller's memset + span writes off the zone heap. */
+int r_visplane_ovf = 0;   /* overflow hand-outs (endgame limits telemetry; peers r_visplane_peak) */
+#if SAT_VISPLANE_POOL
+static byte overflow_top_slice[VP_SLICE_BYTES];
+static byte overflow_bot_slice[VP_SLICE_BYTES];
+#endif
+static visplane_t overflowplane;
+static visplane_t *R_OverflowPlane (fixed_t height, int picnum, int lightlevel,
+				    int minx, int maxx)
+{
+    r_visplane_ovf++;
+#if SAT_VISPLANE_POOL
+    overflowplane.top    = overflow_top_slice + 1;   /* base+1 so [-1]/[SCREENWIDTH] pads stay in-bounds */
+    overflowplane.bottom = overflow_bot_slice + 1;
+#endif
+    overflowplane.height     = height;
+    overflowplane.picnum     = picnum;
+    overflowplane.lightlevel = lightlevel;
+    overflowplane.minx       = minx;
+    overflowplane.maxx       = maxx;
+    memset (overflowplane.top, 0xff, SCREENWIDTH);
+    return &overflowplane;
+}
+
 /* SATURN PERF L1: visplane hash (d32xr-style).  Vanilla R_FindPlane is a linear
    O(n) scan over visplanes, called per subsector for floor AND ceiling => O(n^2)
    of SLOW low-WRAM reads (visplanes live in the zone heap) in plane-heavy rooms.
@@ -509,7 +540,7 @@ R_FindPlane
     }
 
     if (lastvisplane - visplanes == MAXVISPLANES)
-	I_Error ("R_FindPlane: no more visplanes");
+	return R_OverflowPlane (height, picnum, lightlevel, SCREENWIDTH, -1);   /* SATURN P0: graceful sink, not a hard freeze */
 
     check = lastvisplane;
     lastvisplane++;
@@ -600,7 +631,7 @@ R_CheckPlane
        into the zone heap, corrupting allocator blocks and causing a hang with
        no I_Error.  Guard added to match R_FindPlane's existing check. */
     if (lastvisplane - visplanes == MAXVISPLANES)
-        I_Error("R_CheckPlane: no more visplanes");
+        return R_OverflowPlane (pl->height, pl->picnum, pl->lightlevel, start, stop);   /* SATURN P0: graceful sink, not a hard freeze */
 
     // make a new visplane
     lastvisplane->height = pl->height;
