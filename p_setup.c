@@ -871,6 +871,65 @@ static void P_StageBSP (void)
     P_BspStageApply (sat_bsp_stage_on);
 }
 
+#ifdef SAT_SND_PRECACHE
+// SATURN (streaming fluidity): warm THIS level's USED sound effects into SCSP RAM at load,
+// so a never-before-heard sfx never does its blocking lump read + PCM upload MID-FIGHT the
+// first time it fires (I_PrecacheSounds is a no-op stub on this platform, and R_PrecacheLevel
+// precaches graphics only).  Zero Doom-zone cost -- the PCM lives in the separate SCSP RAM
+// and each transient lump is purgeable PU_CACHE -- so this runs safely even on the big maps
+// where the zone is nearly full; it is called AFTER R_SetupTextureCaches so the transient
+// reads never shrink the texcache pool.  Fail-safe: any sfx not caught here (e.g. a monster
+// that teleports in later) simply lazy-loads on first play, exactly as today.
+static void SAT_MarkSfx (byte *used, int s)
+{
+    if (s > 0 && s < NUMSFX) used[s] = 1;
+}
+
+static void SAT_PrecacheLevelSounds (void)
+{
+    static byte used[NUMSFX];
+    thinker_t  *th;
+    int         i;
+
+    // World / player sounds not tied to a spawned monster type: weapons, doors, switches,
+    // lifts/floors, pickups, oof, teleport, barrel + rocket + imp-fireball explosions.
+    // These fire in virtually every level regardless of the monster roster.
+    static const short always[] = {
+        sfx_pistol, sfx_shotgn, sfx_sgcock, sfx_dshtgn, sfx_dbopn, sfx_dbcls, sfx_dbload,
+        sfx_plasma, sfx_bfg,    sfx_sawup,  sfx_sawidl, sfx_sawful, sfx_sawhit, sfx_chgun,
+        sfx_rlaunc, sfx_rxplod, sfx_firsht, sfx_firxpl, sfx_barexp, sfx_punch,  sfx_slop,
+        sfx_noway,  sfx_oof,    sfx_itemup, sfx_wpnup,  sfx_getpow, sfx_tink,
+        sfx_doropn, sfx_dorcls, sfx_bdopn,  sfx_bdcls,  sfx_swtchn, sfx_swtchx,
+        sfx_pstart, sfx_pstop,  sfx_stnmov, sfx_telept, sfx_itmbk,
+    };
+
+    memset (used, 0, sizeof(used));
+    for (i = 0; i < (int)(sizeof(always) / sizeof(always[0])); i++)
+        SAT_MarkSfx (used, always[i]);
+
+    // Spawn-derived: every mobj present at level start contributes its five sounds.
+    for (th = thinkercap.next; th != &thinkercap; th = th->next)
+    {
+        mobj_t *mo;
+        if (th->function.acp1 != (actionf_p1)P_MobjThinker)
+            continue;
+        mo = (mobj_t *)th;
+        if (mo->info == NULL) continue;
+        SAT_MarkSfx (used, mo->info->seesound);
+        SAT_MarkSfx (used, mo->info->attacksound);
+        SAT_MarkSfx (used, mo->info->painsound);
+        SAT_MarkSfx (used, mo->info->deathsound);
+        SAT_MarkSfx (used, mo->info->activesound);
+    }
+
+    // Upload each unique used sfx (index 0 = sfx_None is skipped).  cache_sfx dedupes and
+    // caps itself, and skips gracefully if the SCSP fills -- so this is bounded by design.
+    for (i = 1; i < NUMSFX; i++)
+        if (used[i])
+            I_CacheSound (&S_sfx[i]);
+}
+#endif
+
 //
 // P_SetupLevel
 //
@@ -994,6 +1053,15 @@ P_SetupLevel
     // contiguous zone RAM is left after this level's geometry (no-op unless
     // sat_streaming_mode).  Done last so geometry never competes with the pool.
     R_SetupTextureCaches ();
+
+#ifdef SAT_SND_PRECACHE
+    // SATURN: warm this level's sound effects into SCSP RAM (off the gameplay frame).
+    // Runs in both cart and CD-streaming modes -- the SCSP is separate from the Doom zone
+    // so there is no OOM risk; the win is largest in streaming mode (it also moves the
+    // blocking CD read to the load screen).  Skipped for demos (precache == false).
+    if (precache)
+        SAT_PrecacheLevelSounds ();
+#endif
 
     //printf ("free memory: 0x%x\n", Z_FreeMemory());
 

@@ -159,6 +159,12 @@ void I_StopSound(int channel);
 boolean I_SoundIsPlaying(int channel);
 void I_PrecacheSounds(sfxinfo_t *sounds, int num_sounds);
 
+// SATURN (SAT_SND_PRECACHE): warm a single sfx into the platform's sound RAM ahead of
+// its first play, so the blocking lump read + PCM upload happen off the gameplay frame.
+// Only referenced by the gated level-sound precache in p_setup.c, so ports that do not
+// define SAT_SND_PRECACHE (DoomJo) never need to implement it.
+void I_CacheSound(sfxinfo_t *sfxinfo);
+
 // Interface for music modules
 
 typedef struct
