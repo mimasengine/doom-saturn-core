@@ -21,3 +21,9 @@ Each port adds this repo as a git submodule at `core/` and compiles
 Patched-once, both ports benefit — e.g. the ~1-2min freeze fix
 (`rp_sgl_workptr_reset` in `r_parallel.c`, which resets the SGL transient
 work pointer GBR+72 that `slSlaveFunc` leaks each frame).
+
+## License
+
+GPL-2.0 — see [COPYING](COPYING). Inherited from the Doom source release
+(doomgeneric / Chocolate-Doom lineage); `r_parallel.c` and all local patches
+are released under the same terms.
