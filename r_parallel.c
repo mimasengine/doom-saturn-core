@@ -111,6 +111,17 @@ typedef struct
        slave spends REC waiting for the master to produce commands => there is room
        to offload wall-prep onto it (2.4); low idle% => it is saturated drawing. */
     int slave_opq_total, slave_opq_draw;
+    /* SATURN PERF (2026-07-08): MEASURED slave occupancy.  slave_busy = monotonic sum of every
+       live slave-body duration, timed on the slave's OWN FRT forced to phi/128 (== the master
+       divider SGL sets) so the master converts ticks->ms directly.  The master diffs it per frame
+       in rp_p3_prof_show -> the TRUE busy% of MST, next to the DERIVED SLVi (which only assumes the
+       slave is busy during P/M and is blind to intra-phase idle).  Single writer (slave), read via
+       the uncached SYNC alias -> no cross-CPU race, no reset needed (master keeps its own snapshot). */
+    int slave_busy;
+    /* Same, but PLANE bodies only (tas/steal/static/rows) -> the master derives Pb = the slave's
+       share of the plane phase P (=50% balanced, <50% master-heavy on a dominant flat).  slave_busy
+       is the TOTAL (planes + masked-half + aux/wallprep); slave_pbusy is the plane subset. */
+    int slave_pbusy;
     /* SATURN PERF 2.5 (two-pointers): self-balancing EX opaque drain.  The master
        draws parity-0 opaque FORWARD from 0 (m_pos = highest index it has drawn);
        the slave draws parity-0 opaque BACKWARD from mat-1 (s_pos = lowest it has
@@ -893,11 +904,31 @@ void RP_AuxWait(void)
     if (!guard) rp_timeout_count++;
 }
 
+/* SATURN PERF (2026-07-08): slave self-timing brackets for the MEASURED busy%.  BEGIN forces the
+   slave FRT divider to phi/128 (== the master's, set by SGL) and stamps t0; END adds the elapsed
+   ticks to the monotonic uncached slave_busy accumulator the master diffs each frame.  Wrap-safe
+   (16-bit delta < ~293ms).  Fully compiled out unless RP_PROF, so DoomJo / a shipping build pay
+   nothing (and the slave FRT is never touched there).  __sb_t0 is block-scoped per body. */
+#if RP_PROF
+#define SLAVE_BUSY_BEGIN() *(volatile unsigned char *)0xFFFFFE16 = 0x02; \
+                           unsigned short __sb_t0 = rp_frt()
+#define SLAVE_BUSY_END()   (SYNC->slave_busy += (unsigned short)(rp_frt() - __sb_t0))
+/* plane bodies: count into BOTH the total and the plane-only accumulator (for Pb). */
+#define SLAVE_PBUSY_END()  do { unsigned short __d = (unsigned short)(rp_frt() - __sb_t0); \
+                                SYNC->slave_busy += __d; SYNC->slave_pbusy += __d; } while (0)
+#else
+#define SLAVE_BUSY_BEGIN() ((void)0)
+#define SLAVE_BUSY_END()   ((void)0)
+#define SLAVE_PBUSY_END()  ((void)0)
+#endif
+
 static void rp_aux_body(void *param)
 {
+    SLAVE_BUSY_BEGIN();
     (void)param;
     master_cache_purge();                     /* slave: read the master's fresh accumulators/tables */
     rp_run_on_stack(rp_aux_fn);
+    SLAVE_BUSY_END();
     RP_AUX_DONE = 1;
 }
 
@@ -942,10 +973,12 @@ int RP_AuxKick(void)               /* platform DG-entry consumer; 1 = a job was 
 
 static void rp_plane_steal_body(void *param)
 {
+    SLAVE_BUSY_BEGIN();
     master_cache_purge();                    /* slave: read the master's fresh worklist + tables */
     rp_steal_n = (int)(unsigned int)param;   /* set AFTER the purge (the invalidate would drop a
                                                 dirty line) -- n via param, no cached shared word */
     rp_run_on_stack(rp_plane_steal_slave);   /* draw on the dedicated 4KB stack */
+    SLAVE_PBUSY_END();
     PLANE_DONE = 1;
 }
 
@@ -957,10 +990,12 @@ static void rp_plane_static_slave(void) { R_DrawPlaneWorklist(rp_static_from, rp
 static void rp_plane_static_body(void *param)
 {
     int packed = (int)(unsigned int)param;
+    SLAVE_BUSY_BEGIN();
     master_cache_purge();
     rp_static_from = (packed >> 16) & 0xffff;
     rp_static_to   = packed & 0xffff;
     rp_run_on_stack(rp_plane_static_slave);
+    SLAVE_PBUSY_END();
     PLANE_DONE = 1;
 }
 
@@ -1007,9 +1042,11 @@ static void rp_plane_tas_slave(void)     /* slave: claim UP from 0, stop where i
 }
 static void rp_plane_tas_body(void *param)
 {
+    SLAVE_BUSY_BEGIN();
     master_cache_purge();                /* per-frame worklist/visplane/table coherency (slave cold) */
     rp_tas_n = (int)(unsigned int)param;
     rp_run_on_stack(rp_plane_tas_slave); /* draw on the dedicated 4KB stack */
+    SLAVE_PBUSY_END();
     PLANE_DONE = 1;
 }
 
@@ -1027,10 +1064,12 @@ static void rp_plane_rows_slave(void) { R_DrawPlaneWorklistRows(0, rp_rows_n, rp
 static void rp_plane_rows_body(void *param)
 {
     int packed = (int)(unsigned int)param;
+    SLAVE_BUSY_BEGIN();
     master_cache_purge();                /* per-frame worklist/visplane/table coherency */
     rp_rows_n   = (packed >> 16) & 0xffff;
     rp_rows_mid = packed & 0xffff;
     rp_run_on_stack(rp_plane_rows_slave);
+    SLAVE_PBUSY_END();
     PLANE_DONE = 1;
 }
 
@@ -1107,6 +1146,7 @@ static void rp_masked_slave_body(void *param)
 {
     int packed = (int)(unsigned int)param;
     int take;
+    SLAVE_BUSY_BEGIN();
     master_cache_purge();                    /* slave: read the master's fresh vissprites + drawsegs */
     rp_mask_x0 = (packed >> 16) & 0xffff;
     rp_mask_x1 = packed & 0xffff;
@@ -1116,8 +1156,17 @@ static void rp_masked_slave_body(void *param)
        AFTER -- the master resumes its masked tail + DG pre while the build runs here. */
     take = RP_AUX_ARMED;
     if (take) { RP_AUX_TAKEN = 1; RP_AUX_DONE = 0; }
+    SLAVE_BUSY_END();                        /* masked-half work (before publishing MASK_DONE) */
     MASK_DONE = 1;
-    if (take) { rp_run_on_stack(rp_aux_fn); RP_AUX_DONE = 1; }
+    if (take) {
+#if RP_PROF
+        unsigned short __ax_t0 = rp_frt();   /* time the F-build piggyback on the slave too */
+#endif
+        rp_run_on_stack(rp_aux_fn); RP_AUX_DONE = 1;
+#if RP_PROF
+        SYNC->slave_busy += (unsigned short)(rp_frt() - __ax_t0);
+#endif
+    }
 }
 
 void RP_DispatchMasked(int x0, int x1)
@@ -1169,11 +1218,13 @@ static void rp_wallprep_slave_fn(void)   /* runs on the dedicated 4KB stack */
 static void rp_wallprep_body(void *param)
 {
     unsigned int p = (unsigned int)param; /* (mode<<16)|n -- mode via the register, always fresh */
+    SLAVE_BUSY_BEGIN();
     if (((p >> 16) & 0xff) == 1)
         master_cache_purge();             /* mode 1: full purge (slave reads master's fresh data).
                                              mode 2: SKIP = warm (static-scene-correct diagnostic). */
     rp_wp_n = (int)(p & 0xffff);          /* set AFTER any purge -- n via param, no cached word */
     rp_run_on_stack(rp_wallprep_slave_fn);
+    SLAVE_BUSY_END();
     WP_DONE = 1;                          /* last statement, uncached */
 }
 
@@ -1902,11 +1953,32 @@ static void rp_p3_prof_show(void)
     /* w = master idle waiting for the slave (master FRT): w~0 => the slave keeps up / balanced.
        idle% = the slave's idle share of the render: it works in P, sits idle in B+M -> this is
        the slack masked + wall-prep will fill (it should DROP as each phase is offloaded). */
-    /* row 5: slave occupancy -- SLVidle = the slave's idle share of the render (works in P, idles
-       in B+M), w = master idle waiting for the slave at the plane barrier.  MST and the nr
-       decomposition moved to the platform overlay (rows 0-1, window-averaged).  Full mode only. */
+    /* SATURN PERF (2026-07-08): MEASURED slave busy% = slave_busy ticks THIS frame (diff of the
+       monotonic accumulator the slave bracketed on its own phi/128 FRT) / MST.  This is the real
+       occupancy the DERIVED SLVi cannot see: SLVi assumes the slave is busy for all of P(+M), but
+       the slave actually idles inside P (dispatch latency, early finish, imbalance beyond w) and is
+       idle for the whole T/S/blit/dg tail.  b << (100-SLVi) => that much MORE frame is genuinely
+       free to absorb offload; b tracking a lever proves work really moved to the slave (not just
+       that the master's P shrank).  Per-frame (like w); no window integration. */
+    static unsigned int sb_last = 0, pb_last = 0;
+    unsigned int sb_now = (unsigned int)SYNC->slave_busy;
+    unsigned int pb_now = (unsigned int)SYNC->slave_pbusy;
+    unsigned int sb_d   = sb_now - sb_last;                 /* total slave ticks this frame (wraps cleanly) */
+    unsigned int pb_d   = pb_now - pb_last;                 /* plane-only slave ticks this frame            */
+    sb_last = sb_now; pb_last = pb_now;
+    (void)idle;                                             /* derived SLVi retired: b/id/Pb are all MEASURED */
+    unsigned int busy_pct = rp_master_ms ? (sb_d * 100u / (224u * rp_master_ms)) : 0u;
+    if (busy_pct > 999u) busy_pct = 999u;                   /* first-frame baseline / glitch clamp */
+    unsigned int idle_pct = busy_pct < 100u ? 100u - busy_pct : 0u;
+    unsigned int pb_pct   = p10 ? (pb_d * 1000u / (224u * (unsigned)p10)) : 0u;  /* plane-phase balance */
+    if (pb_pct > 999u) pb_pct = 999u;
+    /* row 5: MEASURED slave occupancy.  b = busy% of MST, id = idle% of MST (= 100-b, the offload
+       HEADROOM), Pb = the slave's share of the plane phase P (~50% balanced, <50% master-heavy on a
+       dominant flat), w = master idle waiting for the slave at the plane barrier.  Full mode only.
+       (Replaces the old DERIVED SLVi 'i', which used a different base (render, not MST) and assumed
+       the slave was busy through all of P -> it never summed to 100 with b and misled.) */
     if (sat_dbg_overlay_mode == 0) {
-        snprintf(p, sizeof p, "SLVi%u%% w%u.%u        ", idle, w10/10, w10%10);
+        snprintf(p, sizeof p, "SLV b%u%% id%u%% Pb%u%% w%u.%u ", busy_pct, idle_pct, pb_pct, w10/10, w10%10);
         dbg_print(0, 5, p);
     }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one
