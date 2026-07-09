@@ -1851,6 +1851,9 @@ int sat_prof_rec_max=0;            /* window max (= p100), tenths-ms */
 int sat_prof_dropped=0;            /* glitch/transition frames excluded from the window */
 int sat_prof_pk_bw=0, sat_prof_pk_bp=0, sat_prof_pk_p=0, sat_prof_pk_m=0;  /* per-phase peaks */
 int sat_prof_mx_map=0, sat_prof_mx_x=0, sat_prof_mx_y=0, sat_prof_mx_ang=0, sat_prof_mx_t=0;
+/* SATURN PERF (2026-07-09): full detail of the worst-REC frame, snapshotted at each new peak
+   (persists until beaten / config change).  Phase split + slave b/Pb AT that frame. tenths-ms / %. */
+int sat_prof_mx_bw=0, sat_prof_mx_bp=0, sat_prof_mx_p=0, sat_prof_mx_m=0, sat_prof_mx_b=0, sat_prof_mx_pb=0;
 int sat_prof_dom_pct=0, sat_prof_plane_n=0;   /* RBG0-floor sizer: dominant-flat pixel share + visplane count */
 #if RP_PROF
 static unsigned int prof_w_recmax=0, prof_w_recn=0;
@@ -1869,6 +1872,7 @@ void RP_ProfReset(void)
 #endif
     sat_prof_rec_max=sat_prof_pk_bw=sat_prof_pk_bp=sat_prof_pk_p=sat_prof_pk_m=0;
     sat_prof_mx_map=sat_prof_mx_x=sat_prof_mx_y=sat_prof_mx_ang=sat_prof_mx_t=0;
+    sat_prof_mx_bw=sat_prof_mx_bp=sat_prof_mx_p=sat_prof_mx_m=sat_prof_mx_b=sat_prof_mx_pb=0;
     sat_prof_dom_pct=sat_prof_plane_n=0;
     sat_prof_dropped=0;
 }
@@ -1921,6 +1925,23 @@ static void rp_p3_prof_show(void)
                  bw10/10,bw10%10, bp10/10,bp10%10, p10/10,p10%10, m10/10,m10%10);
         dbg_print(0, 2, p);
     }
+    /* SATURN PERF (2026-07-08): MEASURED slave busy% = slave_busy ticks THIS frame (diff of the
+       monotonic accumulator the slave bracketed on its own phi/128 FRT) / MST -- the real occupancy
+       the DERIVED SLVi cannot see (it assumes the slave busy through all of P/M).  Computed HERE
+       (before the fold) so the peak snapshot can record b/Pb of the worst-REC frame too. */
+    static unsigned int sb_last = 0, pb_last = 0;
+    unsigned int sb_now = (unsigned int)SYNC->slave_busy;
+    unsigned int pb_now = (unsigned int)SYNC->slave_pbusy;
+    unsigned int sb_d   = sb_now - sb_last;                 /* total slave ticks this frame (wraps cleanly) */
+    unsigned int pb_d   = pb_now - pb_last;                 /* plane-only slave ticks this frame            */
+    sb_last = sb_now; pb_last = pb_now;
+    (void)idle;                                             /* derived SLVi retired: b/id/Pb are all MEASURED */
+    unsigned int busy_pct = rp_master_ms ? (sb_d * 100u / (224u * rp_master_ms)) : 0u;
+    if (busy_pct > 999u) busy_pct = 999u;                   /* first-frame baseline / glitch clamp */
+    unsigned int idle_pct = busy_pct < 100u ? 100u - busy_pct : 0u;
+    unsigned int pb_pct   = p10 ? (pb_d * 1000u / (224u * (unsigned)p10)) : 0u;  /* plane-phase balance */
+    if (pb_pct > 999u) pb_pct = 999u;
+
     /* SATURN PERF (2026-06-24): fold this frame into the window.  Per-PHASE peaks are
        tracked INDEPENDENTLY (Bp and P do not peak on the same frame -> the right basis
        to size each offload); the REC histogram feeds p50/p95 (RP_ProfPercentile); the
@@ -1940,6 +1961,12 @@ static void rp_p3_prof_show(void)
             sat_prof_mx_map=gamemap;
             sat_prof_mx_x=(int)(viewx>>16); sat_prof_mx_y=(int)(viewy>>16);
             sat_prof_mx_ang=(int)(viewangle>>24); sat_prof_mx_t=leveltime;
+            /* SATURN PERF (2026-07-09, user req): snapshot the FULL detail of the worst-REC frame
+               (persists until beaten or a config change) so a new peak is a capture opportunity.
+               Phase split says WHICH phase spiked; b/Pb say whether the slave was idle during it. */
+            sat_prof_mx_bw=(int)bw10; sat_prof_mx_bp=(int)bp10;
+            sat_prof_mx_p =(int)p10;  sat_prof_mx_m =(int)m10;
+            sat_prof_mx_b =(int)busy_pct; sat_prof_mx_pb=(int)pb_pct;
         }
         {
             unsigned int bi = rend / RP_HBWIDTH;
@@ -1950,28 +1977,8 @@ static void rp_p3_prof_show(void)
     } else {
         sat_prof_dropped++;
     }
-    /* w = master idle waiting for the slave (master FRT): w~0 => the slave keeps up / balanced.
-       idle% = the slave's idle share of the render: it works in P, sits idle in B+M -> this is
-       the slack masked + wall-prep will fill (it should DROP as each phase is offloaded). */
-    /* SATURN PERF (2026-07-08): MEASURED slave busy% = slave_busy ticks THIS frame (diff of the
-       monotonic accumulator the slave bracketed on its own phi/128 FRT) / MST.  This is the real
-       occupancy the DERIVED SLVi cannot see: SLVi assumes the slave is busy for all of P(+M), but
-       the slave actually idles inside P (dispatch latency, early finish, imbalance beyond w) and is
-       idle for the whole T/S/blit/dg tail.  b << (100-SLVi) => that much MORE frame is genuinely
-       free to absorb offload; b tracking a lever proves work really moved to the slave (not just
-       that the master's P shrank).  Per-frame (like w); no window integration. */
-    static unsigned int sb_last = 0, pb_last = 0;
-    unsigned int sb_now = (unsigned int)SYNC->slave_busy;
-    unsigned int pb_now = (unsigned int)SYNC->slave_pbusy;
-    unsigned int sb_d   = sb_now - sb_last;                 /* total slave ticks this frame (wraps cleanly) */
-    unsigned int pb_d   = pb_now - pb_last;                 /* plane-only slave ticks this frame            */
-    sb_last = sb_now; pb_last = pb_now;
-    (void)idle;                                             /* derived SLVi retired: b/id/Pb are all MEASURED */
-    unsigned int busy_pct = rp_master_ms ? (sb_d * 100u / (224u * rp_master_ms)) : 0u;
-    if (busy_pct > 999u) busy_pct = 999u;                   /* first-frame baseline / glitch clamp */
-    unsigned int idle_pct = busy_pct < 100u ? 100u - busy_pct : 0u;
-    unsigned int pb_pct   = p10 ? (pb_d * 1000u / (224u * (unsigned)p10)) : 0u;  /* plane-phase balance */
-    if (pb_pct > 999u) pb_pct = 999u;
+    /* w = master idle waiting for the slave at the plane barrier (master FRT): w~0 => balanced.
+       (b/id/Pb are computed above, before the fold, so the peak snapshot can record them.) */
     /* row 5: MEASURED slave occupancy.  b = busy% of MST, id = idle% of MST (= 100-b, the offload
        HEADROOM), Pb = the slave's share of the plane phase P (~50% balanced, <50% master-heavy on a
        dominant flat), w = master idle waiting for the slave at the plane barrier.  Full mode only.
