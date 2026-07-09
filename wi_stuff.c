@@ -43,6 +43,8 @@
 // Needs access to LFB.
 #include "v_video.h"
 
+#include "hu_stuff.h"   // SATURN: hu_font for the intermission meta band
+
 #include "wi_stuff.h"
 
 //
@@ -1764,6 +1766,67 @@ void WI_unloadData(void)
     // W_ReleaseLumpName("STFDEAD0");
 }
 
+// SATURN: the intermission art is a fixed 200-line canvas; on the 224-line framebuffer
+// rows 200..223 were a black letterbox.  Fill it instead:
+//  (1) EXTEND the art downward with the software-sky GRAIN technique (r_draw.c
+//      R_DrawSkyColumn): each overflow pixel samples its own column's bottom art band
+//      [WI_BAND_SRC0..WI_BAND_TOP) through a cheap per-(x,row) hash, so the terrain
+//      appears to continue with fine grain instead of a hard edge or vertical streaks.
+//  (2) draw a meta line (episode/map, skill, session time) over it with hu_font.
+// The platform (dg_saturn) skips its black-fill of these rows for GS_INTERMISSION so
+// WI owns them.  Called for every intermission sub-state below.
+#define WI_BAND_TOP   200
+#define WI_BAND_SRC0  192   // sample the art's bottom 8 rows as the grain source
+static void WI_drawMetaBand (void)
+{
+    extern byte *I_VideoBuffer;
+    extern patch_t *hu_font[HU_FONTSIZE];
+    extern int sat_session_tics;
+    byte *fb = I_VideoBuffer;
+    int x, row;
+
+    if (SCREENHEIGHT <= WI_BAND_TOP)
+        return;   // no letterbox on a 200-line build (e.g. DoomJo) -> nothing to fill
+
+    // (1) grain-extend the art into [WI_BAND_TOP, SCREENHEIGHT)
+    for (x = 0 ; x < SCREENWIDTH ; x++)
+        for (row = WI_BAND_TOP ; row < SCREENHEIGHT ; row++)
+        {
+            unsigned h = (unsigned)(x * 73 + row * 179);
+            h ^= h >> 5;
+            int srcrow = WI_BAND_SRC0 + (int)(h & 7);
+            fb[row * SCREENWIDTH + x] = fb[srcrow * SCREENWIDTH + x];
+        }
+
+    // (2) meta line, centred over the grain
+    {
+        static const char *skname[5] = { "ITYTD", "HNTR", "HMP", "UV", "NM" };
+        const char *sk = (gameskill >= 0 && gameskill <= sk_nightmare) ? skname[gameskill] : "?";
+        int secs = sat_session_tics / TICRATE;
+        char buf[40];
+        const char *s;
+        int w = 0, y = WI_BAND_TOP + 2;
+
+        M_snprintf(buf, sizeof(buf), "E%dM%d  %s  %d:%02d",
+                   wbs->epsd + 1, wbs->last + 1, sk, secs / 60, secs % 60);
+
+        for (s = buf ; *s ; s++)
+        {
+            char c = *s;
+            if (c < HU_FONTSTART || c > HU_FONTEND) { w += 4; continue; }
+            w += SHORT(hu_font[c - HU_FONTSTART]->width);
+        }
+        x = (SCREENWIDTH - w) / 2;
+        for (s = buf ; *s ; s++)
+        {
+            char c = *s;
+            if (c < HU_FONTSTART || c > HU_FONTEND) { x += 4; continue; }
+            V_DrawPatch(x, y, hu_font[c - HU_FONTSTART]);
+            x += SHORT(hu_font[c - HU_FONTSTART]->width);
+        }
+    }
+}
+
 void WI_Drawer (void)
 {
     switch (state)
@@ -1776,15 +1839,17 @@ void WI_Drawer (void)
 	else
 	    WI_drawStats();
 	break;
-	
+
       case ShowNextLoc:
 	WI_drawShowNextLoc();
 	break;
-	
+
       case NoState:
 	WI_drawNoState();
 	break;
     }
+
+    WI_drawMetaBand();   // SATURN: fill the 200..223 letterbox (extended art + meta line)
 }
 
 

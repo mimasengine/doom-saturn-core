@@ -1469,13 +1469,20 @@ void G_SecretExitLevel (void)
     gameaction = ga_completed; 
 } 
  
-void G_DoCompleted (void) 
-{ 
-    int             i; 
-	 
-    gameaction = ga_nothing; 
- 
-    for (i=0 ; i<MAXPLAYERS ; i++) 
+// SATURN: cumulative in-level tics for the whole game session -- shown as the session
+// time on the intermission meta band (docs: no vanilla totalleveltimes here).  Reset on
+// a new game (G_InitNew), advanced by each completed level below.
+int sat_session_tics = 0;
+
+void G_DoCompleted (void)
+{
+    int             i;
+
+    gameaction = ga_nothing;
+
+    sat_session_tics += leveltime;   // SATURN: fold the just-finished level into the session clock
+
+    for (i=0 ; i<MAXPLAYERS ; i++)
 	if (playeringame[i]) 
 	    G_PlayerFinishLevel (i);        // take away cards and stuff 
 	 
@@ -1943,6 +1950,8 @@ G_InitNew
       map = 9;
 
     M_ClearRandom ();
+
+    sat_session_tics = 0;   // SATURN: fresh session clock for the intermission meta band
 
     if (skill == sk_nightmare || respawnparm )
 	respawnmonsters = true;
