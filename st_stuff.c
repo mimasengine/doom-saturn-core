@@ -57,7 +57,7 @@
 #include "i_swap.h"        // SHORT() -- big-endian patch fields
 #include "hud2p_layout.h"  // SATURN 2-player compact-HUD field anchors (generated)
 #include "hud4p_layout.h"  // SATURN 3/4-player compact-HUD band anchors (generated)
-#include "hu_stuff.h"      // HU_FONTSTART -- message font (the compact '%' glyph)
+#include "hu_stuff.h"      // HU_FONTSTART -- message font (big red digits + '%')
 
 // Data.
 #include "dstrings.h"
@@ -1234,49 +1234,64 @@ void ST_DrawCompactWidgets(int pnum, int ox, int oy)
 }
 
 // -----------------------------------------------------------------------
-// SATURN 3/4-player split-screen: compact per-viewport HUD band (160x16).
-// Drawn once per player by the platform (dg_saturn.cxx) on top of the opaque
-// band background, at the bottom of that player's 160x96 quadrant view.  Uses
-// the small STYSNUM font + STKEYS icons + the message-font '%'; NO backing
-// screen/diff and NO single-instance global state, so it is safe to call once
-// per player.  Anchors come from the generated hud4p_layout.h.  Default-unused:
-// only the Mimas 3/4p split path calls it (DoomJo and 1/2-player are unaffected).
+// SATURN 3/4-player split-screen: compact per-viewport HUD band (160x16), drawn
+// once per player by the platform (dg_saturn.cxx) over the opaque brushed-metal
+// STBAR-derived background (which has the engraved gray "AM"/"HE"/"AR" labels baked
+// in).  Ammo = small yellow STYSNUM, CENTRED in a 3-digit field and aligned to the
+// "AM" label height; health & armor = the BIG red message font + red '%' (natively
+// red).  Each font size is vertically centred (own _Y anchor).  Keys = STKEYS icons
+// UPRIGHT (native: cards 7x5, skulls 7x7 square) in a row flush right; deathmatch
+// shows the frag count.  NO backing screen/diff and NO single-instance state -> safe
+// to call once per player.  Anchors: hud4p_layout.h.  Mimas 3/4p split only.
 // -----------------------------------------------------------------------
-extern patch_t *hu_font[HU_FONTSIZE];   // message font (STCFN) -- the compact '%'
+extern patch_t *hu_font[HU_FONTSIZE];   // message font (STCFN) -- big red digits + '%'
 
-// small percent: message-font '%' at (x,y); short-num digits right-justified to x.
-static void hud4p_pct(int x, int y, int num)
+// RIGHT-justified message-font (red) number: digits END at x (drawn leftward)
+static void hud4p_hufnum(int x, int y, int num)
+{
+    if (num < 0) num = 0;
+    do {
+        patch_t *g = hu_font[('0' + (num % 10)) - HU_FONTSTART];
+        x -= SHORT(g->width);
+        V_DrawPatch(x, y, g);
+        num /= 10;
+    } while (num);
+}
+
+// health/armor: big red number right-justified so its digits END at x, red '%' AT x.
+// x is the digits' right edge = the '%' left edge -> the '%' is flush at the field edge.
+static void hud4p_pctnum(int x, int y, int num)
 {
     patch_t *pc = hu_font['%' - HU_FONTSTART];
     if (pc) V_DrawPatch(x, y, pc);
-    hud2p_num(x, y, num, 3, shortnum);
+    hud4p_hufnum(x, y, num);
 }
 
 void ST_DrawQuadHud(int pnum, int ox, int oy)
 {
     player_t *p = &players[pnum];
 
-    // ready-weapon ammo (skip fist/chainsaw: no ammo type)
+    // AM (flush-left, no %) | HE (centred) | armor % (flush-right) -- all big red, each
+    // right-justified in a 3-digit slot ending at *_X (skip fist/chainsaw: no ammo type)
     if (weaponinfo[p->readyweapon].ammo != am_noammo)
-        hud2p_num(ox + HUD4P_AMMO_X, oy + HUD4P_AMMO_Y,
-                  p->ammo[weaponinfo[p->readyweapon].ammo], 3, shortnum);
+        hud4p_hufnum(ox + HUD4P_AMMO_X, oy + HUD4P_AMMO_Y,
+                     p->ammo[weaponinfo[p->readyweapon].ammo]);
+    hud4p_pctnum(ox + HUD4P_HEALTH_X, oy + HUD4P_HEALTH_Y, p->health);
+    hud4p_pctnum(ox + HUD4P_ARMOR_X,  oy + HUD4P_ARMOR_Y,  p->armorpoints);
 
-    // health + armor (small '%' marker distinguishes them from the ammo count)
-    hud4p_pct(ox + HUD4P_HEALTH_X, oy + HUD4P_HEALTH_Y, p->health);
-    hud4p_pct(ox + HUD4P_ARMOR_X,  oy + HUD4P_ARMOR_Y,  p->armorpoints);
-
+    // Keys / frags are an OVERLAY on the 3D view: bottom-right of the quadrant, just
+    // ABOVE the band (oy - HUD4P_KEY_H), NOT inside the band.
     if (deathmatch)
     {
-        // deathmatch: frag total (kills on others minus own suicides) on the right.
-        // hud2p_num clamps <0 to 0, so a net-negative score shows "0" (rare edge).
+        // deathmatch: frag total (kills on others minus own suicides), big red
         int i, f = 0;
         for (i = 0; i < MAXPLAYERS; i++)
             f += (i == pnum) ? -p->frags[i] : p->frags[i];
-        hud2p_num(ox + HUD4P_FRAGS_X, oy + HUD4P_FRAGS_Y, f, 3, shortnum);
+        hud4p_hufnum(ox + HUD4P_FRAGS_X, oy - HUD4P_KEY_H, f);
     }
     else
     {
-        // co-op: the keys held (3 slots; skull overrides the same-colour card)
+        // co-op: keys held, upright in a row (3 slots; skull overrides the same-colour card)
         int i;
         for (i = 0; i < 3; i++)
         {
@@ -1285,7 +1300,7 @@ void ST_DrawQuadHud(int pnum, int ox, int oy)
             if (p->cards[i + 3]) k = i + 3;
             if (k >= 0)
                 V_DrawPatch(ox + HUD4P_KEYS_X + i * HUD4P_KEYS_DX,
-                            oy + HUD4P_KEYS_Y, keys[k]);
+                            oy - HUD4P_KEY_H, keys[k]);
         }
     }
 }
