@@ -1226,6 +1226,13 @@ void R_RenderPlayerView (player_t* player)
 
     game_phase = 4; /* R_RenderPlayerView (BSP + execute) */
 
+    /* SATURN: if the platform dispatched the end-of-frame framebuffer clear to the SLAVE SH-2
+       (sat_clear_slave, docs/BLIT_DMA_PLAN.md Inc3), that clear has been running concurrently with
+       the game tic.  JOIN it HERE -- before the BSP walk writes the first pixel -- so a still-running
+       slave clear can never race the master's render.  No-op (returns instantly) when no aux job is
+       pending (clear-on-master, DoomJo, or a prior split view already joined it). */
+    { extern void RP_AuxWait(void); RP_AuxWait(); }
+
     R_SetupFrame (player);
 
     // SATURN: age the bounded streaming texture cache once per view, before the

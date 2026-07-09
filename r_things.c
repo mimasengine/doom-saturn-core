@@ -108,6 +108,12 @@ int sat_things_emitted = 0;                 /* 1 = things went to VDP1 this view
 int sat_things_occ = 0;                     /* fully-occluded sprites skipped this frame (occlusion metric) */
 int sat_thing_cap = 4;                      /* platform sets = VDP1 thing slots/frame (VRAM cap); nearest win */
 int sat_things_hw = 1;                      /* platform (sat_apply_mode): 1 = world sprites on VDP1; 0 = software (M0/M6) */
+
+/* SATURN nearSprites cull (FastDoom, r_things.c:1137): 1 = drop FAR non-shootable decorations before
+   the projection math (they subtend a few px, invisible).  Live A/B via pad R+X (platform); default
+   0 = vanilla (draw every projected sprite); 1 = cull far decorations.  Shootable actors
+   (monsters/barrels) are NEVER culled.  Default ON (HW-validated 2026-07-09, pad R+X to A/B off). */
+int sat_near_sprites = 1;
 static char sat_thing_vdp1[MAXVISSPRITES];  /* per-vissprite (by array index): 1 = emitted on VDP1 */
 static char sat_thing_elig[MAXVISSPRITES];  /* 1 = selected (nearest sat_thing_cap) for VDP1 this frame */
 
@@ -638,8 +644,15 @@ void R_ProjectSprite (mobj_t* thing)
     // transform the origin point
     tr_x = thing->x - viewx;
     tr_y = thing->y - viewy;
-	
-    gxt = FixedMul(tr_x,viewcos); 
+
+    // SATURN: nearSprites cull (FastDoom) -- a non-shootable decoration >~610 map units out on
+    // either axis is a few px, invisible; reject it here before the FixedMul projection + the
+    // vissprite alloc + the later sort/software-fill.  Shootable actors are always projected.
+    if (sat_near_sprites && !(thing->flags & MF_SHOOTABLE)
+	&& (abs(tr_x) > 40000000 || abs(tr_y) > 40000000))
+	return;
+
+    gxt = FixedMul(tr_x,viewcos);
     gyt = -FixedMul(tr_y,viewsin);
     
     tz = gxt-gyt; 
