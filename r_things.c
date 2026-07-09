@@ -1423,7 +1423,19 @@ void R_SlaveDrawMasked (int x0, int x1)
     vissprite_t *spr;
     s_x0 = x0; s_x1 = x1;
     for (spr = vsprsortedhead.next ; spr != &vsprsortedhead ; spr=spr->next)
+    {
+        /* SATURN: honour the per-sprite VDP1 marks exactly like the master loop in R_DrawMasked
+           -- a sprite already on the VDP1 prio-7 layer must NOT be software-drawn again here, or
+           it double-draws.  This is what lets the masked-by-half split coexist with world-things-
+           on-VDP1 (before, the split was gated fully off because this path ignored the marks). */
+        if (sat_things_emitted)
+        {
+            int idx = spr - vissprites;
+            if (idx >= 0 && idx < MAXVISSPRITES && sat_thing_vdp1[idx])
+                continue;
+        }
         R_SlaveDrawSprite (spr);
+    }
 }
 
 /* World-things offload gate.  Two questions, two different metrics:
@@ -1655,10 +1667,13 @@ void R_DrawMasked (void)
 	/* SATURN masked-by-half: dispatch the slave to draw the RIGHT-half vissprites while the
 	   master draws the LEFT half (g_mask_x1).  Masked walls + psprites stay on the master,
 	   full width, after the wait. */
-	/* SATURN world-things-on-VDP1: when the kick emitted the sprites to VDP1, the masked-by-half
-	   slave split is off (most sprites are skipped below, and the slave path does not honour the
-	   per-sprite marks) -- the few software-fallback sprites draw full-width on the master. */
-	if (sat_masked_parallel && !sat_things_emitted)
+	/* SATURN world-things-on-VDP1: the masked-by-half split now coexists with the VDP1 things --
+	   R_SlaveDrawMasked honours the per-sprite sat_thing_vdp1 marks (skips VDP1 sprites, no double
+	   draw), so the slave takes HALF the SOFTWARE-fallback sprite fill (which piles entirely on the
+	   master when the AIMD cap declines, e.g. ec0 -> th0 -> every sprite software).  Was gated off
+	   (!sat_things_emitted) as a shipping shortcut when world-things landed; measured slave busy%
+	   showed the slave sitting ~90% idle while M ran master-only -> re-enabled 2026-07-09. */
+	if (sat_masked_parallel)
 	{
 	    int half = viewwidth >> 1;
 	    /* pre-cache every sprite patch on the master so the slave's W_CacheLumpNum only ever
