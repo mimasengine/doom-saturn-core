@@ -80,7 +80,14 @@
 #define SP_STATSY		50
 
 #define SP_TIMEX		16
-#define SP_TIMEY		(SCREENHEIGHT-32)
+// SATURN: the intermission graphics are a fixed 200-line canvas (the background patch is
+// 320x200).  Anchor TIME/PAR to THAT canvas bottom, not the physical SCREENHEIGHT -- on
+// Mimas SCREENHEIGHT is 224, so (SCREENHEIGHT-32)=192 drew the glyphs at row 192 with their
+// lower half spilling past the 200-row background edge ("TIME cut in two", floor showing
+// behind).  200-32=168 keeps them inside the art; identical to the stock value on a 200-line
+// build (DoomJo), so no behaviour change there.
+#define WI_CANVAS_H		200
+#define SP_TIMEY		(WI_CANVAS_H-32)
 
 
 // NET GAME STUFF
@@ -1308,8 +1315,16 @@ void WI_drawNetgameStats(void)
 	x = NG_STATSX;
 	V_DrawPatch(x-SHORT(p[i]->width), y, p[i]);
 
-	if (i == me)
-	    V_DrawPatch(x-SHORT(p[i]->width), y, star);
+	// SATURN: in local split-screen co-op every player is a local player, so draw the
+	// doomguy face on EVERY colour backdrop (vanilla faces only `me`, which left the
+	// other players' rows as empty colour blocks -- the "missing heads" bug).  Tint the
+	// shared face to each player's team colour so the marines are distinguishable:
+	// player 0 = green (no translation), players 1-3 use the sprite colour tables.
+	{
+	    extern byte *translationtables;
+	    byte *tr = (i == 0) ? NULL : (translationtables + (i - 1) * 256);
+	    V_DrawPatchTranslated(x - SHORT(p[i]->width), y, star, tr);
+	}
 
 	x += NG_SPACINGX;
 	WI_drawPercent(x-pwidth, y+10, cnt_kills[i]);	x += NG_SPACINGX;

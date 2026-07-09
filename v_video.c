@@ -194,6 +194,66 @@ void V_DrawPatch(int x, int y, patch_t *patch)
     }
 }
 
+// SATURN: V_DrawPatch with a per-index translation table (256 bytes).  Same column
+// walk as V_DrawPatch, but each source pixel is remapped through `trans` -- lets the
+// co-op intermission draw the shared doomguy face tinted to each player's team colour.
+void V_DrawPatchTranslated(int x, int y, patch_t *patch, byte *trans)
+{
+    int count;
+    int col;
+    column_t *column;
+    byte *desttop;
+    byte *dest;
+    byte *source;
+    int w;
+
+    if (!trans) { V_DrawPatch(x, y, patch); return; }
+
+    y -= SHORT(patch->topoffset);
+    x -= SHORT(patch->leftoffset);
+
+    if (patchclip_callback)
+    {
+        if (!patchclip_callback(patch, x, y))
+            return;
+    }
+
+#ifdef RANGECHECK
+    if (x < 0
+     || x + SHORT(patch->width) > SCREENWIDTH
+     || y < 0
+     || y + SHORT(patch->height) > SCREENHEIGHT)
+    {
+        I_Error("Bad V_DrawPatchTranslated x=%i y=%i w=%i h=%i", x, y, patch->width, patch->height);
+    }
+#endif
+
+    V_MarkRect(x, y, SHORT(patch->width), SHORT(patch->height));
+
+    col = 0;
+    desttop = dest_screen + y * SCREENWIDTH + x;
+    w = SHORT(patch->width);
+
+    for ( ; col < w ; x++, col++, desttop++)
+    {
+        column = (column_t *)((byte *)patch + LONG(patch->columnofs[col]));
+
+        while (column->topdelta != 0xff)
+        {
+            source = (byte *)column + 3;
+            dest = desttop + column->topdelta * SCREENWIDTH;
+            count = column->length;
+
+            while (count--)
+            {
+                *dest = trans[*source++];
+                dest += SCREENWIDTH;
+            }
+            column = (column_t *)((byte *)column + column->length + 4);
+        }
+    }
+}
+
 //
 // V_DrawPatchFlipped
 // Masks a column based masked pic to the screen.

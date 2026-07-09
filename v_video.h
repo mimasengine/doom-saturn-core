@@ -55,6 +55,10 @@ void V_CopyRect(int srcx, int srcy, byte *source,
                 int destx, int desty);
 
 void V_DrawPatch(int x, int y, patch_t *patch);
+// SATURN: like V_DrawPatch but each source index is remapped through `trans`
+// (a 256-byte translation table) -- used to tint the co-op intermission faces
+// to each player's team colour.  trans == NULL falls back to a plain draw.
+void V_DrawPatchTranslated(int x, int y, patch_t *patch, byte *trans);
 void V_DrawPatchFlipped(int x, int y, patch_t *patch);
 void V_DrawTLPatch(int x, int y, patch_t *patch);
 void V_DrawAltTLPatch(int x, int y, patch_t * patch);
