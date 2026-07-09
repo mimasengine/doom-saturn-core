@@ -570,6 +570,14 @@ R_FindPlane
 //
 // R_CheckPlane
 //
+/* forward: mark-suppress reads these RBG0-dominant-floor globals + the punch predicate, all
+   defined later in this file.  sat_floor_punch_here() is the SAME gate the draw-skip uses
+   (r_plane.c ~1359) -- it is FALSE in a non-punching split view, where the floor IS software-
+   drawn, so suppressing a split there would leave holes: we must gate on it, not on sat_vdp2_floor. */
+extern int     sat_mark_suppress, sat_vdp2_floor_pic, sat_vdp2_floor_band;
+extern fixed_t sat_vdp2_floor_h;
+extern int     sat_floor_punch_here(void);
+
 visplane_t*
 R_CheckPlane
 ( visplane_t*	pl,
@@ -612,6 +620,19 @@ R_CheckPlane
     {
 	unionh = pl->maxx;
 	intrh = stop;
+    }
+
+    /* SATURN mark-suppress: the elected RBG0 dominant floor is never rasterised, so it never needs
+       to split -- keep it as ONE plane (skip the scan + the fork's memset).  Same triple the draw-
+       skip uses (r_plane.c dominant test), gated on the RBG0 path + toggle so DoomJo / M0 and every
+       non-dominant plane fall through to the exact vanilla split logic below. */
+    if (sat_mark_suppress && sat_floor_punch_here()
+	&& pl->height == sat_vdp2_floor_h && pl->picnum == sat_vdp2_floor_pic
+	&& (pl->lightlevel >> LIGHTSEGSHIFT) == sat_vdp2_floor_band)
+    {
+	pl->minx = unionl;
+	pl->maxx = unionh;
+	return pl;
     }
 
     for (x=intrl ; x<= intrh ; x++)
@@ -1026,6 +1047,16 @@ int sat_vdp2_floor_band = 0;
    per-frame dominant pick was dropped).  Runtime toggle so BOTH paths stay compiled and are
    A/B-switchable without a rebuild; the platform sets it.  DoomJo never sets it. */
 int sat_vdp2_floor_dominant = 0;
+/* SATURN mark-suppress (2026-07-09): the RBG0 dominant floor is NEVER drawn (R_DrawPlanes hands
+   it to VDP2 RBG0 and skips its span fill).  A never-drawn plane never needs to SPLIT: R_CheckPlane
+   normally forks a new visplane (+320-byte memset, +pool slices, +MAXVISPLANES pressure) whenever a
+   later overlapping seg finds already-marked columns.  With this on, the dominant floor is forced to
+   stay ONE plane (expand, never split) -> those per-split memsets vanish from Bp (the audit sized
+   ~2-5ms) and the visplane count drops (helps big WADs).  Only the top/bottom of a plane that is
+   never rasterised become last-write-wins over seam overlaps -- harmless; floorclip (sprite
+   occlusion) is untouched.  Toggle only (default 0 / DoomJo); gated on the RBG0 path (sat_vdp2_floor)
+   and the elected dominant triple so a non-dominant floor still splits and draws correctly. */
+int sat_mark_suppress = 0;
 /* SATURN (Romain 2026-06-30): the TOP screen row (framebuffer row) of the floor actually punched this
    frame -- the floor plane's real on-screen horizon.  The platform clips the RBG0 window AND the
    HW-sky transparent boundary to THIS row so the sky always comes down exactly to the floor (no
