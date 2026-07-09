@@ -1484,8 +1484,15 @@ R_StoreWallRange_impl
 	{
 	    // masked midtexture
 	    maskedtexture = true;
-	    ds_p->maskedtexturecol = maskedtexturecol = lastopening - rw_x;
-	    lastopening += rw_stopx - rw_x;
+	    // SATURN garde-OPENINGS: if the shared pool would overflow, sink this seg's masked-column
+	    // table into opening_overflow (harmless writes, garbage-column HOM) instead of corrupting RAM.
+	    if (lastopening + (rw_stopx - rw_x) > openings_end)
+	    { ds_p->maskedtexturecol = maskedtexturecol = opening_overflow - rw_x; r_opening_ovf++; }
+	    else
+	    {
+		ds_p->maskedtexturecol = maskedtexturecol = lastopening - rw_x;
+		lastopening += rw_stopx - rw_x;
+	    }
 	}
     }
     
@@ -1596,17 +1603,27 @@ R_StoreWallRange_impl
     if ( ((ds_p->silhouette & SIL_TOP) || maskedtexture)
 	 && !ds_p->sprtopclip)
     {
-	memcpy (lastopening, ceilingclip+start, 2*(rw_stopx-start));
-	ds_p->sprtopclip = lastopening - start;
-	lastopening += rw_stopx - start;
+	if (lastopening + (rw_stopx - start) > openings_end)   /* SATURN garde-OPENINGS: sink (bounded copy = HOM, not corruption) */
+	{ memcpy (opening_overflow, ceilingclip+start, 2*(rw_stopx-start)); ds_p->sprtopclip = opening_overflow - start; r_opening_ovf++; }
+	else
+	{
+	    memcpy (lastopening, ceilingclip+start, 2*(rw_stopx-start));
+	    ds_p->sprtopclip = lastopening - start;
+	    lastopening += rw_stopx - start;
+	}
     }
     
     if ( ((ds_p->silhouette & SIL_BOTTOM) || maskedtexture)
 	 && !ds_p->sprbottomclip)
     {
-	memcpy (lastopening, floorclip+start, 2*(rw_stopx-start));
-	ds_p->sprbottomclip = lastopening - start;
-	lastopening += rw_stopx - start;
+	if (lastopening + (rw_stopx - start) > openings_end)   /* SATURN garde-OPENINGS: sink (bounded copy = HOM, not corruption) */
+	{ memcpy (opening_overflow, floorclip+start, 2*(rw_stopx-start)); ds_p->sprbottomclip = opening_overflow - start; r_opening_ovf++; }
+	else
+	{
+	    memcpy (lastopening, floorclip+start, 2*(rw_stopx-start));
+	    ds_p->sprbottomclip = lastopening - start;
+	    lastopening += rw_stopx - start;
+	}
     }
 
     if (maskedtexture && !(ds_p->silhouette&SIL_TOP))

@@ -27,6 +27,10 @@
 
 // Visplane related.
 extern  short*		lastopening;
+// SATURN garde-OPENINGS: overflow guard for the shared openings pool (see r_plane.c / r_segs.c).
+extern  short* const	openings_end;       // == openings + MAXOPENINGS
+extern  short		opening_overflow[];  // graceful sink (SCREENWIDTH) for overflowing writes
+extern  int		r_opening_ovf;       // redirects this frame (0 = no overflow)
 
 
 typedef void (*planefunction_t) (int top, int bottom);

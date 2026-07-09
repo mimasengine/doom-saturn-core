@@ -192,6 +192,15 @@ static void R_HashInsert (int bucket, int idx)
 #define MAXOPENINGS	SCREENWIDTH*64
 short			openings[MAXOPENINGS];
 short*			lastopening;
+/* SATURN garde-OPENINGS (crash-proof, mirrors the P0 overflowplane/pool sinks): the shared openings
+   pool (masked-column tables + sprite clip snapshots, filled in r_segs.c) has NO bounds guard in
+   vanilla -- a big PWAD with many silhouetted segs overruns it, corrupting RAM past openings[] and
+   tripping the post-hoc RANGECHECK I_Error freeze.  openings_end bounds the r_segs.c writes; anything
+   that would overflow is redirected into opening_overflow (a single SCREENWIDTH sink) = a HOM/wrong-clip
+   glitch on those segs, never a corruption/freeze.  r_opening_ovf counts redirects/frame (instrument). */
+short* const		openings_end = openings + MAXOPENINGS;
+short			opening_overflow[SCREENWIDTH];
+int			r_opening_ovf = 0;
 
 
 //
@@ -464,6 +473,7 @@ void R_ClearPlanes (void)
 #endif
     lastvisplane = visplanes;
     lastopening = openings;
+    r_opening_ovf = 0;   /* SATURN garde-OPENINGS: per-frame reset of the overflow-redirect count */
 #if SAT_VISPLANE_POOL
     plane_pool_ptr = plane_pool;   /* bump-reset the span pool for the new frame */
     r_visplane_pool_ovf = 0;
