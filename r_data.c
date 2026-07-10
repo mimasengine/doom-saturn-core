@@ -155,6 +155,14 @@ short**			texturecolumnlump;
 unsigned short**	texturecolumnofs;
 byte**			texturecomposite;
 
+// SATURN crash-proof (garde-COMPOSITE, same lineage as garde-OPENINGS / overflowplane): when a
+// multi-patch texture's composite cannot be allocated (zone full/fragmented -- TNT MAP15: 32KB
+// PU_STATIC vs lg31K), R_GenerateComposite USED to I_Error-freeze.  Now it bails and publishes this
+// shared placeholder column as a sentinel; R_GetColumn serves it (the texture renders as a flat
+// placeholder, never a crash/OOB).  256 bytes covers any standard Doom column height; zero-init.
+byte			r_column_stub[256];
+int			r_composite_ovf = 0;   // # textures stubbed (extern, overlay 'tc')
+
 // for global animation
 int*		flattranslation;
 int*		texturetranslation;
@@ -265,6 +273,17 @@ void R_GenerateComposite (int texnum)
     if (block)
     {
 	cached = 1;	// pool block; texturecomposite[texnum] already published
+    }
+    else if (Z_LargestAllocatable() < texturecompositesize[texnum])
+    {
+	// SATURN garde-COMPOSITE: the composite will not fit the zone even after purging PU_CACHE
+	// (Z_LargestAllocatable == what Z_Malloc could get).  A Z_Malloc here would I_Error-freeze.
+	// Publish the shared stub as a sentinel + bail; R_GetColumn serves the placeholder column.
+	texturecomposite[texnum] = r_column_stub;
+	r_composite_ovf++;
+	Z_ChangeTag (texturecolumnlump[texnum], PU_CACHE);   // unpin (mirrors the tail below)
+	Z_ChangeTag (texturecolumnofs[texnum],  PU_CACHE);
+	return;
     }
     else
     {
@@ -467,8 +486,11 @@ R_GetColumn
 
     if (!texturecomposite[tex])
 	R_GenerateComposite (tex);
-    else if (sat_texcache_active)
+    else if (sat_texcache_active && texturecomposite[tex] != r_column_stub)
 	R_TexCacheTouch (texturecomposite[tex]);   // keep visible composites resident
+
+    if (texturecomposite[tex] == r_column_stub)   // SATURN garde-COMPOSITE: OOM sentinel -> placeholder, no crash/OOB
+	return r_column_stub;
 
     return texturecomposite[tex] + ofs;
 }
