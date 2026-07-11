@@ -41,6 +41,13 @@ extern boolean W_PtrIsMapped(const void *p);
 #define MEM_ALIGN sizeof(void *)
 #define ZONEID	0x1d4a11
 
+// SATURN diag (SAT_ZONE_RA): tag every block with its Z_Malloc caller so the top-8 resident
+// dump can NAME the big blocks (resolve ra vs build/Mimas.map) -> attribute the RAM-diet targets.
+// +4 bytes/block header (a few KB) -- keep ON while dieting the zone, flip to 0 to ship.
+#ifndef SAT_ZONE_RA
+#define SAT_ZONE_RA 1
+#endif
+
 typedef struct memblock_s
 {
     int			size;	// including the header and possibly tiny fragments
@@ -49,6 +56,9 @@ typedef struct memblock_s
     int			id;	// should be ZONEID
     struct memblock_s*	next;
     struct memblock_s*	prev;
+#if SAT_ZONE_RA
+    void*		ra;	// Z_Malloc caller (alloc site)
+#endif
 } memblock_t;
 
 
@@ -273,6 +283,9 @@ Z_Malloc
                (resolve against build/Mimas.map to name the victim alloc).  Tags:
                1=STATIC 2=SOUND 3=MUSIC 50=LEVEL 51=LEVSPEC. */
             int t_sz[8] = {0}, t_tag[8] = {0}, t_off[8] = {0};
+#if SAT_ZONE_RA
+            void* t_ra[8] = {0};
+#endif
             for (b = mainzone->blocklist.next ; b != &mainzone->blocklist ; b = b->next)
             {
                 if (b->tag == PU_FREE || b->tag >= PU_PURGELEVEL)   continue;
@@ -282,15 +295,26 @@ Z_Malloc
                 {
                     int j = 7;
                     while (j > 0 && t_sz[j-1] < b->size)
-                    { t_sz[j]=t_sz[j-1]; t_tag[j]=t_tag[j-1]; t_off[j]=t_off[j-1]; j--; }
+                    { t_sz[j]=t_sz[j-1]; t_tag[j]=t_tag[j-1]; t_off[j]=t_off[j-1];
+#if SAT_ZONE_RA
+                      t_ra[j]=t_ra[j-1];
+#endif
+                      j--; }
                     t_sz[j]  = b->size;
                     t_tag[j] = b->tag;
                     t_off[j] = (int)((char*)b - (char*)mainzone);
+#if SAT_ZONE_RA
+                    t_ra[j]  = b->ra;
+#endif
                 }
             }
-            printf("ZONE top8 resident (KB t=tag @KB from base):\n");
+            printf("ZONE top8 resident (KB t=tag @KB ra=allocsite):\n");
             for (int i = 0 ; i < 8 && t_sz[i] ; i++)
+#if SAT_ZONE_RA
+                printf(" %2dK t%d @%dK ra=%p\n", t_sz[i]>>10, t_tag[i], t_off[i]>>10, t_ra[i]);
+#else
                 printf(" %2dK t%d @%dK\n", t_sz[i]>>10, t_tag[i], t_off[i]>>10);
+#endif
             I_Error ("Zmalloc fail %i t%d ra=%p (fr%dK lg%dK st%dK lv%dK)",
                      size, tag, __builtin_return_address(0),
                      Z_FreeMemory()>>10, Z_LargestAllocatable()>>10,
@@ -365,6 +389,9 @@ Z_Malloc
 
     base->user = user;
     base->tag = tag;
+#if SAT_ZONE_RA
+    base->ra = __builtin_return_address(0);   // who called Z_Malloc (W_CacheLumpNum / R_GenerateComposite / P_Setup...)
+#endif
 
     result  = (void *) ((byte *)base + sizeof(memblock_t));
 

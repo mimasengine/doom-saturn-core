@@ -292,6 +292,26 @@ void R_GenerateComposite (int texnum)
 			  &texturecomposite[texnum]);
     }
 
+    // SATURN garde-COMPOSITE (patch phase): with the composite now allocated + pinned, verify the
+    // BIGGEST source patch will still fit alongside it -- else the W_CacheLumpNum(patch) loop below
+    // would I_Error-freeze (the observed TNT 29KB t8 crash: a big texture patch on a fragmented zone).
+    // Bail to the placeholder stub instead (giving back the composite block if it was ours).
+    {
+	int big = 0, k;
+	texpatch_t *pp = texture->patches;
+	for (k = 0; k < texture->patchcount; k++, pp++)
+	{ int pl = W_LumpLength (pp->patch); if (pl > big) big = pl; }
+	if (Z_LargestAllocatable () < big)
+	{
+	    if (!cached) Z_Free (block);
+	    texturecomposite[texnum] = r_column_stub;
+	    r_composite_ovf++;
+	    Z_ChangeTag (texturecolumnlump[texnum], PU_CACHE);
+	    Z_ChangeTag (texturecolumnofs[texnum],  PU_CACHE);
+	    return;
+	}
+    }
+
     collump = texturecolumnlump[texnum];
     colofs = texturecolumnofs[texnum];
 
