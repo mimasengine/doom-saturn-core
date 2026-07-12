@@ -1063,6 +1063,20 @@ P_SetupLevel
         SAT_PrecacheLevelSounds ();
 #endif
 
+#ifdef SAT_REPACK
+    // SATURN R5.1 (STREAMING_FLUIDITY_ROADMAP.md §8): budgeted preload of this map's
+    // .DRP subset (sprites + flats first) into purgeable PU_CACHE, under the load fade
+    // -- first-sight assets stop paying their CD read mid-combat.  Runs LAST so neither
+    // the texcache carve nor the sfx warm-up competes with it; its keep-free guard makes
+    // it a no-op on zone-tight maps.  Demos skip it (precache == false), same convention
+    // as the precaches above.  No-op without an active .DRP.
+    if (precache && sat_streaming_mode)
+    {
+        extern void sat_drp_preload (void);
+        sat_drp_preload ();
+    }
+#endif
+
     //printf ("free memory: 0x%x\n", Z_FreeMemory());
 
 }

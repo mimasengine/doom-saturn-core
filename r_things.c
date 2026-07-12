@@ -91,6 +91,16 @@ void (*sat_psprite_hook)(patch_t *patch, int lump, int sx, int sy, int flip,
    the late software psprite draw.  0 on DoomJo / when the weapon stays software. */
 int sat_psprite_early = 0;
 
+/* SATURN front-only sprites (the Hexen-Saturn RAM trick; STREAMING_FLUIDITY_ROADMAP.md):
+   when set, every NON-PLAYER sprite draws its front rotation (lump[0]) regardless of view
+   angle, so rotation lumps are never requested.  Armed by the platform (w_drp_saturn.cxx)
+   when the .DRP was built --front-only, i.e. the rotation lumps are STRIPPED from the
+   per-map blobs -- a rotation request would take the full-WAD CD fallback (hitches, CD
+   traffic under CDDA).  Players keep their rotations (split-screen readability; the tool
+   keeps PLAY* in the blobs to match).  Render-only: gameplay, demos and netgame state are
+   untouched.  Always 0 on DoomJo (never armed). */
+int sat_sprite_frontonly = 0;
+
 /* SATURN world-things-on-VDP1 (de-risk probe, platform gate SAT_WORLD_THINGS_VDP1): draw the
    world sprites as prio-7 VDP1 quads (like the weapon) to offload the memory-bound masked FILL
    off the two SH-2s.  The platform hook bakes the sprite patch (full-patch, cache key lump+cmap)
@@ -685,7 +695,9 @@ void R_ProjectSprite (mobj_t* thing)
 #endif
     sprframe = &sprdef->spriteframes[ thing->frame & FF_FRAMEMASK];
 
-    if (sprframe->rotate)
+    // SATURN front-only: force the front view for non-players when the .DRP blobs
+    // carry no rotation lumps (sat_sprite_frontonly above).
+    if (sprframe->rotate && (!sat_sprite_frontonly || thing->player))
     {
 	// choose a different rotation based on player view
 	ang = R_PointToAngle (thing->x, thing->y);
