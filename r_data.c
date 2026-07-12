@@ -920,7 +920,23 @@ void R_InitSpriteLumps (void)
         extern int sat_drp_sprite_headers (int *w, int *lo, int *to, int n);
         if (sat_drp_sprite_headers (spritewidth, spriteoffset, spritetopoffset,
                                     numspritelumps))
-            return;
+        {
+            // Trust-but-verify: cross-check the first and last entries against the
+            // real patch headers (2 lump reads instead of numspritelumps).  A
+            // container/decode bug fails loudly here and the classic loop rebuilds.
+            boolean ok = true;
+            for (i = 0; i < 2 && ok; i++)
+            {
+                int k = i ? numspritelumps - 1 : 0;
+                patch = W_CacheLumpNum (firstspritelump + k, PU_CACHE);
+                ok = spritewidth[k]     == (SHORT(patch->width)      << FRACBITS)
+                  && spriteoffset[k]    == (SHORT(patch->leftoffset) << FRACBITS)
+                  && spritetopoffset[k] == (SHORT(patch->topoffset)  << FRACBITS);
+            }
+            if (ok)
+                return;
+            printf ("R3.1 sprite index MISMATCH -> classic rebuild\n");
+        }
     }
 #endif
 
