@@ -909,7 +909,21 @@ void R_InitSpriteLumps (void)
     spritewidth = Z_Malloc (numspritelumps*sizeof(*spritewidth), PU_STATIC, 0);
     spriteoffset = Z_Malloc (numspritelumps*sizeof(*spriteoffset), PU_STATIC, 0);
     spritetopoffset = Z_Malloc (numspritelumps*sizeof(*spritetopoffset), PU_STATIC, 0);
-	
+
+#ifdef SAT_REPACK
+    // SATURN R3.1 boot index (STREAMING_FLUIDITY_ROADMAP.md §6): if the DOOMRP.DRP
+    // carries a precomputed sprite-header section, fill all three arrays from one
+    // sequential read instead of caching every sprite lump (in CD-streaming mode
+    // that is ~1381 CD reads for 6 useful header bytes each).  Fails closed: absent
+    // section / stale count / read error -> fall through to the classic loop below.
+    {
+        extern int sat_drp_sprite_headers (int *w, int *lo, int *to, int n);
+        if (sat_drp_sprite_headers (spritewidth, spriteoffset, spritetopoffset,
+                                    numspritelumps))
+            return;
+    }
+#endif
+
     for (i=0 ; i< numspritelumps ; i++)
     {
 	if (!(i&63))
