@@ -91,15 +91,23 @@ void (*sat_psprite_hook)(patch_t *patch, int lump, int sx, int sy, int flip,
    the late software psprite draw.  0 on DoomJo / when the weapon stays software. */
 int sat_psprite_early = 0;
 
-/* SATURN front-only sprites (the Hexen-Saturn RAM trick; STREAMING_FLUIDITY_ROADMAP.md):
-   when set, every NON-PLAYER sprite draws its front rotation (lump[0]) regardless of view
-   angle, so rotation lumps are never requested.  Armed by the platform (w_drp_saturn.cxx)
-   when the .DRP was built --front-only, i.e. the rotation lumps are STRIPPED from the
-   per-map blobs -- a rotation request would take the full-WAD CD fallback (hitches, CD
-   traffic under CDDA).  Players keep their rotations (split-screen readability; the tool
-   keeps PLAY* in the blobs to match).  Render-only: gameplay, demos and netgame state are
-   untouched.  Always 0 on DoomJo (never armed). */
-int sat_sprite_frontonly = 0;
+/* SATURN sprite-rotation degradation ladder (STREAMING_FLUIDITY_ROADMAP.md):
+     8 = full (default)                    5 lumps per rotated frame
+     4 = front/back/left/right (cardinal)  3 lumps (sides share the mirrored A3A7)
+     2 = front/back                        2 lumps
+     1 = front only (Hexen-Saturn trick)   1 lump
+   Armed by the platform (w_drp_saturn.cxx) from the .DRP header: the blobs carry
+   EXACTLY the kept rotations, so the level is a CEILING baked into the disc -- a
+   request above it would take the full-WAD CD fallback (hitches, CD traffic under
+   CDDA).  Players are always exempt (PLAY* stays complete in the blobs).
+   MULTIPLAYER: levels 4/2 preserve the "which player is it facing/targeting" cue --
+   each split view quantizes the SAME world facing to its own angle, so the fronted
+   player sees the face and the flanking player the back/side.  Level 1 destroys that
+   cue for everyone (every view sees the monster face-on) => level-1 discs are
+   SOLO-oriented; ship level 4 (fits the 4MB cart on all three big IWADs) or at
+   minimum level 2 for multiplayer.  Render-only: gameplay/demos untouched.  Always
+   8 on DoomJo (never armed). */
+int sat_sprite_rotlevel = 8;
 
 /* SATURN world-things-on-VDP1 (de-risk probe, platform gate SAT_WORLD_THINGS_VDP1): draw the
    world sprites as prio-7 VDP1 quads (like the weapon) to offload the memory-bound masked FILL
@@ -695,13 +703,21 @@ void R_ProjectSprite (mobj_t* thing)
 #endif
     sprframe = &sprdef->spriteframes[ thing->frame & FF_FRAMEMASK];
 
-    // SATURN front-only: force the front view for non-players when the .DRP blobs
-    // carry no rotation lumps (sat_sprite_frontonly above).
-    if (sprframe->rotate && (!sat_sprite_frontonly || thing->player))
+    // SATURN rotation ladder: quantize the view rotation to the levels the .DRP blobs
+    // actually carry (sat_sprite_rotlevel above; players always full).  Level 4/2
+    // offsets are derived so the kept views sit at their vanilla angles: level 4
+    // matches vanilla exactly on the cardinals and folds the diagonals to the nearest
+    // one; level 2 splits on the front/back half-plane.
+    if (sprframe->rotate && (sat_sprite_rotlevel > 1 || thing->player))
     {
 	// choose a different rotation based on player view
 	ang = R_PointToAngle (thing->x, thing->y);
-	rot = (ang-thing->angle+(unsigned)(ANG45/2)*9)>>29;
+	if (thing->player || sat_sprite_rotlevel >= 8)
+	    rot = (ang-thing->angle+(unsigned)(ANG45/2)*9)>>29;
+	else if (sat_sprite_rotlevel == 4)
+	    rot = ((ang-thing->angle+(unsigned)(ANG45)*5)>>30)<<1;   // indices 0/2/4/6
+	else
+	    rot = ((ang-thing->angle+(unsigned)(ANG90)*3)>>31)<<2;   // indices 0/4
 	lump = sprframe->lump[rot];
 	flip = (boolean)sprframe->flip[rot];
     }
