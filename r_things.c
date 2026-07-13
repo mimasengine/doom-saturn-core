@@ -106,8 +106,20 @@ int sat_psprite_early = 0;
    cue for everyone (every view sees the monster face-on) => level-1 discs are
    SOLO-oriented; ship level 4 (fits the 4MB cart on all three big IWADs) or at
    minimum level 2 for multiplayer.  Render-only: gameplay/demos untouched.  Always
-   8 on DoomJo (never armed). */
+   8 on DoomJo (never armed).  Since the v2 .DRP the level is PER MAP (re-armed at
+   sat_drp_select_map: a map whose full blob fits the cart keeps all 8 rotations;
+   only over-cart maps degrade). */
 int sat_sprite_rotlevel = 8;
+
+/* SATURN distance LOD UNDER the ceiling: beyond this distance (map units; 0 = off),
+   non-player sprites draw their front lump outright -- at that scale (a ~56-unit
+   monster is <=~12 px tall past ~750 units) the facing is unreadable anyway, so no
+   gameplay cue is lost, and the lump variety pulled by distant crowds collapses to
+   one lump per frame (cache/CD churn win on full-rotation discs, the multiplayer
+   case included).  lump[0] exists at EVERY rot level, so the LOD can only go BELOW
+   the disc ceiling, never request a stripped rotation.  Left 0 (off) in core;
+   Mimas's platform sets its default at boot (DoomJo untouched). */
+int sat_sprite_rotlod_dist = 0;
 
 /* SATURN world-things-on-VDP1 (de-risk probe, platform gate SAT_WORLD_THINGS_VDP1): draw the
    world sprites as prio-7 VDP1 quads (like the weapon) to offload the memory-bound masked FILL
@@ -703,18 +715,26 @@ void R_ProjectSprite (mobj_t* thing)
 #endif
     sprframe = &sprdef->spriteframes[ thing->frame & FF_FRAMEMASK];
 
-    // SATURN rotation ladder: quantize the view rotation to the levels the .DRP blobs
-    // actually carry (sat_sprite_rotlevel above; players always full).  Level 4/2
-    // offsets are derived so the kept views sit at their vanilla angles: level 4
-    // matches vanilla exactly on the cardinals and folds the diagonals to the nearest
-    // one; level 2 splits on the front/back half-plane.
-    if (sprframe->rotate && (sat_sprite_rotlevel > 1 || thing->player))
+    // SATURN rotation ladder + distance LOD: quantize the view rotation to the levels
+    // this map's .DRP blob actually carries (sat_sprite_rotlevel, per-map; players
+    // always full), and beyond sat_sprite_rotlod_dist serve the front lump outright
+    // (facing unreadable at that scale; lump[0] exists at every level so the LOD only
+    // ever goes BELOW the disc ceiling).  Level 4/2 offsets are derived so the kept
+    // views sit at their vanilla angles: level 4 matches vanilla exactly on the
+    // cardinals and folds the diagonals to the nearest one; level 2 splits on the
+    // front/back half-plane.
+    {
+    int rlvl = sat_sprite_rotlevel;
+    if (sat_sprite_rotlod_dist && rlvl > 1 && !thing->player
+	&& tz > ((fixed_t)sat_sprite_rotlod_dist << FRACBITS))
+	rlvl = 1;
+    if (sprframe->rotate && (rlvl > 1 || thing->player))
     {
 	// choose a different rotation based on player view
 	ang = R_PointToAngle (thing->x, thing->y);
-	if (thing->player || sat_sprite_rotlevel >= 8)
+	if (thing->player || rlvl >= 8)
 	    rot = (ang-thing->angle+(unsigned)(ANG45/2)*9)>>29;
-	else if (sat_sprite_rotlevel == 4)
+	else if (rlvl == 4)
 	    rot = ((ang-thing->angle+(unsigned)(ANG45)*5)>>30)<<1;   // indices 0/2/4/6
 	else
 	    rot = ((ang-thing->angle+(unsigned)(ANG90)*3)>>31)<<2;   // indices 0/4
@@ -726,6 +746,7 @@ void R_ProjectSprite (mobj_t* thing)
 	// use single rotation for all views
 	lump = sprframe->lump[0];
 	flip = (boolean)sprframe->flip[0];
+    }
     }
     
     // calculate edges of the shape
