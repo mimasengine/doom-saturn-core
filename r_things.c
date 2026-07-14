@@ -485,6 +485,9 @@ void R_DrawMaskedColumn (column_t* column)
    sets sat_sprite_ld). */
 int sat_sprite_ld = 0;   /* 1 = LD software sprites; combines with detailshift for the 4 wall/sprite
                             quality combos (platform sat_apply_mode). */
+extern int sat_lowres;   /* core r_main.c: half-h-res PACKED render + VDP2 x2 zoom (docs/LOWRES_RENDER_STUDY.md).
+                            In lowres the framebuffer is physically 160-wide, so the software sprite path must
+                            PACK (1 screen col per projection col), NOT upsample to 320 (which the blit cuts). */
 static void R_DrawSpriteCol (column_t* column, int write_x, int clip_x, int wide)
 {
     extern int   centery;
@@ -596,8 +599,11 @@ R_DrawVisSprite
 	    R_DrawSpriteCol (column, dc_x, dc_x, wide);
 	}
     }
-    else if (normal && detailshift && !sat_sprite_ld)
-    {   /* walls LD, sprite FULL: upsample -- 2 distinct texels per (halved) projection column */
+    else if (normal && detailshift && !sat_sprite_ld && !sat_lowres)
+    {   /* walls LD, sprite FULL: upsample -- 2 distinct texels per (halved) projection column.
+           SATURN lowres: SKIP this (falls to the packed R_DrawMaskedColumn else-branch) -- the
+           framebuffer is physically 160-wide there, so upsampling to 320 would write past the
+           blitted region and the sprite would be cut + stretched by the x2 zoom. */
 	for (dc_x=vis->x1 ; dc_x<=vis->x2 ; dc_x++, frac += vis->xiscale)
 	{
 	    int sx, tcL, tcR;
@@ -1681,8 +1687,13 @@ void R_EmitWorldThingsVDP1 (void)
 	if (hpx < 1) hpx = 1;
 
 	ybot = ytop + hpx - 1;
+	/* SATURN: x1full is a PROJECTION COLUMN (0..viewwidth-1) -> shift to screen space by
+	   detailshift; wpx is already a FULL-PIXEL width (detailshift is baked into spr->scale,
+	   line "vis->scale = xscale<<detailshift"), so it must NOT be shifted again.  The old
+	   (x1full+wpx)<<detailshift double-counted wpx -> the sprite came out 2x too WIDE in
+	   low-res (detailshift=1).  detailshift=0 (shipping default) is byte-identical. */
 	x0s = (x1full << detailshift) + viewwindowx;
-	x1s = (((x1full + wpx) << detailshift) - 1) + viewwindowx;
+	x1s = (x1full << detailshift) + wpx - 1 + viewwindowx;
 	y0s = ytop + viewwindowy;
 	y1s = ybot + viewwindowy;
 
@@ -1735,8 +1746,10 @@ void R_DrawMasked (void)
 	   master when the AIMD cap declines, e.g. ec0 -> th0 -> every sprite software).  Was gated off
 	   (!sat_things_emitted) as a shipping shortcut when world-things landed; measured slave busy%
 	   showed the slave sitting ~90% idle while M ran master-only -> re-enabled 2026-07-09. */
-	if (sat_masked_parallel)
-	{
+	if (sat_masked_parallel && !sat_lowres)
+	{   /* SATURN lowres: the slave's R_SlaveDrawMasked upsamples its half to 320 (a separate impl),
+	       which would cut the sprite at g_mask_x1 ("entre les deux SH2").  Draw all software sprites
+	       on the master (packed 160) in lowres -- already ~half the fill, so the slave loss is small. */
 	    int half = viewwidth >> 1;
 	    /* pre-cache every sprite patch on the master so the slave's W_CacheLumpNum only ever
 	       finds them already cached -> no concurrent zone alloc (which would race the heap

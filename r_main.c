@@ -675,6 +675,17 @@ R_SetViewSize
    overwrites the same shared tables, so it invalidates this cache below. */
 static int satvw_w = -1, satvw_h = -1, satvw_ds = -1;
 
+// SATURN low-res 3D-view mode (docs/LOWRES_RENDER_STUDY.md): render the software
+// framebuffer at HALF horizontal resolution (viewwidth 160, PACKED) so the platform
+// can VDP2 hardware-x2-zoom NBG1 -> real fill+blit halving.  We force detailshift=1
+// (=> viewwidth 160, and the VDP1 walls/weapon + RBG0 floor keep emitting at x<<1 =
+// full 320, so they stay crisp and ALIGNED with the 2x-zoomed software) BUT keep the
+// NORMAL (packed, 1 byte/column) drawers instead of the *Low duplicators -- that is
+// what makes the framebuffer physically 160-wide.  Platform flips it via R_SetLowRes.
+// DoomJo: default 0 = byte-identical (detailshift path untouched).
+int sat_lowres = 0;
+void R_SetLowRes (int on) { sat_lowres = on; setsizeneeded = true; }
+
 void R_ExecuteSetViewSize (void)
 {
     fixed_t	cosadj;
@@ -698,7 +709,7 @@ void R_ExecuteSetViewSize (void)
 	viewheight = (setblocks*(SCREENHEIGHT-32)/10)&~7;   /* SATURN: 168->192 for 224 (bar=32) */
     }
     
-    detailshift = setdetail;
+    detailshift = sat_lowres ? 1 : setdetail;   /* SATURN: lowres forces the 160-col projection */
     viewwidth = scaledviewwidth>>detailshift;
 	
     centery = viewheight/2;
@@ -707,8 +718,11 @@ void R_ExecuteSetViewSize (void)
     centeryfrac = centery<<FRACBITS;
     projection = centerxfrac;
 
-    if (!detailshift)
+    if (!detailshift || sat_lowres)
     {
+	/* SATURN lowres: detailshift is 1 (for the 160-col projection + VDP1 x<<1) but we
+	   use the NORMAL drawers -- they write ONE byte per logical column 0..159 = a
+	   PACKED 160-wide framebuffer (the *Low drawers would re-duplicate back to 320). */
 	colfunc = basecolfunc = R_DrawColumn;
 	fuzzcolfunc = R_DrawFuzzColumn;
 	transcolfunc = R_DrawTranslatedColumn;

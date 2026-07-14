@@ -278,6 +278,10 @@ extern int sat_floor_ld;
    r_data.c), set per-visplane in R_DrawPlanes; replaces the old centre-texel sample. */
 int sat_floor_color = 0;
 extern int R_FlatPotatoColor (int lumpnum);
+/* SATURN low-res (docs/LOWRES_RENDER_STUDY.md): the framebuffer is physically 160-wide, so the
+   Potato span memsets must PACK (1 px/source col), NOT upsample to 320 like the detailshift path
+   does -- otherwise the ceiling is written past the blitted 160 and cut.  Default 0 = untouched. */
+extern int sat_lowres;
 /* SATURN: framebuffer row/column lookup -- also externed below for R_DrawPlanes;
    hoisted here so R_MapPlane's inline Potato span memset can reach them. */
 extern byte *ylookup[];
@@ -416,7 +420,7 @@ R_MapPlane
     {
 	byte  c = ds_colormap[sat_floor_color];   /* flat dominant/average (R_FlatPotatoColor) */
 	byte *d;
-	if (detailshift)
+	if (detailshift && !sat_lowres)
 	{
 	    d = ylookup[y] + columnofs[x1 << 1];
 	    memset(d, c, (size_t)((x2 - x1 + 1) * 2));   /* low-detail: 2 screen px / source */
@@ -761,7 +765,7 @@ static inline void R_PotatoSpan (int y, int x1, int x2, fixed_t plheight,
     }
 
     c = cmap[color];   /* the flat's dominant/average colour (R_FlatPotatoColor), distance-shaded */
-    if (detailshift)
+    if (detailshift && !sat_lowres)
     {
         d = ylookup[y] + columnofs[x1 << 1];
         memset (d, c, (size_t)((x2 - x1 + 1) * 2));
