@@ -58,8 +58,23 @@ typedef struct
 
 // Location of each lump on disk.
 
-lumpinfo_t *lumpinfo;		
+lumpinfo_t *lumpinfo;
 unsigned int numlumps = 0;
+
+// SATURN garde-W_ReadLump: count of streaming reads that came up short and were
+// zero-filled (crash-proofed) instead of I_Error-freezing.  Surfaced on the debug
+// overlay (LIM row `rl`).  0 = every read was complete this session; >0 = a short CD
+// read was sunk (see W_ReadLump below).
+int r_readlump_short = 0;
+
+// SATURN R4.3c: the single WAD file backing every lump (was a per-lump lumpinfo.wad_file
+// pointer -- dropped to save 4B/lump off the zone).  Set once by W_AddFile; a second file
+// trips a loud guard there.  All read sites below use this instead of lump->wad_file.
+static wad_file_t *w_wadfile = NULL;
+
+// SATURN R4.3c: accessor for the single WAD file -- w_checksum.c needs it now that the
+// per-lump lumpinfo.wad_file field is gone (with one file every lump is file #0).
+wad_file_t *W_MainWadFile(void) { return w_wadfile; }
 
 // Hash table for fast lookups
 
@@ -165,6 +180,13 @@ wad_file_t *W_AddFile (char *filename)
 		return NULL;
     }
 
+    // SATURN R4.3c: lumpinfo dropped its per-lump wad_file pointer -> one global file.
+    // Mimas only ever adds a single WAD; fail loud rather than silently corrupt reads
+    // if a second (different) file is ever added (would need the per-lump field back).
+    if (w_wadfile != NULL && w_wadfile != wad_file)
+        I_Error ("W_AddFile: multi-file not supported (lumpinfo.wad_file dropped, R4.3c)");
+    w_wadfile = wad_file;
+
     newnumlumps = numlumps;
 
     if (strcasecmp(filename+strlen(filename)-3 , "wad" ) )
@@ -222,7 +244,6 @@ wad_file_t *W_AddFile (char *filename)
 
     for (i=startlump; i<numlumps; ++i)
     {
-		lump_p->wad_file = wad_file;
 		lump_p->position = LONG(filerover->filepos);
 		lump_p->size = LONG(filerover->size);
 			lump_p->cache = NULL;
@@ -364,9 +385,9 @@ void W_ReadLump(unsigned int lump, void *dest)
        Bypass Saturn_Read (which gates on sat_wad_size and can return 0 for
        lumps in the second half of the WAD) and memcpy directly from the
        memory-mapped region, exactly as W_CacheLumpNum does. */
-    if (l->wad_file->mapped != NULL)
+    if (w_wadfile->mapped != NULL)
     {
-        memcpy(dest, l->wad_file->mapped + l->position, l->size);
+        memcpy(dest, w_wadfile->mapped + l->position, l->size);
         I_EndRead();
         return;
     }
@@ -381,12 +402,21 @@ void W_ReadLump(unsigned int lump, void *dest)
     }
 #endif
 
-    c = W_Read(l->wad_file, l->position, dest, l->size);
+    c = W_Read(w_wadfile, l->position, dest, l->size);
 
     if (c < l->size)
     {
-	I_Error ("W_ReadLump: only read %i of %i on lump %i",
-		 c, l->size, lump);
+	// SATURN garde-W_ReadLump: a streaming CD read that returns short (transient GFS
+	// truncation, or an endgame-fragmented heap starving the bounce staging) used to
+	// I_Error-freeze here -- the LAST fatal I_Error on the gameplay hot path (the TNT
+	// halt seen in capture #9).  Sink it gracefully instead: zero-fill the shortfall
+	// and continue, so a missing lump renders as HOM / a silent lump (survivable)
+	// rather than a hard crash.  Same graceful-sink policy as the visplane / openings
+	// / composite guards.  r_readlump_short (overlay LIM `rl`) flags how often it fired.
+	if (c < 0)
+	    c = 0;
+	memset((byte *) dest + c, 0, l->size - c);
+	r_readlump_short++;
     }
 
     I_EndRead ();
@@ -424,11 +454,11 @@ void *W_CacheLumpNum(int lumpnum, int tag)
     // region.  If the lump is in an ordinary file, we may already
     // have it cached; otherwise, load it into memory.
 
-    if (lump->wad_file->mapped != NULL)
+    if (w_wadfile->mapped != NULL)
     {
         // Memory mapped file, return from the mmapped region.
 
-        result = lump->wad_file->mapped + lump->position;
+        result = w_wadfile->mapped + lump->position;
     }
     else if (lump->cache != NULL)
     {
@@ -480,7 +510,7 @@ void W_ReleaseLumpNum(int lumpnum)
 
     lump = &lumpinfo[lumpnum];
 
-    if (lump->wad_file->mapped != NULL)
+    if (w_wadfile->mapped != NULL)
     {
         // Memory-mapped file, so nothing needs to be done here.
     }
@@ -511,7 +541,7 @@ boolean W_PtrIsMapped(const void *p)
 
     if (numlumps == 0 || p == NULL)
         return false;
-    wf = lumpinfo[0].wad_file;
+    wf = w_wadfile;
     if (wf == NULL || wf->mapped == NULL)
         return false;
     m = (const byte *)wf->mapped;

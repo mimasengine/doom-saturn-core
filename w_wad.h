@@ -41,7 +41,13 @@ typedef struct lumpinfo_s lumpinfo_t;
 struct lumpinfo_s
 {
     char	name[8];
-    wad_file_t *wad_file;
+    // SATURN R4.3c: the per-lump `wad_file` pointer was dropped (-4B/lump, ~11K on a
+    // ~2900-lump IWAD -> the 944K zone) -- Mimas loads exactly ONE WAD file (D_AddFile
+    // once; the -file PWAD path is unreachable with no argv and FEATURE_WAD_MERGE off),
+    // and W_PtrIsMapped already treated lumpinfo[0].wad_file as THE file.  The single
+    // file now lives in w_wadfile (w_wad.c), guarded loud on a 2nd W_AddFile.
+    // DoomJo: also single-file on console -> benign; a multi-file build would trip the
+    // guard and must restore the per-lump field.
     int		position;
     int		size;
     void       *cache;
@@ -56,6 +62,7 @@ extern lumpinfo_t *lumpinfo;
 extern unsigned int numlumps;
 
 wad_file_t *W_AddFile (char *filename);
+wad_file_t *W_MainWadFile(void);   // SATURN R4.3c: the single WAD file (lumpinfo.wad_file dropped)
 
 int	W_CheckNumForName (char* name);
 int	W_GetNumForName (char* name);
