@@ -118,7 +118,20 @@ void R_ClearTextureCaches (void)
 
 void R_SetupTextureCaches (void)
 {
-    int largest, sz;
+    // SATURN R4.4: adaptive slab ladder.  Take the biggest (slab,margin) rung that
+    // fits Z_LargestAllocatable, instead of the old all-or-nothing FIXED+MARGIN carve
+    // that ran split-screen CACHELESS on big WADs (the 96K+128K=224K contiguous run
+    // never exists on TNT/Plutonia and 23/32 Doom II maps -- exactly where the 2-4p
+    // anti-frag slab is needed).  Each rung's margin floor stays >= the ~35K sky/face
+    // contiguous patch (smallest margin = 64K) so the play tail never re-fragments
+    // below it.  Rungs derive from TEXCACHE_FIXED/MARGIN so the Makefile override
+    // still tunes the top rung.  DoomJo (sat_streaming_mode==0) never reaches here.
+    static const int rungs[3][2] = {
+        { TEXCACHE_FIXED,       TEXCACHE_MARGIN       },   // 96K + 128K (best)
+        { TEXCACHE_FIXED*2/3,   TEXCACHE_MARGIN*3/4   },   // 64K + 96K
+        { TEXCACHE_FIXED/2,     TEXCACHE_MARGIN/2     },   // 48K + 64K (floor)
+    };
+    int largest, sz, i;
 
     R_ClearTextureCaches ();          // drop any prior pool (no-op the first time)
 
@@ -137,18 +150,19 @@ void R_SetupTextureCaches (void)
     if (!sat_streaming_mode || sat_local_players <= 1)
         return;
 
-    // FIXED-size slab.  `largest` = the run Z_Malloc could hand out after purging
-    // PU_CACHE (Z_LargestAllocatable, not Z_LargestFreeBlock which counts only the
-    // tiny PU_FREE runs at level start and kept TXC a0).  Carve a small FIXED slab
-    // ONLY IF a >=MARGIN contiguous tail still remains after it -- that tail is what
-    // serves the big ~35K sky/face patches + the mid-play MUS lump; sizing the slab to
-    // leftover-minus-MARGIN shrank that tail to MARGIN and fragmented it below 35K
-    // (the contiguous-run OOM).  Below the threshold the tightest maps run cacheless.
+    // `largest` = the run Z_Malloc could hand out after purging PU_CACHE
+    // (Z_LargestAllocatable, not Z_LargestFreeBlock which counts only the tiny PU_FREE
+    // runs at level start and kept TXC a0).  Carve the biggest slab rung whose slab +
+    // its play-tail margin still fit -- that tail is what serves the big ~35K sky/face
+    // patches + the mid-play MUS lump.  Below the smallest rung the tightest maps run
+    // cacheless (the proven-playable baseline).
     largest = Z_LargestAllocatable ();
     sat_texcache_carve_lf = largest >> 10;   // diag: the run the carve saw (overlay TXC lf)
-    sz = TEXCACHE_FIXED;
-    if (largest < sz + TEXCACHE_MARGIN)
-        return;                       // can't keep both the slab and a play tail -> cacheless
+    sz = 0;
+    for (i = 0; i < 3; i++)
+        if (largest >= rungs[i][0] + rungs[i][1]) { sz = rungs[i][0]; break; }
+    if (!sz)
+        return;                       // even the 48K rung won't fit -> cacheless
 
     texcache_slab = Z_Malloc (sz, PU_STATIC, NULL);  // non-purgable; we own its lifetime
     texcache_zone = Z_InitZone (texcache_slab, sz);
