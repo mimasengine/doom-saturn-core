@@ -380,10 +380,29 @@ void HU_Start(void)
 
 }
 
+// SATURN: when non-NULL (set by dg_saturn in lowres 1p), HU_Drawer draws the message widget
+// into this scratch buffer (isolated glyphs on an index-0/transparent field, stride SCREENWIDTH)
+// instead of the framebuffer, so the platform re-emits it as a crisp prio-7 VDP1 sprite that is
+// immune to the NBG1 x2 zoom.  NULL (DoomJo / non-lowres) -> the message draws to the framebuffer
+// exactly as before -- zero behaviour change.  V_UseBuffer/V_RestoreBuffer live in v_video.c
+// (not #included here -> forward-declared).
+unsigned char *sat_hu_msg_buf = NULL;               // SATURN
+int            sat_hu_msg_drawn = 0;                // SATURN: 1 = message was on this frame (VDP1 emit gate)
+extern void V_UseBuffer(byte *buffer);              // SATURN
+extern void V_RestoreBuffer(void);                  // SATURN
+
 void HU_Drawer(void)
 {
 
-    HUlib_drawSText(&w_message);
+    if (sat_hu_msg_buf)                              // SATURN: isolate the message glyphs into VDP1 VRAM
+    {
+	V_UseBuffer(sat_hu_msg_buf);
+	HUlib_drawSText(&w_message);
+	V_RestoreBuffer();
+    }
+    else
+	HUlib_drawSText(&w_message);
+    sat_hu_msg_drawn = message_on ? 1 : 0;          // SATURN
     HUlib_drawIText(&w_chat);
     if (automapactive)
 	HUlib_drawTextLine(&w_title, false);
