@@ -1387,10 +1387,10 @@ void R_DrawPlanes (void)
 		    dc_source = R_GetColumn(skytexture, angle);
 		    if (!sat_split_active)
 			colfunc ();               /* 1p: byte-identical (span never overflows the texture) */
-		    else if (detailshift)
-			R_DrawSkyColumnLow ();    /* split low-detail: clamp the top overflow (no wrap) */
+		    else if (detailshift && !sat_lowres)
+			R_DrawSkyColumnLow ();    /* split low-detail: DUPLICATING drawer, clamp the top overflow (no wrap) */
 		    else
-			R_DrawSkyColumn ();       /* split hi-detail:  clamp the top overflow (no wrap) */
+			R_DrawSkyColumn ();       /* split hi-detail OR M7-lowres: PACKED drawer (1 col; lowres packs to fb[0,80)) */
 		}
 	    }
 	    continue;

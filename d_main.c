@@ -352,12 +352,15 @@ void D_Display (void)
     {
 	extern int sat_split_active, sat_split_vdp1, sat_wall_skip, viewheight;
 	extern int detailshift, sat_split_lowdetail, sat_psprite_yoff, sat_vdp2_sky;
+	extern int sat_lowres;   /* M7-multi: force the packed 80-col projection in split too */
 	extern int sat_vdp2_floor, sat_rbg0_view, sat_split_p1hw;   /* SATURN split: P1-only HW floor punch */
 	extern int sat_sky_view;                                    /* SATURN Part 5: elected HW-sky view (-1 = none) */
 	extern unsigned int sat_sky_px, sat_sky_px_view[4];         /* per-view sky coverage (election metric) */
 	extern unsigned int sat_sky_view_angle, viewangle;          /* elected view's angle -> platform NBG0 scroll (angle_t==unsigned int) */
 	extern void R_SetViewWindow (int, int, int, int);
 	extern void R_ExecuteSetViewSize (void);
+	extern void sat_view_sq_apply (int);     /* SATURN: per-view software-quality (split-context SQ) */
+	extern void sat_view_sq_restore (void);  /* SATURN: re-apply the 1p SQ after the split loop */
 	extern void (*sat_walls_done_hook)(void);
 	/* was_split is now a D_Display-scope static (near the top) so the status-bar redraw test can see it. */
 	/* SATURN: split-render only a REAL co-op game (usergame).  An armed
@@ -390,7 +393,14 @@ void D_Display (void)
 	    uint32_t tv[5] = { 0 }, td = 0;           /* per-view timestamps tv[0..n] + post-kick td */
 	    int i;
 	    sat_split_active = 1;
-	    detailshift = sat_split_lowdetail;        /* 0 = hi-detail (byte-identical); 1 = half-res */
+	    /* M7-multi (docs/LOWRES_RENDER_STUDY.md): lowres forces detailshift=1 in the split too,
+	       giving viewwidth=w>>1=80 per half (the packed 80-col projection).  R_SetViewWindow then
+	       packs each viewport into fb[wx/2, wx/2+80) and the whole-layer x2 NBG1 zoom restores it
+	       (P1 fb[0,80)->scr[0,160), P2 fb[80,160)->scr[160,320)).  Else = wall-SQ low-detail
+	       (0 = hi-detail, byte-identical).  The weapon-emit mirror (R_DrawSplitPlayerSprites, kick
+	       time) inherits this global detailshift, which is still 1 there (restored below AFTER the
+	       kick), so the VDP1 weapon scales identically. */
+	    detailshift = sat_lowres ? 1 : sat_split_lowdetail;
 	    sat_psprite_yoff = fh / 2 - 50;           /* drop the half-size gun to the view bottom */
 	    sat_vdp2_sky = 0;                         /* default: software sky; the loop sets it PER-VIEW = (i==sat_sky_view) so only the elected view (Part 5) gets the HW sky */
 	    /* sat_wall_skip is set PER VIEW in the loop below (all views VDP1 when pad-X on; all software when off) */
@@ -404,6 +414,7 @@ void D_Display (void)
 		sat_vdp2_floor = (sat_split_p1hw && i == sat_rbg0_view) ? 1 : 0;   /* SATURN split: only this view punches the HW floor */
 		sat_vdp2_sky   = (i == sat_sky_view) ? 1 : 0;   /* SATURN Part 5: only the ELECTED view gets the HW sky (index-0); the others draw software sky.  sat_sky_view==-1 (default) => all 0 = today's behaviour */
 		sat_wall_skip  = vdp1 ? 1 : 0;
+		sat_view_sq_apply (i);   /* SATURN: this viewport's wall/floor/ceil SQ (split-context, cuts per-view Bp+P) */
 		R_SetViewWindow (vpx[i], twop ? 0 : vpy[i], hw, fh);
 		R_RenderPlayerView (&players[i]);
 		sat_sky_px_view[i] = sat_sky_px;                /* SATURN Part 5: this view's sky coverage (platform election metric) */
@@ -417,9 +428,14 @@ void D_Display (void)
 	       minimap (software fb writes only; does NOT consume the VDP1 wall budget).  Drawn
 	       AFTER the kick + td so it never pollutes the sat_spl_kick measurement. */
 	    if (n == 3)
-		AM_DrawMiniMap (vpx[3], vpy[3], hw, fh);
+		/* M7-multi: pack the minimap into the bottom-right quad's LEFT half (fb x = 160>>1 = 80,
+		   w = 80) so it rides the 160-byte packed blit + x2 NBG1 zoom like the views; else full
+		   160-wide.  (AM_DrawMiniMap scales its content to w and rebuilds its scratch on a w change.) */
+		AM_DrawMiniMap (sat_lowres ? (vpx[3] >> 1) : vpx[3], vpy[3],
+				sat_lowres ? (hw >> 1) : hw, fh);
 	    sat_wall_skip    = sws;
 	    detailshift      = sds;
+	    sat_view_sq_restore ();   /* SATURN: back to the 1p SQ (after the kick@421 -- walls flushed with the split style) */
 	    sat_psprite_yoff = 0;
 	    sat_vdp2_sky     = sky_save;
 	    sat_vdp2_floor   = floor_save;

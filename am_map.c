@@ -1316,6 +1316,7 @@ void AM_drawPlayers(void)
 static byte*    mm_scratch     = NULL;
 static void*    mm_built_for   = NULL;          // the lines[] pointer the scratch was baked for
 static int      mm_built_shown = -1;            // the revealed-line count the scratch was baked for
+static int      mm_built_w      = -1;           // SATURN M7: the width the scratch was baked at (160/80)
 static int      mm_minx, mm_miny, mm_scale, mm_dh, mm_padx, mm_pady;
 
 // Bresenham into the LOCAL scratch (stride == w, a full-width buffer -> always safe).
@@ -1437,13 +1438,17 @@ void AM_DrawMiniMap(int ox, int oy, int w, int h)
         for (i = 0; i < numlines; i++)
             if (!(lines[i].flags & ML_DONTDRAW) && (cheating || (lines[i].flags & ML_MAPPED)))
                 shown++;
+        /* SATURN M7-multi: w varies (160 full / 80 packed) when the render mode is toggled live in
+           3p.  Allocate the scratch at the MAX width (SCREENWIDTH/2 = 160) so an 80<->160 switch
+           never overflows it, and add w to the rebuild key so the panel re-bakes when the width flips. */
         if (mm_scratch == NULL)
-            mm_scratch = Z_Malloc(w * h, PU_STATIC, NULL);
-        if (mm_built_for != (void*) lines || shown != mm_built_shown)
+            mm_scratch = Z_Malloc((SCREENWIDTH/2) * h, PU_STATIC, NULL);
+        if (mm_built_for != (void*) lines || shown != mm_built_shown || w != mm_built_w)
         {
             mm_build_scratch(mm_scratch, w, h);
             mm_built_for   = (void*) lines;
             mm_built_shown = shown;
+            mm_built_w     = w;
         }
     }
 

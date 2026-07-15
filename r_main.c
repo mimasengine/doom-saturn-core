@@ -842,32 +842,46 @@ void R_SetViewWindow (int wx, int wy, int w, int h)
 	    }
 	}
 
-	/* SATURN: select the draw funcs for the detail level (mirrors R_ExecuteSetViewSize) so
-	   the split low-detail path gets R_Draw*Low; self-corrects back to high when detailshift
-	   returns to 0 (the cache keys on detailshift).  detailshift=0 == the existing defaults. */
-	if (!detailshift)
-	{
-	    colfunc = basecolfunc = R_DrawColumn;
-	    fuzzcolfunc = R_DrawFuzzColumn;
-	    transcolfunc = R_DrawTranslatedColumn;
-	    spanfunc = R_DrawSpan;
-	}
-	else
-	{
-	    colfunc = basecolfunc = R_DrawColumnLow;
-	    fuzzcolfunc = R_DrawFuzzColumnLow;
-	    transcolfunc = R_DrawTranslatedColumnLow;
-	    spanfunc = R_DrawSpanLow;
-	}
     }
 
-    /* framebuffer pointers at the explicit origin -- ALWAYS (cheap, per-view).  columnofs is
-       indexed by SCREEN x (full width w = viewwidth<<detailshift); R_DrawColumnLow writes
-       columnofs[dc_x<<1] and [dc_x<<1 +1].  At detailshift=0, w==viewwidth -> identical loop. */
+    /* SATURN: select the draw funcs (mirrors R_ExecuteSetViewSize).  HOISTED OUT of the
+       size-table cache above: it must reflect sat_lowres, which is NOT in the cache key
+       (w,h,detailshift).  Split low-detail and M7-lowres BOTH run at detailshift=1 but need
+       DIFFERENT drawers -- duplicating *Low vs packed -- so a cache hit on unchanged
+       (w,h,detailshift) must still update this.  Cheap (4 ptr writes/view).  M7-multi:
+       sat_lowres picks the PACKED drawers at detailshift=1 so each viewport writes ONE byte
+       per logical column (the *Low drawers would re-duplicate to full width, which the x2
+       NBG1 zoom would then double AGAIN = garbage). */
+    if (!detailshift || sat_lowres)
+    {
+	colfunc = basecolfunc = R_DrawColumn;
+	fuzzcolfunc = R_DrawFuzzColumn;
+	transcolfunc = R_DrawTranslatedColumn;
+	spanfunc = R_DrawSpan;
+    }
+    else
+    {
+	colfunc = basecolfunc = R_DrawColumnLow;
+	fuzzcolfunc = R_DrawFuzzColumnLow;
+	transcolfunc = R_DrawTranslatedColumnLow;
+	spanfunc = R_DrawSpanLow;
+    }
+
+    /* framebuffer pointers at the explicit origin -- ALWAYS (cheap, per-view).
+       NON-lowres: columnofs base = viewwindowx (screen x), w entries (R_DrawColumnLow writes
+       columnofs[dc_x<<1] and [+1]); at detailshift=0, w==viewwidth -> identity loop.
+       M7-multi lowres: the software render is PACKED, so the base is viewwindowx>>1 (P2's
+       screen origin 160 -> fb col 80) and the packed drawers index [0,viewwidth=80); the
+       whole-layer x2 NBG1 zoom stretches fb[0,160) back to screen[0,320).  viewwindowx itself
+       stays = wx (the FULL-res screen origin the UN-zoomed VDP1 walls/weapon/sprites read via
+       (x<<detailshift)+viewwindowx -- keeping the two coordinate spaces distinct). */
     viewwindowx = wx;
     viewwindowy = wy;
-    for (i=0 ; i<w ; i++)
-	columnofs[i] = viewwindowx + i;
+    {
+	int pack_base = sat_lowres ? (wx >> 1) : wx;
+	for (i=0 ; i<w ; i++)
+	    columnofs[i] = pack_base + i;
+    }
     for (i=0 ; i<viewheight ; i++)
 	ylookup[i] = I_VideoBuffer + (i+viewwindowy)*SCREENWIDTH;
 }
