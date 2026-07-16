@@ -117,13 +117,51 @@ void P_RunThinkers (void)
 
 
 //
+// SATURN test cheats (pad chord, src/dg_saturn.cxx R+Down).  The Saturn has no keyboard, so the
+// classic IDDQD/IDCLIP string entry (st_stuff.c) is unreachable; instead the platform cycles a
+// desired state here and P_Ticker RE-APPLIES it every tic to all local players, so it survives
+// level changes, player reborns and the E1M8 super-damage floor (p_spec.c case 11 clears
+// CF_GODMODE).  0 = off, 1 = god (all damage < 1000 ignored), 2 = god + noclip.
+//   DoomJo-safe: SAT_ApplyCheats is inert until the platform first calls SAT_CycleCheat
+//   (sat_cheat_engaged latch), so a port that never wires the chord (DoomJo) keeps its own
+//   keyboard cheats untouched -- we only OWN the two bits once the Saturn chord is used.
+int		sat_cheat_want = 0;
+static int	sat_cheat_engaged = 0;
+
+void SAT_ApplyCheats (void)
+{
+    int i;
+    if (!sat_cheat_engaged)
+	return;
+    for (i = 0 ; i < MAXPLAYERS ; i++)
+    {
+	if (!playeringame[i])
+	    continue;
+	if (sat_cheat_want >= 1) players[i].cheats |=  CF_GODMODE;
+	else                     players[i].cheats &= ~CF_GODMODE;
+	if (sat_cheat_want >= 2) players[i].cheats |=  CF_NOCLIP;
+	else                     players[i].cheats &= ~CF_NOCLIP;
+    }
+}
+
+void SAT_CycleCheat (void)
+{
+    sat_cheat_engaged = 1;
+    sat_cheat_want = (sat_cheat_want + 1) % 3;
+    SAT_ApplyCheats ();
+    players[consoleplayer].message = (sat_cheat_want == 2) ? (char *)"GOD + NOCLIP" :
+				     (sat_cheat_want == 1) ? (char *)"GOD MODE"     :
+							     (char *)"MORTAL AGAIN";
+}
+
+//
 // P_Ticker
 //
 
 void P_Ticker (void)
 {
     int		i;
-    
+
     // run the tic
     if (paused)
 	return;
@@ -138,10 +176,12 @@ void P_Ticker (void)
     }
     
 		
+    SAT_ApplyCheats ();		// SATURN: re-establish god/noclip before player think + damage
+
     for (i=0 ; i<MAXPLAYERS ; i++)
 	if (playeringame[i])
 	    P_PlayerThink (&players[i]);
-			
+
     P_RunThinkers ();
     P_UpdateSpecials ();
     P_RespawnSpecials ();
