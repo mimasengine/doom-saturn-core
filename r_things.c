@@ -144,6 +144,21 @@ int sat_things_hw = 1;                      /* platform (sat_apply_mode): 1 = wo
    0 = vanilla (draw every projected sprite); 1 = cull far decorations.  Shootable actors
    (monsters/barrels) are NEVER culled.  Default ON (HW-validated 2026-07-09, pad R+X to A/B off). */
 int sat_near_sprites = 1;
+/* SATURN piste-3 (split thing cull, pad L+Left): in a co-op split, drop sprites that PROJECT to
+   near-nothing (tiny xscale) -- each of the N views pays vissprite alloc + sort + VDP1/software emit,
+   and a sub-few-px sprite in a 96-row quadrant is invisible.  TWO buckets: SHOOTABLE actors AND
+   MISSILES (incoming rockets/fireballs a split player must see) use the CONSERVATIVE near-1px ACTOR
+   floor; only decorations + pickups fall to the harsher DECOR floor.  Split-only, off by default ->
+   byte-identical in 1p / when off.  HW-tune on Bp/M + SPR n (row 15).  NOTE: xscale is a DEPTH proxy
+   (projection/z), so on-screen px = spritewidth*xscale/FRACUNIT -- the px figures below assume a 64px
+   sprite; a 128px boss subtends ~2x, i.e. its effective cull floor is ~2x larger. */
+int sat_split_thingcull = 1;   /* DEFAULT-ON 2026-07-15: split thing-cull is impractical to A/B on HW
+                                  (needs a monster-dense room = can't stand still to read the overlay),
+                                  and the thresholds are conservative (monsters/missiles only culled
+                                  sub-~1px), so ship it on -- it only bites in a split (sat_split_active)
+                                  and only drops sprites already near-invisible.  Pad L+Left toggles. */
+#define SAT_SPLIT_CULL_DECOR (FRACUNIT / 12)   /* decoration/pickup depth floor (~5px of a 64px sprite) */
+#define SAT_SPLIT_CULL_ACTOR (FRACUNIT / 40)   /* actor/missile depth floor (~1.5px -- near-invisible)  */
 static char sat_thing_vdp1[MAXVISSPRITES];  /* per-vissprite (by array index): 1 = emitted on VDP1 */
 static char sat_thing_elig[MAXVISSPRITES];  /* 1 = selected (nearest sat_thing_cap) for VDP1 this frame */
 
@@ -698,8 +713,23 @@ void R_ProjectSprite (mobj_t* thing)
 	return;
     
     xscale = FixedDiv(projection, tz);
-	
-    gxt = -FixedMul(tr_x,viewsin); 
+
+    // SATURN piste-3: split thing cull -- xscale is the on-screen size proxy (projection/depth).
+    // In a co-op split, drop sprites that project to near-nothing to cut the per-view vissprite
+    // alloc + sort + emit across all N views.  Decorations culled harder than shootable actors.
+    {
+	extern int sat_split_active, sat_split_thingcull;
+	// SHOOTABLE actors (monsters/barrels) AND in-flight MISSILES (rockets/fireballs/plasma -- the
+	// incoming-threat telegraph a split player must see) use the CONSERVATIVE near-1px ACTOR floor;
+	// only true decorations + pickups fall to the harsher DECOR floor.  (px estimates below assume a
+	// 64px sprite; large bosses ~110-128px subtend ~2x, so their effective cull size is ~2x larger.)
+	fixed_t culldist = (thing->flags & (MF_SHOOTABLE | MF_MISSILE))
+			   ? SAT_SPLIT_CULL_ACTOR : SAT_SPLIT_CULL_DECOR;
+	if (sat_split_thingcull && sat_split_active && xscale < culldist)
+	    return;
+    }
+
+    gxt = -FixedMul(tr_x,viewsin);
     gyt = FixedMul(tr_y,viewcos); 
     tx = -(gyt+gxt); 
 
@@ -1533,6 +1563,13 @@ void R_SlaveDrawMasked (int x0, int x1)
      below the flicker threshold in the tech room automatically.  THING_EMIT_MAX just bounds the top
      end (and the selection scratch arrays); the rest stay software = drawn correctly, no flicker. */
 #define THING_MIN_SCREEN_PCT 2
+/* SATURN: shootable ACTORS (monsters + barrels) route to VDP1 at a MUCH lower on-screen floor than
+   decorations/pickups -- per-mille of the view, so an approaching monster becomes a crisp prio-7
+   VDP1 sprite well before it is close (in low-res M7 the software leftovers are half-res, so the
+   sooner a monster leaves the software fill the better it looks).  5/1000 = 0.5% ~= a 16px monster;
+   decorations still wait for the 2% THING_MIN_SCREEN_PCT floor.  Actors also outrank decorations in
+   both the texture grant and the emit budget below. */
+#define THING_ACTOR_SCREEN_PM 5
 #define THING_TEX_TRACK      32
 #define THING_EMIT_MAX       16
 
@@ -1596,62 +1633,80 @@ void R_EmitWorldThingsVDP1 (void)
        software.  Occlusion is resolved per-sprite in pass 2. */
     {
 	int           cap = sat_thing_cap;  if (cap > THING_TEX_TRACK) cap = THING_TEX_TRACK;
-	long          area_floor = (long)viewwidth * viewheight * THING_MIN_SCREEN_PCT / 100;
+	long          area_floor  = (long)viewwidth * viewheight * THING_MIN_SCREEN_PCT / 100;
+	long          actor_floor = (long)viewwidth * viewheight * THING_ACTOR_SCREEN_PM / 1000;
 	int           tk_lump[THING_TEX_TRACK];
 	lighttable_t *tk_cmap[THING_TEX_TRACK];
 	long          tk_area[THING_TEX_TRACK];        /* largest sprite area seen per distinct texture */
+	char          tk_actor[THING_TEX_TRACK];       /* 1 = texture belongs to a shootable actor (monster/barrel) */
 	char          tk_grant[THING_TEX_TRACK];
 	int           ntk = 0, i, g;
 
 	/* fold every above-floor sprite into its distinct-texture record (keep the max area) */
 	for (spr = vsprsortedhead.next ; spr != &vsprsortedhead ; spr = spr->next)
 	{
-	    long area = R_ThingScreenArea (spr);
+	    long area     = R_ThingScreenArea (spr);
+	    int  is_actor = (spr->mobjflags & MF_SHOOTABLE) != 0;   /* monster/barrel -> lower floor + priority */
+	    long fl       = is_actor ? actor_floor : area_floor;
 	    int  j;
-	    if (area < area_floor) continue;             /* ineligible (-1) or below the floor -> software */
+	    if (area < fl) continue;                     /* ineligible (-1) or below the floor -> software */
 	    for (j = 0 ; j < ntk ; j++)
 		if (tk_lump[j] == spr->patch && tk_cmap[j] == spr->colormap) break;
 	    if (j < ntk) { if (area > tk_area[j]) tk_area[j] = area; }
 	    else if (ntk < THING_TEX_TRACK)
-	    { tk_lump[ntk] = spr->patch; tk_cmap[ntk] = spr->colormap; tk_area[ntk] = area; tk_grant[ntk] = 0; ntk++; }
+	    { tk_lump[ntk] = spr->patch; tk_cmap[ntk] = spr->colormap; tk_area[ntk] = area;
+	      tk_actor[ntk] = (char)is_actor; tk_grant[ntk] = 0; ntk++; }
 	}
-	/* grant the cap distinct textures with the largest sprite (biggest fill per slot) */
+	/* grant the cap slots: shootable ACTORS first (monsters get a VDP1 texture slot ahead of any
+	   decoration, so a lone far monster is crisp even in a room full of big near props), then by the
+	   largest sprite within each class (biggest fill per slot; a same-type horde shares one slot). */
 	for (g = 0 ; g < cap ; g++)
 	{
 	    int best = -1;
 	    for (i = 0 ; i < ntk ; i++)
-		if (!tk_grant[i] && (best < 0 || tk_area[i] > tk_area[best])) best = i;
+	    {
+		if (tk_grant[i]) continue;
+		if (best < 0) { best = i; continue; }
+		if (tk_actor[i] != tk_actor[best]) { if (tk_actor[i]) best = i; }   /* actor outranks decoration */
+		else if (tk_area[i] > tk_area[best]) best = i;                       /* same class -> larger wins */
+	    }
 	    if (best < 0) break;
 	    tk_grant[best] = 1;
 	}
-	/* mark eligible the emax LARGEST sprites among the granted textures, where emax is the
-	   platform's adaptive VDP1-raster budget (sat_thing_emit_cap, clamped to THING_EMIT_MAX).
-	   Top-N insertion by area; the rest stay software (drawn correctly, no flicker).  A same-type
-	   horde still shares one baked slot for its emitted few. */
+	/* mark eligible the emax highest-RANKED sprites among the granted textures (rank = actors over
+	   decorations, then area), where emax is the platform's adaptive VDP1-raster budget
+	   (sat_thing_emit_cap, clamped to THING_EMIT_MAX).  Top-N insertion by rank key; the rest stay
+	   software (drawn correctly, no flicker).  A same-type horde still shares one baked slot. */
 	{
 	    int  emax = sat_thing_emit_cap;
 	    if (emax > THING_EMIT_MAX) emax = THING_EMIT_MAX;
 	    if (emax < 0)              emax = 0;
 	    int  em_idx[THING_EMIT_MAX];
-	    long em_area[THING_EMIT_MAX];
+	    long em_key[THING_EMIT_MAX];
 	    int  nem = 0, k;
 	    for (spr = vsprsortedhead.next ; emax > 0 && spr != &vsprsortedhead ; spr = spr->next)
 	    {
 		int  idx = spr - vissprites, j;
 		long area = R_ThingScreenArea (spr);
+		int  is_actor = (spr->mobjflags & MF_SHOOTABLE) != 0;
+		long key, fl = is_actor ? actor_floor : area_floor;
 		if (idx < 0 || idx >= MAXVISSPRITES) continue;
-		if (area < area_floor) continue;
+		if (area < fl) continue;
 		for (j = 0 ; j < ntk ; j++)
 		    if (tk_lump[j] == spr->patch && tk_cmap[j] == spr->colormap) break;
 		if (j >= ntk || !tk_grant[j]) continue;   /* texture not granted -> software */
-		if (nem < emax) {                         /* insert (ascending, em_area[0] = smallest) */
-		    for (k = nem ; k > 0 && em_area[k-1] > area ; k--)
-		    { em_area[k] = em_area[k-1]; em_idx[k] = em_idx[k-1]; }
-		    em_area[k] = area; em_idx[k] = idx; nem++;
-		} else if (area > em_area[0]) {           /* drop the smallest, insert */
-		    for (k = 1 ; k < emax && em_area[k] < area ; k++)
-		    { em_area[k-1] = em_area[k]; em_idx[k-1] = em_idx[k]; }
-		    em_area[k-1] = area; em_idx[k-1] = idx;
+		/* rank key: shootable actors sit above ALL decorations (bit 20 >> max sprite area ~64000),
+		   then by on-screen area -> the emit budget feeds MONSTERS first (crisp on VDP1), and a far
+		   monster still outranks a big near prop.  Decorations fall back to the software fill. */
+		key = area + (is_actor ? (1L << 20) : 0);
+		if (nem < emax) {                         /* insert (ascending, em_key[0] = lowest rank) */
+		    for (k = nem ; k > 0 && em_key[k-1] > key ; k--)
+		    { em_key[k] = em_key[k-1]; em_idx[k] = em_idx[k-1]; }
+		    em_key[k] = key; em_idx[k] = idx; nem++;
+		} else if (key > em_key[0]) {             /* drop the lowest-ranked, insert */
+		    for (k = 1 ; k < emax && em_key[k] < key ; k++)
+		    { em_key[k-1] = em_key[k]; em_idx[k-1] = em_idx[k]; }
+		    em_key[k-1] = key; em_idx[k-1] = idx;
 		}
 	    }
 	    for (k = 0 ; k < nem ; k++) sat_thing_elig[em_idx[k]] = 1;
@@ -1667,7 +1722,7 @@ void R_EmitWorldThingsVDP1 (void)
 	int	cx0, cy0, cx1, cy1, xx, vx1, vx2, vtop, vbot;
 
 	if (idx < 0 || idx >= MAXVISSPRITES)   continue;
-	if (!sat_thing_elig[idx])              continue;   /* not among the nearest sat_thing_cap -> software */
+	if (!sat_thing_elig[idx])              continue;   /* outranked (decoration / over budget) -> software */
 
 	patch  = W_CacheLumpNum (spr->patch+firstspritelump, PU_CACHE);
 	patchw = spritewidth[spr->patch] >> FRACBITS;
