@@ -840,32 +840,6 @@ static volatile int rp_plane_done = 1;
    it would overflow and corrupt SGL.  Give the plane slave its OWN 4KB stack and switch to
    it for the draw.  (Only the slave touches this, so its write-through writes need no purge.) */
 static char rp_plane_slave_stack[4 * 1024] __attribute__((aligned(16)));
-/* SATURN PERF (RANK 1): two-pointer work-steal for the visplane draw, replacing the static
-   half=n>>1 split.  The master draws planes FORWARD from 0, the slave draws BACKWARD from n-1;
-   each publishes its cursor in UNCACHED memory and stops when they meet.  Self-balancing -- the
-   slower CPU simply covers fewer planes and w->0, with NO per-scene tuning (mirrors the parity
-   column steal ~line 627).  Visplanes are disjoint framebuffer regions with no inter-plane
-   overdraw, so the <=~1-plane overlap at the crossing draws identical pixels (harmless, like a
-   doubly-drawn opaque column).  No gap is possible: the master stops at m>=PLANE_SPOS and s only
-   decreases, so the final S<=M => [0,M) U [S,n) covers [0,n).  n is passed via the slave param
-   (no cached shared word); the cursors use the |0x20000000 uncached alias so the live cross-CPU
-   reads are always fresh. */
-static volatile int rp_plane_mpos, rp_plane_spos;
-#define PLANE_MPOS (*(volatile int *)((unsigned int)&rp_plane_mpos | 0x20000000u))
-#define PLANE_SPOS (*(volatile int *)((unsigned int)&rp_plane_spos | 0x20000000u))
-static int rp_steal_n;
-
-static void rp_plane_steal_slave(void)   /* slave: draw backward from n-1, stop at the master */
-{
-    int s = rp_steal_n;
-    while (s > PLANE_MPOS)
-    {
-        R_DrawPlaneWorklist(s - 1, s);   /* one plane */
-        s--;
-        PLANE_SPOS = s;                  /* publish */
-    }
-}
-
 /* SH-2 trampoline: save r14 on the old stack, keep the old SP in r14 (callee-saved, so the
    call preserves it), switch r15 to the dedicated stack, call fn, restore.  Shared by the plane
    AND masked slave dispatch (they run in different frame phases, never concurrently). */
@@ -971,46 +945,7 @@ int RP_AuxKick(void)               /* platform DG-entry consumer; 1 = a job was 
     return 1;
 }
 
-static void rp_plane_steal_body(void *param)
-{
-    SLAVE_BUSY_BEGIN();
-    master_cache_purge();                    /* slave: read the master's fresh worklist + tables */
-    rp_steal_n = (int)(unsigned int)param;   /* set AFTER the purge (the invalidate would drop a
-                                                dirty line) -- n via param, no cached shared word */
-    rp_run_on_stack(rp_plane_steal_slave);   /* draw on the dedicated 4KB stack */
-    SLAVE_PBUSY_END();
-    PLANE_DONE = 1;
-}
-
-/* Static half-split path, kept for the live A/B (pad Y) against the work-steal: the slave draws a
-   FIXED [from,to) (the old behaviour) so w (the master's wait at the barrier) shows the count-split
-   imbalance the steal removes.  from/to set AFTER the purge (same write-back rule as the steal). */
-static int rp_static_from, rp_static_to;
-static void rp_plane_static_slave(void) { R_DrawPlaneWorklist(rp_static_from, rp_static_to); }
-static void rp_plane_static_body(void *param)
-{
-    int packed = (int)(unsigned int)param;
-    SLAVE_BUSY_BEGIN();
-    master_cache_purge();
-    rp_static_from = (packed >> 16) & 0xffff;
-    rp_static_to   = packed & 0xffff;
-    rp_run_on_stack(rp_plane_static_slave);
-    SLAVE_PBUSY_END();
-    PLANE_DONE = 1;
-}
-
-/* Live A/B (pad Y, row 1 'ws'): 1 = two-pointer work-steal, 0 = static half-split.  Read by the
-   MASTER ONLY (in RP_DrawPlanesSplit) -- the chosen slave body is passed via slSlaveFunc, so the
-   slave never reads this flag (no new cross-CPU coherency surface).  DoomJo keeps
-   sat_plane_parallel=0 so it never reaches here.
-   DEFAULT 0 = STATIC: on HW the work-steal REGRESSED at E1M1 (per-plane uncached cursor sync +
-   the slave's fixed startup latency -- which makes the master finish first so w>0 every frame --
-   + the <=2-plane crossing overlap, all > the tiny count-split imbalance at n~20).  Kept behind
-   the toggle so the regression can be re-confirmed on the same scene (Y: ws0 vs ws1). */
-int sat_plane_steal = 0;
-
-/* SATURN PERF (Fafling-style, pad-C 'ts' / sat_plane_tas): TAS.B plane work-steal -- replaces the
-   uncached two-pointer cursor (sat_plane_steal) with an ATOMIC TAS.B claim per plane.  Both CPUs
+/* SATURN PERF (Fafling-style / sat_plane_tas): TAS.B plane work-steal.  Both CPUs
    claim planes from opposite ends and meet in the middle; the lock byte is read via SH-2 TAS.B
    (bus-locked + cache-bypassing for the RMW, like Fafling's R_Render_Span), so there is NO per-plane
    uncached cursor publish/read (the cost that made the cursor steal regress) and the single meeting
@@ -1050,69 +985,18 @@ static void rp_plane_tas_body(void *param)
     PLANE_DONE = 1;
 }
 
-/* SATURN row-split (sat_plane_rowsplit) -- the UNIVERSAL balancer (supersedes the plane-grain
-   split): both CPUs draw ALL planes, master the TOP rows [0,mid), slave [mid,256), via
-   R_DrawPlaneWorklistRows.  The per-row FILL (the real cost) is split 50/50 regardless of plane
-   sizes, so a single DOMINANT plane (d99%) is balanced across both SH-2 -- exactly what the
-   plane-grain split (static / TAS) cannot do.  Whole-cache purge kept for the slave (per-frame
-   coherency).  DoomJo keeps sat_plane_parallel=0 -> never reached. */
-int sat_plane_rowsplit = 0;
-extern int viewheight;
-extern void R_DrawPlaneWorklistRows(int from, int to, int row_lo, int row_hi);
-static int rp_rows_n, rp_rows_mid;
-static void rp_plane_rows_slave(void) { R_DrawPlaneWorklistRows(0, rp_rows_n, rp_rows_mid, 256); }
-static void rp_plane_rows_body(void *param)
-{
-    int packed = (int)(unsigned int)param;
-    SLAVE_BUSY_BEGIN();
-    master_cache_purge();                /* per-frame worklist/visplane/table coherency */
-    rp_rows_n   = (packed >> 16) & 0xffff;
-    rp_rows_mid = packed & 0xffff;
-    rp_run_on_stack(rp_plane_rows_slave);
-    SLAVE_PBUSY_END();
-    PLANE_DONE = 1;
-}
-
 void RP_WaitPlanes(void);   /* defined just below */
 
-/* Visplane split: master + slave.  Two modes for the hardware A/B (sat_plane_steal). */
+/* Visplane split: master + slave via TAS.B meet-in-the-middle work-steal (the shipped default;
+   the static + row-split + cursor-steal A/B losers were removed 2026-07-16, docs/TOGGLE_AUDIT.md). */
 void RP_DrawPlanesSplit(int n)
 {
+    int m = n - 1;
     PLANE_DONE = 0;
     rp_sgl_workptr_reset();                  /* GBR-creep guard for this 2nd dispatch/frame */
-    if (sat_plane_rowsplit)
-    {
-        int mid = viewheight >> 1;           /* 50/50 screen rows (later: bias on w) */
-        slSlaveFunc(rp_plane_rows_body, (void *)(unsigned int)(((n & 0xffff) << 16) | (mid & 0xffff)));
-        R_DrawPlaneWorklistRows(0, n, 0, mid);   /* master: TOP rows of ALL planes; slave: bottom */
-    }
-    else if (sat_plane_tas)
-    {
-        int m = n - 1;
-        for (int i = 0; i < n; i++) rp_plane_lock[i] = 0;   /* arm claims (write-through to RAM) */
-        slSlaveFunc(rp_plane_tas_body, (void *)(unsigned int)n);   /* slave claims UP from 0 */
-        while (m >= 0) { if (!rp_tas_claim(m)) break; R_DrawPlaneWorklist(m, m + 1); m--; }  /* master DOWN */
-    }
-    else if (sat_plane_steal)
-    {
-        int m = 0;
-        PLANE_MPOS = 0;
-        PLANE_SPOS = n;
-        slSlaveFunc(rp_plane_steal_body, (void *)(unsigned int)n);
-        while (m < PLANE_SPOS)               /* master: forward from 0, stop where the slave is */
-        {
-            R_DrawPlaneWorklist(m, m + 1);
-            m++;
-            PLANE_MPOS = m;
-        }
-    }
-    else
-    {
-        int half = n >> 1;                   /* old static split: master [0,half), slave [half,n) */
-        slSlaveFunc(rp_plane_static_body,
-                    (void *)(unsigned int)(((half & 0xffff) << 16) | (n & 0xffff)));
-        R_DrawPlaneWorklist(0, half);
-    }
+    for (int i = 0; i < n; i++) rp_plane_lock[i] = 0;         /* arm claims (write-through to RAM) */
+    slSlaveFunc(rp_plane_tas_body, (void *)(unsigned int)n);  /* slave claims UP from 0 */
+    while (m >= 0) { if (!rp_tas_claim(m)) break; R_DrawPlaneWorklist(m, m + 1); m--; }  /* master DOWN */
     RP_WaitPlanes();                         /* slave sets PLANE_DONE; purges before the blit */
 }
 
