@@ -56,6 +56,15 @@ drawseg_t*	ds_p;
    window boundary; harmless when unread (0). */
 int		r_drawseg_peak = 0;
 
+/* SATURN: solidsegs[] high-water (vanilla MAXSEGS=32), folded in R_ClearClipSegs.  The array is
+   immediately followed in .bss by newend / r_drawseg_peak / ds_p (build/Mimas.map), and vanilla
+   R_ClipSolidWallSegment has NO overflow guard -> an over-budget view walks newend past solidsegs[31]
+   and the insert-shuffle stomps those globals (ds_p wild -> HARD FREEZE on real HW; Ymir tolerates the
+   wild write, ds peak reads ~1.4e9).  r_solidseg_ovf latches when the new guard drops a post; the peak
+   caps at MAXSEGS.  Read on the platform "limits" overlay ('ss'). */
+int		r_solidseg_peak = 0;
+int		r_solidseg_ovf  = 0;
+
 
 void
 R_StoreWallRange
@@ -132,8 +141,16 @@ R_ClipSolidWallSegment
 	    //  so insert a new clippost.
 	    RP_QueueWall (first, last);
 	    next = newend;
+	    /* SATURN overflow SINK (root-cause of the M7/lowres level-start HARD FREEZE): vanilla
+	       MAXSEGS=32 solidsegs[] has NO bound here, so an over-budget view (>32 disjoint solid
+	       posts) walks newend PAST solidsegs[31]; the shuffle below then writes solidsegs[32],
+	       which the linker puts exactly on newend / r_drawseg_peak / ds_p (build/Mimas.map) ->
+	       ds_p wild -> freeze on real HW (Ymir tolerates the wild write).  Drop the extra post
+	       (like the visplane/opening sinks: at worst a HOM sliver, never a crash).  The wall was
+	       already queued above, so nothing vanishes -- only its clip entry is skipped. */
+	    if (newend == &solidsegs[MAXSEGS]) { r_solidseg_ovf = 1; return; }
 	    newend++;
-	    
+
 	    while (next != start)
 	    {
 		*next = *(next-1);
@@ -266,6 +283,8 @@ int sat_view_x1 = 0;   /* <=0 or > viewwidth => viewwidth (full screen) */
 
 void R_ClearClipSegs (void)
 {
+    int n = (int)(newend - solidsegs);          /* SATURN: fold the prior view's solidseg high-water */
+    if (n > r_solidseg_peak) r_solidseg_peak = n;
     int x0 = sat_view_x0;
     int x1 = sat_view_x1;
     if (x0 < 0) x0 = 0;

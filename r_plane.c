@@ -1743,8 +1743,18 @@ void R_DrawPlanes (void)
 	/* P3: QUEUE this regular flat (potato or textured high-detail) for the master+slave
 	   visplane split after the loop (R_DrawPlaneWorklist).  The flat is ALREADY cached, so
 	   the slave never touches the zone allocator; the lump release is DEFERRED (the slave
-	   reads src during the draw) -> done post-loop.  Low-detail keeps the global path. */
-	if ((eff_potato || !detailshift) && plane_worklist_n < MAXVISPLANES)
+	   reads src during the draw) -> done post-loop.
+	   SATURN M7 (2026-07-17): lowres (detailshift=1, PACKED 160) ALSO queues.  R_TexturedSpan
+	   writes a CONTIGUOUS run from columnofs[x1] (== R_DrawSpan), which IS the packed layout in
+	   lowres (columnofs is 1:1) -> the slave draws M7 planes byte-identically to the inline
+	   R_MapPlane it was falling back to.  This was the sole thing making M7 != "M4 + lowres":
+	   textured+detailshift planes went inline (master-only) -> slave IDLE in M7 -> the slave
+	   plane dispatch (which rewinds the SGL GBR+72 work pointer AND drives the VDP1 coherent-pair
+	   present) never ran -> GBR creep + the present never reset on a New Game (M7-only stale walls
+	   on level restart).  Routing them to the slave puts M7 on M4's exact render path.  Non-lowres
+	   low-detail (detailshift=1, sat_lowres=0) still keeps the inline path -- R_TexturedSpan packs
+	   but cannot DOUBLE to 320, so that case is not added. */
+	if ((eff_potato || !detailshift || sat_lowres) && plane_worklist_n < MAXVISPLANES)
 	{
 	    planework_t *w = &plane_worklist[plane_worklist_n++];
 	    w->pl = pl; w->src = ds_source; w->plzlight = planezlight;
@@ -1780,7 +1790,16 @@ void R_DrawPlanes (void)
         extern int sat_plane_parallel;
         extern void RP_DrawPlanesSplit(int n);
         int n = plane_worklist_n, i;
-        if (sat_plane_parallel && n > 1)
+        /* SATURN M7 (2026-07-17): draw the queued planes MASTER-ONLY in lowres.  The slave
+           plane-split does NOT help in M7 -- packed planes are light, so the master's work-steal
+           claims them all before the slave even starts (SLV id100%, b0 Pb0 at the peak) -- yet
+           RP_DrawPlanesSplit's RP_WaitPlanes join still spins up to 30M iterations (~2-3s = the
+           "game stops for several seconds, regularly") waiting for a PLANE_DONE the idle slave
+           never publishes.  Master-only loses zero work and removes the spin.  The floors-done
+           hook (sat_vdp1_floors_done -> VDP1 present flip) fires at the END of R_DrawPlanes on
+           BOTH paths, so New Game still clears the stale VDP1 walls; GBR+72 is rewound every
+           frame by the DG_DrawFrame reset, independent of this dispatch. */
+        if (sat_plane_parallel && n > 1 && !sat_lowres)
             RP_DrawPlanesSplit(n);           /* master+slave: static half-split or work-steal (pad Y) */
         else
             R_DrawPlaneWorklist(0, n);
