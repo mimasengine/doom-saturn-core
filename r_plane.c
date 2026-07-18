@@ -1802,7 +1802,8 @@ void R_DrawPlanes (void)
         if (sat_plane_parallel && n > 1 && !sat_lowres)
             RP_DrawPlanesSplit(n);           /* master+slave: static half-split or work-steal (pad Y) */
         else
-            R_DrawPlaneWorklist(0, n);
+            R_DrawPlaneWorklist(0, n);       /* M7 lowres: MASTER-ONLY -- the slave plane-split fights SGL
+                                                slave scheduling (s0/Pb0 on HW), see r_parallel.c */
         for (i = 0; i < n; i++)
             W_ReleaseLumpNum(plane_worklist[i].lumpnum);
     }

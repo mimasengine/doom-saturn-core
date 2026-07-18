@@ -53,7 +53,11 @@ static const char *player_colors[] =
 
 // Array of end-of-level statistics that have been captured.
 
-#define MAX_CAPTURES 32
+// SATURN (2026-07-18): 32 -> 8.  -statdump is a PC-only debug feature (needs an argv "-statdump"
+// that neither Saturn port can pass), so captured_stats is DEAD .bss on hardware -- 32 entries x
+// ~200B = 6.4KB.  Trimming to 8 reclaims ~4.8KB of the TLSF boot pool (_end..__heap_end), which the
+// M7 slave plane-split code had pushed under the 4KB boot-loop floor.  DoomJo-safe (dead there too).
+#define MAX_CAPTURES 8
 static wbstartstruct_t captured_stats[MAX_CAPTURES];
 static int num_captured_stats = 0;
 

@@ -1013,6 +1013,18 @@ void RP_WaitPlanes(void)
     master_cache_purge();                     /* read the slave's drawn plane pixels before the blit */
 }
 
+/* SATURN (2026-07-18): M7 slave plane-split ABANDONED on HW.  A TRIVIAL probe body ran on the slave
+   in M7 (overlay stage 2 + done), but the REAL draw body never even ENTERED it (overlay s0, SLV Pb0
+   id100 -- the slave stays 100% idle), so the master fell back every frame; with the wait guard
+   sized for a working slave, the per-frame spin (an uncached PLANE_DONE poll x400k) cost ~350ms =
+   2.4fps at spawn.  Root: the SGL slave doesn't reliably execute a dispatched DRAW body when the
+   probe/split is the ONLY per-frame slSlaveFunc (M7 runs no masked-split/aux to pump the SGL slave
+   scheduler) -- the same thing that froze the original 30M-guard split.  The trivial probe's
+   apparent success was misleading (a microsecond body that runs != a real draw body that doesn't).
+   Reclaiming the M7 idle slave needs the SGL slave-pump understood first; until then M7 planes stay
+   MASTER-ONLY (r_plane.c), which is the stable ~13fps behaviour.  Do NOT re-wire RP_DrawPlanes* into
+   the sat_lowres branch without solving the pump. */
+
 /* ------------------------------------------------------------------------------------------ *
  * SATURN masked-by-half (Option B): the slave draws the RIGHT-half vissprites (r_things.c        *
  * R_SlaveDrawMasked) while the master draws the LEFT half, during the masked phase.  Same        *
