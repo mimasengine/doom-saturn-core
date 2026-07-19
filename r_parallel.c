@@ -713,12 +713,22 @@ static void rp_slave_wrapper(void *arg) { (void)arg; rp_slave_body(); }
 /* Master side                                                          */
 /* ------------------------------------------------------------------ */
 
+/* SATURN freeze-proofing (2026-07-19): wall-clock-BOUNDED slave wait -- returns 1 if the slave set
+   *flag in time, 0 on timeout (caller then runs the work itself; every fallback below is idempotent
+   so a false timeout only costs redundant work, never corruption).  WHY not a spin-COUNT: the
+   completion flags live in UNCACHED WRAM (the 0x2xxxxxxx alias), so one loop iteration is a ~25-cycle
+   uncached read -> the old 30M/1M count = up to ~26s = a HARD FREEZE whenever a dispatched slave body
+   never starts (the SGL slave-scheduler-after-idle quirk: e.g. an M7->M4 mode switch re-arming the
+   masked-split -- the reported freeze).  Bound by the FRT (real wall clock) instead.  rp_timeout_count
+   (shown on the overlay) tallies every fallback, so a persistently-dead slave is visible, not silent. */
+#define RP_WAIT_TIMEOUT_FRT 5376u   /* ~24ms @ ~224 FRT ticks/ms: > any live slave half, << a frame-hang */
 static int rp_wait(volatile int *flag)
 {
-    int guard=1000000;
-    while (!*flag && --guard) ;
-    if (!guard) rp_timeout_count++;
-    return guard!=0;
+    unsigned short t0 = rp_frt();
+    while (!*flag) {
+        if ((unsigned short)(rp_frt() - t0) >= RP_WAIT_TIMEOUT_FRT) { rp_timeout_count++; return 0; }
+    }
+    return 1;
 }
 
 /* TEST (2026-06-15): 0 = disable the manual GBR+72 reset, to confirm it is what
@@ -873,9 +883,9 @@ static void (*rp_aux_fn)(void);
 
 void RP_AuxWait(void)
 {
-    int guard = 30000000;                     /* bounded: a dead slave costs a slow frame, not a hang */
-    while (!RP_AUX_DONE && --guard) ;
-    if (!guard) rp_timeout_count++;
+    /* FRT-bounded (see rp_wait).  No master fallback: the aux job is a cosmetic VDP1-floor build --
+       a missed frame is a 1-frame floor glitch, not a crash, and the next frame re-dispatches. */
+    rp_wait(&RP_AUX_DONE);
 }
 
 /* SATURN PERF (2026-07-08): slave self-timing brackets for the MEASURED busy%.  BEGIN forces the
@@ -989,27 +999,37 @@ void RP_WaitPlanes(void);   /* defined just below */
 
 /* Visplane split: master + slave via TAS.B meet-in-the-middle work-steal (the shipped default;
    the static + row-split + cursor-steal A/B losers were removed 2026-07-16, docs/TOGGLE_AUDIT.md). */
+static int rp_plane_disp_n;                  /* # planes dispatched, for the RP_WaitPlanes timeout fallback */
+
 void RP_DrawPlanesSplit(int n)
 {
     int m = n - 1;
+    rp_plane_disp_n = n;
     PLANE_DONE = 0;
     rp_sgl_workptr_reset();                  /* GBR-creep guard for this 2nd dispatch/frame */
     for (int i = 0; i < n; i++) rp_plane_lock[i] = 0;         /* arm claims (write-through to RAM) */
     slSlaveFunc(rp_plane_tas_body, (void *)(unsigned int)n);  /* slave claims UP from 0 */
     while (m >= 0) { if (!rp_tas_claim(m)) break; R_DrawPlaneWorklist(m, m + 1); m--; }  /* master DOWN */
-    RP_WaitPlanes();                         /* slave sets PLANE_DONE; purges before the blit */
+    /* m<0 => the master's meet-in-the-middle steal claimed+drew EVERY plane, i.e. the slave never
+       started (the freeze case) => there is nothing to wait for.  Only wait when the master broke on a
+       plane the slave had locked (m>=0), meaning the slave IS alive; RP_WaitPlanes bounds that too. */
+    if (m >= 0) RP_WaitPlanes();             /* slave sets PLANE_DONE; bounded + fallback + purge */
+    else        master_cache_purge();
 }
 
 void RP_WaitPlanes(void)
 {
-    volatile int guard = 30000000;           /* ~bounded spin; never wedge if the slave dies */
 #if RP_PROF
     unsigned short t0 = rp_frt();             /* master idle while the slave finishes = imbalance */
 #endif
-    while (!PLANE_DONE && guard-- > 0) { }
+    int ok = rp_wait(&PLANE_DONE);            /* FRT-bounded (see rp_wait) -- never a 26s wedge */
 #if RP_PROF
     p3_wait_ticks = (unsigned short)(rp_frt() - t0);
 #endif
+    /* slave stalled mid-draw (claimed planes it never finished): idempotently redraw the whole
+       worklist.  Opaque flats -> the redraw writes the SAME pixels, so no missing planes, no double
+       image; the only cost is the redundant draw of the ones already done (a slow frame, not a hang). */
+    if (!ok) R_DrawPlaneWorklist(0, rp_plane_disp_n);
     master_cache_purge();                     /* read the slave's drawn plane pixels before the blit */
 }
 
@@ -1074,8 +1094,12 @@ void RP_DispatchMasked(int x0, int x1)
 
 void RP_WaitMasked(void)
 {
-    volatile int guard = 30000000;
-    while (!MASK_DONE && guard-- > 0) { }
+    /* FRT-bounded (see rp_wait) -- never a 26s wedge.  On timeout we deliberately DO NOT redraw the
+       slave's [x0,x1) half on the master: that master-side R_SlaveDrawMasked while a LATE (not dead)
+       slave may still own its SGL command slot was the mode-switch whole-screen corruption suspect
+       (2026-07-19).  A missed half is ONE frame of not-drawn masked sprites (cosmetic), which the
+       next frame corrects -- a far safer failure mode than risking VDP1 command-list corruption. */
+    rp_wait(&MASK_DONE);
     master_cache_purge();                     /* read the slave's drawn sprite pixels before the blit */
 }
 
@@ -1135,15 +1159,14 @@ void RP_DispatchWallPrep(int n)
 
 void RP_WaitWallPrep(void)
 {
-    volatile int guard = 30000000;        /* bounded spin; never wedge if the slave dies */
 #if RP_PROF
     unsigned short t0 = rp_frt();          /* master idle while the slave flushes = the flush time */
 #endif
-    while (!WP_DONE && guard-- > 0) { }
+    int ok = rp_wait(&WP_DONE);            /* FRT-bounded (see rp_wait) -- never a 26s wedge */
 #if RP_PROF
     prof_wpwait = (unsigned short)(rp_frt() - t0);
 #endif
-    if (!WP_DONE)
+    if (!ok)
         RP_FlushWallsRange(0, rp_wp_disp_n);   /* slave died -> serial fallback (idempotent enough) */
     master_cache_purge();                 /* read the slave's drawsegs/visplanes/clip/wall_acc */
 }
