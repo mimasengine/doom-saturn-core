@@ -1265,6 +1265,7 @@ void R_DrawSprite (vissprite_t* spr)
  * slave (right) half shows the correct per-player colour, not the base green. */
 int sat_masked_parallel = 0;          /* gate, set by the platform (src/main.cxx) */
 int g_mask_x1 = 32767;                 /* master vissprite right clip [0,x1); reset to viewwidth each use */
+extern int sat_local_players;          /* core g_game.c: LIVE local-coop count (1 = single player) */
 
 static int      s_dc_x, s_dc_yl, s_dc_yh, s_fuzzpos, s_x0, s_x1, s_coltype;
 static fixed_t  s_dc_iscale, s_dc_texturemid, s_spryscale, s_sprtopscreen;
@@ -1801,7 +1802,7 @@ void R_DrawMasked (void)
 	   master when the AIMD cap declines, e.g. ec0 -> th0 -> every sprite software).  Was gated off
 	   (!sat_things_emitted) as a shipping shortcut when world-things landed; measured slave busy%
 	   showed the slave sitting ~90% idle while M ran master-only -> re-enabled 2026-07-09. */
-	if (sat_masked_parallel && !sat_lowres)
+	if (sat_masked_parallel && !sat_lowres && sat_local_players <= 1)   /* SATURN 2026-07-20: never slave-split in MP -- a New-Game-into-coop from a 1p pause renders one split frame with sat_lowres still 0, which used to dispatch the slave into a split it was never set up for -> wedge/freeze (see r_plane.c) */
 	{   /* SATURN lowres: the slave's R_SlaveDrawMasked upsamples its half to 320 (a separate impl),
 	       which would cut the sprite at g_mask_x1 ("entre les deux SH2").  Draw all software sprites
 	       on the master (packed 160) in lowres -- already ~half the fill, so the slave loss is small. */

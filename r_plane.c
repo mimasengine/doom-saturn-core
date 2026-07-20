@@ -1787,7 +1787,7 @@ void R_DrawPlanes (void)
        half via r_parallel.c; otherwise (DoomJo / off) the master draws them all.  Then release
        the deferred flat locks (no-op on the cart, where W_CacheLumpNum is a direct pointer). */
     {
-        extern int sat_plane_parallel;
+        extern int sat_plane_parallel, sat_local_players;
         extern void RP_DrawPlanesSplit(int n);
         int n = plane_worklist_n, i;
         /* SATURN M7 (2026-07-17): draw the queued planes MASTER-ONLY in lowres.  The slave
@@ -1799,7 +1799,15 @@ void R_DrawPlanes (void)
            hook (sat_vdp1_floors_done -> VDP1 present flip) fires at the END of R_DrawPlanes on
            BOTH paths, so New Game still clears the stale VDP1 walls; GBR+72 is rewound every
            frame by the DG_DrawFrame reset, independent of this dispatch. */
-        if (sat_plane_parallel && n > 1 && !sat_lowres)
+        /* SATURN 2026-07-20 (freeze fix): ALSO require single-player.  !sat_lowres was a proxy for
+           "M7 = master-only", but the M7 pause-fullres flips sat_lowres->0 for a 1p menu; starting a
+           New Game INTO co-op from that menu renders ONE split frame while sat_lowres is still 0 (the
+           count-change hook re-pins it only on the next poll_pad) -> the slave plane-split gets
+           dispatched in a split it was never set up for -> the RP_WaitPlanes 30M spin below wedged =
+           the reported freeze.  In the parked-M7 world split is always master-only anyway, so this
+           only makes it explicit + race-proof.  (Un-parked M4 co-op would lose dual-CPU planes here --
+           acceptable, flagged: M7 split is already >= M4 split on HW.) */
+        if (sat_plane_parallel && n > 1 && !sat_lowres && sat_local_players <= 1)
             RP_DrawPlanesSplit(n);           /* master+slave: static half-split or work-steal (pad Y) */
         else
             R_DrawPlaneWorklist(0, n);       /* M7 lowres: MASTER-ONLY -- the slave plane-split fights SGL
