@@ -1720,10 +1720,14 @@ void R_EmitWorldThingsVDP1 (void)
 		for (j = 0 ; j < ntk ; j++)
 		    if (tk_lump[j] == spr->patch && tk_cmap[j] == spr->colormap) break;
 		if (j >= ntk || !tk_grant[j]) continue;   /* texture not granted -> software */
-		/* rank key: shootable actors sit above ALL decorations (bit 20 >> max sprite area ~64000),
-		   then by on-screen area -> the emit budget feeds MONSTERS first (crisp on VDP1), and a far
-		   monster still outranks a big near prop.  Decorations fall back to the software fill. */
-		key = area + (is_actor ? (1L << 20) : 0);
+		/* rank key: shootable actors sit above ALL decorations (bit 20 >> max sprite area ~64000).
+		   SATURN: rank actors by DISTANCE (spr->scale), NOT on-screen area -- the area pulses with
+		   the animation frame (attack pose wider than idle), which made the VDP1 slot HOP between
+		   two similar enemies frame-to-frame.  scale does not pulse: the nearer actor stays the
+		   winner, only a real depth-cross flips it.  Decorations keep the real area (fill priority);
+		   the actor bit still puts every actor above every decoration.  Floor test + fill
+		   accumulator keep using the real area. */
+		key = (is_actor ? (long)spr->scale : area) + (is_actor ? (1L << 20) : 0);
 		if (nem < emax) {                         /* insert (ascending, em_key[0] = lowest rank) */
 		    for (k = nem ; k > 0 && em_key[k-1] > key ; k--)
 		    { em_key[k] = em_key[k-1]; em_idx[k] = em_idx[k-1]; }
