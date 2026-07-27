@@ -247,11 +247,20 @@ extern int sat_vdp1_floor;               /* SATURN: secondary floors/ceilings de
    swim), and via the layer inversion they land in NBG1 ON TOP of the farther VDP1 walls --
    correct, since a too-close wall is the nearest.  Match the magnitude to the platform; only
    near-touching walls trip it (few columns of CPU work, occasional). */
-#define SAT_WALL_CPU_SPAN 480   /* span > this: too close for VDP1 -> render in SOFTWARE (CPU). */
-#define SAT_WALL_CPU_V1   576   /* VDP1 starts EARLY (span < this, above the CPU threshold) so it
-                                   pre-warms the pipeline a frame+ before the CPU hands off -- on
+#define SAT_WALL_CPU_SPAN 480   /* DEFAULT span > this: too close for VDP1 -> render in SOFTWARE (CPU). */
+/* SATURN 2026-07-26: RUNTIME so the platform's budget-driven LOD can LOWER it (push more near walls to
+   software to free the VDP1 raster) when the MEASURED VDP1 budget is tight and the master has headroom,
+   then relax it back to the default.  DoomJo links it and never writes it -> stays 480 = old behaviour. */
+int sat_wall_cpu_span = SAT_WALL_CPU_SPAN;
+#define SAT_WALL_CPU_V1   576   /* DEFAULT: VDP1 starts EARLY (span < this, above the CPU threshold) so
+                                   it pre-warms the pipeline a frame+ before the CPU hands off -- on
                                    Saturn the VDP1 presents >2 frames late, so the CPU exit-frames
                                    alone still showed sky.  Band [SPAN,V1] = CPU + VDP1 both. */
+/* SATURN 2026-07-26: RUNTIME, driven WITH sat_wall_cpu_span (the platform keeps V1 = span + 96 so the
+   pre-warm band width is preserved as the budget LOD shifts the whole near-wall CPU window down/up).
+   V1 is the true VDP1-exit threshold (s >= V1 -> off VDP1), so LOWERING it is what actually frees the
+   VDP1 raster.  DoomJo links it, never writes it -> stays 576 = old behaviour. */
+int sat_wall_cpu_v1 = SAT_WALL_CPU_V1;
 #define SAT_WALL_CPU_MAG  3     /* MAGNIFICATION (screen px per texel of u) above which a wall is so
                                    close/face-on that its VDP1 tiling extrapolates past the screen edge
                                    and the platform SQUISHES it ("ecrasement", worst on doors) -- and
@@ -580,14 +589,14 @@ void R_RenderSegLoop (void)
 	    int s1 = (bottomfrac - topfrac) >> HEIGHTBITS;
 	    int s2 = ((bottomfrac + bottomstep * n) - (topfrac + topstep * n)) >> HEIGHTBITS;
 	    int s = s1 > s2 ? s1 : s2;
-	    int span_close = (s > SAT_WALL_CPU_SPAN);   /* kept for the FBK counter */
+	    int span_close = (s > sat_wall_cpu_span);   /* kept for the FBK counter */
 	    /* SPAN clamp DISABLED (v0 near-wall affine perspective warp = "moche", owner 2026-07-02):
 	       span-close one-sided walls stay on the CPU (shipping).  sat_wall_clamp now drives ONLY the
 	       BELOW-FLOOR cut (Phase 1b).  Revisit SPAN only with finer near-tile u-subdivision. */
 	    int cpu_now = span_close || magnified;
 	    int idx = (int)(curline - segs);
 	    unsigned char *st = (idx >= 0 && idx < SAT_SEG_MAX) ? &sat_seg_cpu[idx] : 0;
-	    sat_v1_mid = (s < SAT_WALL_CPU_V1) && !magnified;  /* magnified -> NO VDP1 quad (it squishes) */
+	    sat_v1_mid = (s < sat_wall_cpu_v1) && !magnified;  /* magnified -> NO VDP1 quad (it squishes) */
 #if SAT_WALL_SUBDIV
 	    if (magnified && !span_close) { sat_v1_mid_sub = 1; cpu_now = 0; }  /* keep on VDP1 via perspective subdivision (emit site), not CPU */
 #endif
@@ -616,14 +625,14 @@ void R_RenderSegLoop (void)
 		int s1 = (pixhigh - topfrac) >> HEIGHTBITS;
 		int s2 = ((pixhigh + pixhighstep * n) - (topfrac + topstep * n)) >> HEIGHTBITS;
 		int s = s1 > s2 ? s1 : s2;
-		cpu_up = (s > SAT_WALL_CPU_SPAN);
+		cpu_up = (s > sat_wall_cpu_span);
 	    }
 	    if (bottomtexture)
 	    {
 		int s1 = (bottomfrac - pixlow) >> HEIGHTBITS;
 		int s2 = ((bottomfrac + bottomstep * n) - (pixlow + pixlowstep * n)) >> HEIGHTBITS;
 		int s = s1 > s2 ? s1 : s2;
-		cpu_lo = (s > SAT_WALL_CPU_SPAN);
+		cpu_lo = (s > sat_wall_cpu_span);
 	    }
 	    {
 		int cpu_now = cpu_up || cpu_lo || magnified;

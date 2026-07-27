@@ -91,6 +91,14 @@ void (*sat_psprite_hook)(patch_t *patch, int lump, int sx, int sy, int flip,
    the late software psprite draw.  0 on DoomJo / when the weapon stays software. */
 int sat_psprite_early = 0;
 
+/* SATURN (2026-07-19): route the player WEAPON off VDP1 to the SOFTWARE layer -- the monster-BLINK
+   lever.  VDP1 plot order is weapon(1) -> walls -> things -> weapon(2); the weapon (~18k px, drawn
+   TWICE) is a big fixed fill BEFORE the things, so a plot-time overrun (D<100%) dies in the walls and
+   never reaches the monsters.  Moving the weapon to software (half-res in M7, but the ENEMIES stay
+   crisp on VDP1 -- the hard constraint) frees that fill so the things plot.  0 = weapon on VDP1
+   (default, no change).  Platform toggles it live (pad L+X); DoomJo keeps 0. */
+int sat_wpn_soft = 0;
+
 /* SATURN sprite-rotation degradation ladder (STREAMING_FLUIDITY_ROADMAP.md):
      8 = full (default)                    5 lumps per rotated frame
      4 = front/back/left/right (cardinal)  3 lumps (sides share the mirrored A3A7)
@@ -138,6 +146,22 @@ int sat_things_emitted = 0;                 /* 1 = things went to VDP1 this view
 int sat_things_occ = 0;                     /* fully-occluded sprites skipped this frame (occlusion metric) */
 int sat_thing_cap = 4;                      /* platform sets = VDP1 thing slots/frame (VRAM cap); nearest win */
 int sat_things_hw = 1;                      /* platform (sat_apply_mode): 1 = world sprites on VDP1; 0 = software (M0/M6) */
+
+/* SATURN (2026-07-19): VDP1 sprite FILL budget -- the monster-BLINK fix.  The blink is a VDP1
+   fill-TIME tail-cut: near monsters are emitted LAST (over the walls, for z-order) so they are the
+   FIRST cut when the per-vblank pixel fill overruns.  sat_thing_emit_cap (AIMD) bounds the COUNT off
+   the CEF signal but NOT the fill -- a few BIG near sprites overrun the raster at a low count (why
+   the blink shows with ec16 / no overflow flags).  This bounds the accumulated on-screen AREA of the
+   VDP1 sprites: from the highest rank (nearest/biggest actor) down, keep marking eligible until the
+   area crosses the budget; the rest fall to the SOFTWARE fill (half-res in M7 but VISIBLE -- strictly
+   better than cut, and it shortens the VDP1 list so the kept ones plot in time).  0 = uncapped (the
+   count-only old default -> byte-identical).  Platform cycles it live (pad L+X); area = full-320 px
+   (R_ThingScreenArea).  DoomJo keeps it 0 -> inert. */
+int sat_thing_fill_budget = 0;
+int sat_thing_vdp1_fill   = 0;   /* accumulated VDP1 sprite area this view (overlay)    */
+int sat_thing_vdp1_kept   = 0;   /* sprites kept crisp on VDP1 under the budget         */
+int sat_thing_vdp1_spill  = 0;   /* sprites spilled to software by the budget (overlay) */
+
 
 /* SATURN nearSprites cull (FastDoom, r_things.c:1137): 1 = drop FAR non-shootable decorations before
    the projection math (they subtend a few px, invisible).  Live A/B via pad R+X (platform); default
@@ -1710,7 +1734,27 @@ void R_EmitWorldThingsVDP1 (void)
 		    em_key[k-1] = key; em_idx[k-1] = idx;
 		}
 	    }
-	    for (k = 0 ; k < nem ; k++) sat_thing_elig[em_idx[k]] = 1;
+	    /* FILL cap: mark eligible from the HIGHEST rank (nem-1 = nearest/biggest actor) down,
+	       accumulating on-screen area; once it crosses sat_thing_fill_budget the lower-rank
+	       sprites stay SOFTWARE so the VDP1 sprite list plots within the vblank (bounded fill =
+	       no tail-cut = no blink).  budget 0 -> keep all nem (byte-identical old behaviour). */
+	    {
+		long acc = 0, budg = sat_thing_fill_budget;
+		int  kept = 0;
+		for (k = nem - 1 ; k >= 0 ; k--)
+		{
+		    sat_thing_elig[em_idx[k]] = 1;
+		    kept++;
+		    if (budg > 0)
+		    {
+			acc += R_ThingScreenArea (&vissprites[em_idx[k]]);
+			if (acc >= budg) break;   /* budget reached -> the rest stay software */
+		    }
+		}
+		sat_thing_vdp1_fill  = (int)acc;
+		sat_thing_vdp1_kept  = kept;
+		sat_thing_vdp1_spill = nem - kept;
+	    }
 	}
     }
 
@@ -1851,7 +1895,7 @@ void R_DrawMasked (void)
        software path. */
     {
 	extern int sat_wall_skip;
-	int vdp1_will_emit = sat_psprite_early && sat_wall_skip;
+	int vdp1_will_emit = sat_psprite_early && sat_wall_skip && !sat_wpn_soft;
 	if (!viewangleoffset && !vdp1_will_emit)
 	    R_DrawPlayerSprites ();
     }

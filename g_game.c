@@ -654,9 +654,26 @@ void G_DoLoadLevel (void)
 	memset (players[i].frags,0,sizeof(players[i].frags)); 
     } 
 		 
-    P_SetupLevel (gameepisode, gamemap, 0, gameskill);    
-    displayplayer = consoleplayer;		// view the guy you are playing    
-    gameaction = ga_nothing; 
+    P_SetupLevel (gameepisode, gamemap, 0, gameskill);
+    displayplayer = consoleplayer;		// view the guy you are playing
+    gameaction = ga_nothing;
+#ifdef SAT_TEST_GOD
+    /* SATURN flicker-test build ONLY (SAT_TEST_GOD, gated -- normal & DoomJo builds never see it):
+       spawn the tester into the arena INVINCIBLE and fully kitted (god mode + all weapons/keys/ammo +
+       armor) so she can walk into a monster horde and STAND STILL filming the V1 probe without dying
+       or being blocked by a locked door.  Runs after P_SetupLevel (the player is spawned). */
+    {
+	player_t *plyr = &players[consoleplayer];
+	plyr->cheats |= CF_GODMODE;
+	plyr->health = 100;
+	if (plyr->mo) plyr->mo->health = 100;
+	plyr->armorpoints = 200;
+	plyr->armortype   = 2;
+	for (i = 0; i < NUMWEAPONS; i++) plyr->weaponowned[i] = true;
+	for (i = 0; i < NUMAMMO;    i++) plyr->ammo[i] = plyr->maxammo[i];
+	for (i = 0; i < NUMCARDS;   i++) plyr->cards[i] = true;
+    }
+#endif
     Z_CheckHeap ();
     
     // clear cmd building stuff

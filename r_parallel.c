@@ -1045,6 +1045,13 @@ void RP_WaitPlanes(void)
    MASTER-ONLY (r_plane.c), which is the stable ~13fps behaviour.  Do NOT re-wire RP_DrawPlanes* into
    the sat_lowres branch without solving the pump. */
 
+/* SATURN (2026-07-19) M7 SLAVE-PUMP PROBE -- built + run on HW, then REMOVED (it answered its
+   question).  Verdict: a real slave DRAW body does NOT run in single-mode M7 (trivial body ran,
+   realwork body never entered, a second dispatch did not "pump" it, and a failed dispatch wedges
+   the slave).  The idle M7 slave cannot be given real draw work via slSlaveFunc -- see the memory
+   [[slave-sh2-vdp1-flicker-offload]].  The gate above stands: do NOT re-wire RP_DrawPlanes* / any
+   slave draw offload into the sat_lowres branch. */
+
 /* ------------------------------------------------------------------------------------------ *
  * SATURN masked-by-half (Option B): the slave draws the RIGHT-half vissprites (r_things.c        *
  * R_SlaveDrawMasked) while the master draws the LEFT half, during the masked phase.  Same        *

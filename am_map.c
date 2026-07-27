@@ -1317,7 +1317,11 @@ static byte*    mm_scratch     = NULL;
 static void*    mm_built_for   = NULL;          // the lines[] pointer the scratch was baked for
 static int      mm_built_shown = -1;            // the revealed-line count the scratch was baked for
 static int      mm_built_w      = -1;           // SATURN M7: the width the scratch was baked at (160/80)
-static int      mm_minx, mm_miny, mm_scale, mm_dh, mm_padx, mm_pady;
+// SATURN M7: when the minimap is packed (sat_lowres, w=80) the whole NBG1 layer is HW-zoomed x2
+// horizontally, so plotted x is packed by mm_hz(=2) -> square on screen.  mm_scale is the uniform
+// DISPLAY scale; x positions are divided by mm_hz (precise: keeps big-level detail vs scaling /2).
+static int      mm_minx, mm_miny, mm_scale, mm_hz, mm_dh, mm_padx, mm_pady;
+extern int      sat_lowres;                     // core r_main.c: 1 = M7 packed render + x2 NBG1 zoom
 
 // Bresenham into the LOCAL scratch (stride == w, a full-width buffer -> always safe).
 static void mm_scratch_line(byte* sc, int w, int x0, int y0, int x1, int y1, int color)
@@ -1358,6 +1362,7 @@ static void mm_build_scratch(byte* sc, int w, int h)
 {
     int minx, maxx, miny, maxy, spanx, spany;
     int aw, ah, sx, sy, s, dw, dh, padx, pady, i;
+    int hz = sat_lowres ? 2 : 1;   // M7: the packed minimap is x2-zoomed horizontally on screen
 
     minx = miny =  0x7fffffff;
     maxx = maxy = -0x7fffffff;
@@ -1374,11 +1379,14 @@ static void mm_build_scratch(byte* sc, int w, int h)
     spany = maxy - miny; if (spany < 1) spany = 1;
 
     aw = w - 4; ah = h - 4;
-    sx = (aw << 8) / spanx;
-    sy = (ah << 8) / spany;
-    s  = sx < sy ? sx : sy;
-    dw = (spanx * s) >> 8;
-    dh = (spany * s) >> 8;
+    /* Fit uniformly in DISPLAY space: x has (aw*hz) on-screen pixels (the x2 NBG1 zoom), y has ah.
+       Then pack the plotted x by hz (divide the FINAL position, not the scale -> precise on big
+       levels where s is small) so the zoom restores square aspect.  hz=1 (non-M7) = old uniform fit. */
+    sx = (aw * hz << 8) / spanx;         // display-space x scale
+    sy = (ah << 8) / spany;              // y scale (vertical is NOT zoomed)
+    s  = sx < sy ? sx : sy;              // uniform DISPLAY scale
+    dw = ((spanx * s) >> 8) / hz;        // scratch-x extent (display extent packed by hz)
+    dh = (spany * s)   >> 8;
     padx = 2 + (aw - dw) / 2;            // scratch-local (0-based); FB adds ox/oy later
     pady = 2 + (ah - dh) / 2;
 
@@ -1408,15 +1416,15 @@ static void mm_build_scratch(byte* sc, int w, int h)
             color = TSWALLCOLORS;                                   // plain two-sided (cheat only)
         else
             continue;                                               // plain two-sided: not drawn
-        x0 = padx + (((l->v1->x >> FRACBITS) - minx) * s >> 8);
+        x0 = padx + ((((l->v1->x >> FRACBITS) - minx) * s >> 8) / hz);
         y0 = pady + dh - 1 - (((l->v1->y >> FRACBITS) - miny) * s >> 8);
-        x1 = padx + (((l->v2->x >> FRACBITS) - minx) * s >> 8);
+        x1 = padx + ((((l->v2->x >> FRACBITS) - minx) * s >> 8) / hz);
         y1 = pady + dh - 1 - (((l->v2->y >> FRACBITS) - miny) * s >> 8);
         mm_scratch_line(sc, w, x0, y0, x1, y1, color);
     }
 
-    // stash the fit so the per-frame dots match the baked walls
-    mm_minx = minx; mm_miny = miny; mm_scale = s; mm_dh = dh;
+    // stash the fit so the per-frame dots match the baked walls (x packed by mm_hz, y full)
+    mm_minx = minx; mm_miny = miny; mm_scale = s; mm_hz = hz; mm_dh = dh;
     mm_padx = padx; mm_pady = pady;
 }
 
@@ -1466,7 +1474,7 @@ void AM_DrawMiniMap(int ox, int oy, int w, int h)
         if (!playeringame[i] || !players[i].mo)
             continue;
         color = their_colors[i];
-        px = ox + mm_padx + (((players[i].mo->x >> FRACBITS) - mm_minx) * mm_scale >> 8);
+        px = ox + mm_padx + ((((players[i].mo->x >> FRACBITS) - mm_minx) * mm_scale >> 8) / mm_hz);
         py = oy + mm_pady + mm_dh - 1 - (((players[i].mo->y >> FRACBITS) - mm_miny) * mm_scale >> 8);
         for (by = py - 2; by <= py + 2; by++)
         {
