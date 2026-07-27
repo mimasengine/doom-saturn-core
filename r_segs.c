@@ -713,7 +713,7 @@ void R_RenderSegLoop (void)
 	         software draws 0 px of it -- claim NOTHING (the old full-quad claim painted it
 	         over nearer walls in the near-first painter; owner's outer-border capture). */ }
 	else if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
-	    { /* entirely below the floor -> cull (neither VDP1 nor CPU draws it) */ }
+	    { if (sat_wall_clamp) sat_sw_mid = 1; /* SATURN: reached only when 711 passed => span_visible said VISIBLE, so this end-only "below floor" is a pedestal false-positive -> draw in SOFTWARE (per-column floorclip clips the truly-below columns; no bleed).  clamp off: cull as before. */ }
 	else if (sat_floor_punch_here() && sat_wall_cross_lo(yh1, yh2))
 	{
 	    /* Occluded below a NEARER floor somewhere in the span (ends OR interior -- the pedestal
@@ -816,7 +816,7 @@ void R_RenderSegLoop (void)
 	    if (sat_wall_clamp && !sat_wall_span_visible(yl1, yl2, yh1, yh2))
 		{ /* invisible at every column -> claim nothing (see the mid tier) */ }
 	    else if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
-		{ /* entirely below the floor -> cull */ }
+		{ if (sat_wall_clamp) sat_sw_up = 1; /* SATURN: 816 passed => VISIBLE; end-only "below floor" = pedestal false-positive -> SOFTWARE (per-column floorclip clips).  clamp off: cull as before. */ }
 	    else if (sat_floor_punch_here() && sat_wall_cross_lo(yh1, yh2))
 	    {   /* below the floor somewhere -> Phase-1 world-anchored cut + software wedge; else CPU */
 		if (!(sat_wall_clamp && sat_v1_up
@@ -887,7 +887,7 @@ void R_RenderSegLoop (void)
 	    if (sat_wall_clamp && !sat_wall_span_visible(yl1, yl2, yh1, yh2))
 		{ /* invisible at every column -> claim nothing (see the mid tier) */ }
 	    else if (sat_floor_punch_here() && yl1 >= floorclip[rw_x] && yl2 >= floorclip[rw_stopx - 1])
-		{ /* entirely below the floor -> cull */ }
+		{ if (sat_wall_clamp) sat_sw_lo = 1; /* SATURN: 887 passed => VISIBLE; end-only "below floor" = pedestal false-positive -> SOFTWARE (per-column floorclip clips).  clamp off: cull as before. */ }
 	    else if (sat_floor_punch_here() && sat_wall_cross_lo(yh1, yh2))
 	    {   /* below the floor somewhere -> Phase-1 world-anchored cut + software wedge; else CPU */
 		if (!(sat_wall_clamp && sat_v1_lo
