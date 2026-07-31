@@ -222,6 +222,31 @@ int (*sat_wall_hook)(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
                      int texnum, int u1, int u2, int v0, int v1,
                      const unsigned char *cmap) = 0;
 
+/* SATURN L5 (near-wall edge split): ask the PLATFORM which sub-range of a tier's columns it can
+   actually emit.  The acceptance test lives in dg_saturn's wall_emit_band -- the view window +/-
+   wall_ext, plus the 13-bit VDP1 coordinate clamp -- and a tile that fails it takes the "clamp +
+   squish" fallback that compresses a whole texw-wide texture into the clipped span.  THAT is the
+   ecrasement.  Duplicating the test in core would let the two drift, so the splitter REPLAYS the
+   emitter's own tile loop and returns the widest run of ACCEPTED tiles.
+   RETURNS 1 = usable interior: *xL/*xR = its screen columns, *uL/*uR = its tile-aligned texture
+   bounds.  0 = nothing emittable, and *why says which clause lost:
+     1 = LATERAL  (tile lands outside the view window +/- wall_ext) -> CPU borders can rescue it;
+     2 = MAGNITUDE(texw * magnification exceeds the frame-buffer plane) -> no screen-space split can
+         ever help; only a narrower BAKED sub-texture would.  This one is HARDWARE, not caution:
+         VDP1 UM p.21 -- "nothing is written for parts that exceed the range of the frame buffer
+         plane" (+/-1024).  A quad always draws a WHOLE character, so the smallest unit VDP1 can
+         place is one full texw tile; once texw * magnification leaves that plane the tile is
+         undrawable at ANY screen subdivision (docs/VDP1_LIMITS_SOURCED.md 1.3/1.5).
+   So one capture of row-8 `e`/`b` tells us whether building that rebake is worth it. */
+int (*sat_wall_edge_hook)(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
+                          int u1, int u2, int texw,
+                          int *xL, int *xR, int *uL, int *uR, int *why) = 0;
+/* Row-8 sizer for L5.  `e<got>/<want>` + `b<L><M><T><R>`: a single capture must be able to explain a
+   NULL result, or a flat Bp proves nothing (the `to` lesson -- never judge a lever through an
+   instrument that cannot show why it did nothing).  want = tiers that ASKED for the split. */
+int sat_fb_edge_w = 0;     /* tiers that armed the split this frame (the denominator)            */
+int sat_fb_edge_b[4] = {0,0,0,0};  /* bail causes: 0 lateral, 1 magnitude, 2 too-thin, 3 refused */
+
 /* SATURN: when the VDP1 world renderer owns the one-sided walls, skip the software
    midtexture column draw (R_GetColumn + colfunc) for them -> measure the perf the
    VDP1 path buys back.  The ceiling/floor clip + visplane marking still run (floors,
@@ -333,8 +358,14 @@ int sat_wall_clamp = 0;
      4 = + L4 subdivision cap SAT_WALL_SUBDIV_MAX(6) -> sat_wall_subdiv_max(3): fewer VDP1 quads
            AND fewer SAT_VROWS divides on magnified walls.  **NOT byte-identical** -- slightly
            more affine error on a near face-on wall.  The only step with a visible tradeoff.
-   Default 4.  DoomJo compiles and runs this unchanged; only step 4 alters pixels. */
-int sat_opt = 4;
+     5 = + L5 near-wall EDGE SPLIT: a wall too close for a VDP1 quad is no longer dumped whole to
+           the CPU.  VDP1 gets the tile-aligned INTERIOR (never extrapolated -> no squish), the CPU
+           keeps only the partial edge tiles, where u is exact per column.  Targets the ~22ms
+           nose-to-wall Bp.  Changes pixels (it REPLACES a full software wall with a hybrid), and
+           bails out to the old full-CPU wall whenever the interior is too thin.  Overlay row-8 `e`
+           counts the tiers it actually saved -- `e0` means it never engaged.
+   Default 5.  DoomJo compiles and runs this unchanged; only steps 4 and 5 alter pixels. */
+int sat_opt = 5;
 int sat_wall_subdiv_max = 3;   /* the L4 cap (sat_opt >= 4); SAT_WALL_SUBDIV_MAX is the level-0 one */
 
 /* SATURN L2: the per-SEG hoisted extremes of the two clip arrays over [rw_x, rw_stopx).
@@ -342,6 +373,24 @@ int sat_wall_subdiv_max = 3;   /* the L4 cap (sat_opt >= 4); SAT_WALL_SUBDIV_MAX
    scan and the column loop.  sat_clip_have = 0 makes every consumer fall back to its own scan
    (so sat_opt < 2 is byte-identical, and so is a seg the scan skipped). */
 static int sat_clip_fcm, sat_clip_ccm, sat_clip_have;
+
+/* SATURN L5 -- NEAR-WALL EDGE SPLIT (sat_opt >= 5): CPU borders, VDP1 core.
+   WHY the near wall squishes: dg_saturn's wall_emit_band tiles the wall in TEXTURE space and places
+   each tile with a LINEAR u->x map anchored at (u1,x1) and (u2,x2).  Inside that interval it is
+   INTERPOLATION -- error bounded by the chord, zero at the anchors.  But the tile loop starts at
+   `umin & ~(texw-1)`, i.e. BEFORE u1, so the first and last tiles are placed by EXTRAPOLATING that
+   map outside its fitted range, and extrapolation error is unbounded: nose-to-wall with ~2 visible
+   tiles the edge tile lands most of a screen-width off.  That is the "ecrasement", and it is why the
+   whole tier was routed to the CPU in 2026-07-02 ("v0 near-wall affine perspective warp = moche";
+   the same comment names the way back in: finer near-tile u handling).
+   THE SPLIT: give VDP1 only the TILE-ALIGNED INTERIOR [uL,uR] -> every emitted tile is interpolated,
+   never extrapolated.  The partial edge tiles stay on the CPU, where u is resampled per column from
+   finetangent[] and is therefore perspective-EXACT by construction -- strictly better than any extra
+   sub-quad, which would still be affine within itself.  Cost is paid only on the thin borders.
+   sat_we_on gates it per seg; 0 = the untouched full-CPU wall, so bailing out never regresses. */
+#define SAT_WALL_EDGE_MIN 12      /* interior columns below which the split is not worth a quad */
+static int sat_we_on, sat_we_lo, sat_we_hi;
+int sat_fb_edge_t = 0;            /* tiers rendered as CPU-borders + VDP1-core this frame (overlay `e`) */
 
 /* LAZY on purpose (Ymir A/B 2026-07-30): the first cut of L2 ran this eagerly once per seg and
    measured EXACTLY ZERO -- because sat_wall_cross_lo returns on its two END-column tests for most
@@ -576,6 +625,45 @@ static int sat_wall_span_visible(int yl1, int yl2, int yh1, int yh2)
     return 0;
 }
 
+/* SATURN L5: try to render this tier as CPU-BORDERS + VDP1-CORE instead of a full software wall.
+   Returns 1 when armed (sat_we_* set) -- the caller must then clear its sat_sw_* tier flag so the
+   column loop draws ONLY the border columns, via is_edge.  Returns 0 = the caller keeps the
+   untouched full-CPU wall, so every bail-out here is a no-op, never a regression.
+   need_floor_clear: the caller is the floor-CROSSING path.  The RBG0 floor is transparent (index 0),
+   so a VDP1 quad dipping under floorclip would bleed through it -- prove the whole interior stays
+   above the seg's minimum floorclip (the same O(1) argument as L2) before emitting. */
+static int sat_wall_try_edge(int texture, int yl1, int yh1, int yl2, int yh2,
+                             int u1, int u2, int v0, int v1, const lighttable_t *cm,
+                             int need_floor_clear)
+{
+    int tw, xL, xR, uL, uR, why = 0, dL, dR, ylL, yhL, ylR, yhR;
+    if (!sat_wall_edge_hook || !sat_wall_hook || texture <= 0) return 0;
+    tw = texturewidthmask[texture] + 1;
+    if (tw <= 1) return 0;
+    if (!sat_wall_edge_hook(rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, u1, u2, tw,
+                            &xL, &xR, &uL, &uR, &why))
+	{ if (why >= 1 && why <= 2) sat_fb_edge_b[why - 1]++; return 0; }
+    if (xL < rw_x)         xL = rw_x;
+    if (xR > rw_stopx - 1) xR = rw_stopx - 1;
+    if (xR - xL < SAT_WALL_EDGE_MIN) { sat_fb_edge_b[2]++; return 0; }
+    dL = xL - rw_x; dR = xR - rw_x;
+    ylL = (topfrac    + topstep    * dL + HEIGHTUNIT - 1) >> HEIGHTBITS;
+    yhL = (bottomfrac + bottomstep * dL)                  >> HEIGHTBITS;
+    ylR = (topfrac    + topstep    * dR + HEIGHTUNIT - 1) >> HEIGHTBITS;
+    yhR = (bottomfrac + bottomstep * dR)                  >> HEIGHTBITS;
+    if (need_floor_clear)
+    {
+	int m = yhL > yhR ? yhL : yhR;
+	sat_wall_clip_need();
+	if (m >= sat_clip_fcm) { sat_fb_edge_b[3]++; return 0; }  /* may dip under a nearer floor -> CPU */
+    }
+    if (sat_wall_hook(xL, ylL, yhL, xR, ylR, yhR, texture, uL, uR, v0, v1, cm))
+	{ sat_fb_edge_b[3]++; return 0; }     /* VDP1 bank full */
+    sat_we_on = 1; sat_we_lo = xL; sat_we_hi = xR;
+    sat_fb_edge_t++;
+    return 1;
+}
+
 void R_RenderSegLoop (void)
 {
     angle_t		angle;
@@ -593,6 +681,7 @@ void R_RenderSegLoop (void)
     int			sat_sw_mid = 0, sat_sw_up = 0, sat_sw_lo = 0;
     int			sat_v1_mid = 0, sat_v1_up = 0, sat_v1_lo = 0;
     int			sat_v1_mid_sub = 0, sat_v1_up_sub = 0, sat_v1_lo_sub = 0;   /* magnified tier -> perspective-subdivide on VDP1 (not CPU) */
+    int			sat_v1_mid_edge = 0;   /* SATURN L5: try CPU-borders + VDP1-core instead of a full CPU wall */
     /* SATURN Phase-1 wall clamp: per-tier residual-WEDGE state.  0 = off (software draws the
        full tier when sat_sw_* is set); 1 = below-floor cut, software draws only rows >= edge(x);
        2 = above-ceiling cut, software draws only rows <= edge(x).  edge(x) steps linearly per
@@ -617,6 +706,7 @@ void R_RenderSegLoop (void)
        and in_masked is 0 during opaque wall generation). */
     wall_solid = sat_potato_walls && !sat_wall_textured && !rp_disabled;
     sat_clip_have = 0;   /* SATURN L2: per-SEG validity -- never inherit the previous seg's scan */
+    sat_we_on     = 0;   /* SATURN L5: edge-split disarmed until this seg's claim block arms it */
 
     /* texture ROW (v) at a wall's top/bottom screen y, so the platform maps the right
        vertical SUBRANGE of the texture (charAddr/height) instead of stretching the whole
@@ -677,6 +767,10 @@ void R_RenderSegLoop (void)
 		    else if (span_close)            { sat_fb_clamp_t++; sat_fb_px += s * sx; }  /* pure span  -> clampable     */
 		}
 		sat_sw_mid = 1;  if (st) *st = 2;   /* CPU draws (close/magnified); arm 2 CPU exit-frames */
+		    /* SATURN L5: this tier is about to cost a FULL-SCREEN software wall (the ~22ms
+		       nose-to-wall Bp).  Let the emit site below try the CPU-borders/VDP1-core split
+		       first; it silently leaves everything as-is when the interior is too thin. */
+		    if (sat_opt >= 5) { sat_v1_mid_edge = 1; sat_fb_edge_w++; }
 	    }
 	    else
 	    {
@@ -753,7 +847,7 @@ void R_RenderSegLoop (void)
     /* SATURN VDP1 world renderer (Step 2): one-sided (solid) walls -> the platform as
        a quad.  The 4 screen corners come from the same topfrac/bottomfrac the loop
        below steps; midtexture = the full-height wall texture. */
-    if (sat_wall_hook && SAT_WALL_VDP1_OK && midtexture && !curline->backsector && rw_stopx > rw_x && (sat_v1_mid || sat_v1_mid_sub))
+    if (sat_wall_hook && SAT_WALL_VDP1_OK && midtexture && !curline->backsector && rw_stopx > rw_x && (sat_v1_mid || sat_v1_mid_sub || sat_v1_mid_edge))
     {
 	int n   = rw_stopx - 1 - rw_x;
 	int yl1 = (topfrac + HEIGHTUNIT - 1) >> HEIGHTBITS;
@@ -799,6 +893,15 @@ void R_RenderSegLoop (void)
 	                                sat_sw_mid, &sat_wcl_mid_ef, &sat_wcl_mid_es, &sat_wcl_mid)))
 	        { sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }
 	    sat_sw_mid = 1;   /* full tier on a failed clamp; only the WEDGE rows when sat_wcl_mid is armed */
+	    /* SATURN L5 COMPOSITION: the vertical cut above is gated on !magnified, so a MAGNIFIED wall
+	       that ALSO crosses the floor line used to fall straight through to a full software wall --
+	       the case the owner rightly called out.  The lateral split is ORTHOGONAL to the vertical
+	       cut, so try it here too; the floor-clearance proof inside keeps any VDP1 pixel from
+	       bleeding through the transparent RBG0 floor.  Skipped when a wedge is already armed
+	       (that regime has its own software rows and its own z-contract). */
+	    if (sat_v1_mid_edge && !sat_wcl_mid
+	        && sat_wall_try_edge(midtexture, yl1, yh1, yl2, yh2, u1, u2, v0, v1, cm, 1))
+		sat_sw_mid = 0;
 	}
 	else if (sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2))
 	{
@@ -812,6 +915,15 @@ void R_RenderSegLoop (void)
 	                               sat_sw_mid, &sat_wcl_mid_ef, &sat_wcl_mid_es, &sat_wcl_mid)))
 	        { sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }
 	    sat_sw_mid = 1;   /* full tier on a failed clamp; only the WEDGE rows when sat_wcl_mid is armed */
+	}
+	else if (sat_v1_mid_edge)
+	{
+	    /* SATURN L5: hand VDP1 only the columns its own emitter accepts (sat_wall_edge_hook
+	       replays wall_emit_band's guard), and keep the rejected borders on the CPU, where u is
+	       resampled per column from finetangent[] and is therefore perspective-EXACT -- strictly
+	       better than another affine sub-quad.  Not armed -> the untouched full-CPU wall. */
+	    if (sat_wall_try_edge(midtexture, yl1, yh1, yl2, yh2, u1, u2, v0, v1, cm, 0))
+		sat_sw_mid = 0;   /* the column loop now draws ONLY the borders (is_edge) */
 	}
 #if SAT_WALL_SUBDIV
 	else if (sat_v1_mid_sub && !sat_v1_mid)   /* normal path only (pot2 force-sets sat_v1_mid=1 -> single quad) */
@@ -1032,15 +1144,10 @@ void R_RenderSegLoop (void)
 #endif
     for ( ; rw_x < rw_stopx ; rw_x++)
     {
-#if SAT_WALL_EDGE_FILL
-	/* software-draw the wall's first/last SAT_WALL_EDGE_FILL columns even when VDP1 owns it -> the NBG1
-	   strips align with the lagged mask and fill the horizontal rotation decrochage.  sat_wall_skip==0
-	   (DoomJo / VDP1-off) -> is_edge is always 0 -> inert. */
-	int is_edge = sat_wall_skip && (rw_x - sat_ef_x0 < SAT_WALL_EDGE_FILL
-	                             || sat_ef_x1 - rw_x < SAT_WALL_EDGE_FILL);
-#else
-	enum { is_edge = 0 };
-#endif
+	/* SATURN L5: the CPU border columns of an edge-split wall (sat_we_on, armed in the claim
+	   block above).  Disarmed -> a constant 0 the compiler folds away, exactly like the old
+	   SAT_WALL_EDGE_FILL enum it replaces.  DoomJo / VDP1-off never arm it. */
+	int is_edge = sat_we_on && (rw_x <= sat_we_lo || rw_x >= sat_we_hi);
 	// mark floor / ceiling areas
 	yl = (topfrac+HEIGHTUNIT-1)>>HEIGHTBITS;
 
