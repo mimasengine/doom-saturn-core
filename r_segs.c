@@ -278,7 +278,10 @@ int sat_wall_cpu_v1 = SAT_WALL_CPU_V1;
    derived for free from the same mag quantity (columns-per-texel), capped so a few close walls can't
    starve the far ones.  0 = old behaviour (magnified -> CPU), byte-identical (A/B). */
 #define SAT_WALL_SUBDIV      1
-#define SAT_WALL_SUBDIV_MAX  6   /* hard cap on sub-segments per magnified wall (budget guard) */
+#define SAT_WALL_SUBDIV_MAX  6   /* level-0 cap on sub-segments per magnified wall (budget guard).
+                                    SATURN L4 (sat_opt >= 4) lowers it to sat_wall_subdiv_max (3):
+                                    each sub-segment costs a VDP1 quad AND a SAT_VROWS divide, and
+                                    the affine error it buys back is sub-pixel past ~3 chords. */
 
 /* EDGE FILL (owner 2026-07-02): a VDP1 wall is only visible through NBG1's index-0 mask, so in rotation
    its VDP1 body (current) is offset from that lagged NBG1 mask -> a horizontal "decrochage" sky gap at
@@ -313,6 +316,50 @@ int sat_fb_wclamp_t = 0;   /* Phase-1: tiers KEPT on VDP1 by the cut+wedge clamp
    the platform sets it from the SAT_WALL_CLAMP compile flag (dg_saturn) for the HW A/B. */
 int sat_wall_clamp = 0;
 
+/* SATURN PERF LEVERS (2026-07-30) -- CUMULATIVE A/B level, pad L+C (1p).  Each step ADDS one
+   optimisation so the tester can bisect the gain LIVE: build-vs-build fps photos are invalid
+   (+-6ms of Bp noise from ~600B .bss shifts), so every lever must be togglable in-session.
+     0 = all off -- the 2026-07-29 shipping code, the byte-identical reference.
+     1 = + L1 span fill (r_plane.c R_TexturedSpan, the ld path = THE #1 inner loop): the two
+           pixels of an ld pair are IDENTICAL bytes, so emit them as ONE 16-bit store and drop
+           the odd-tail branch from the hot loop.  Byte-identical output.
+     2 = + L2 clip-scan hoist: ONE per-seg min(floorclip)/max(ceilingclip) pass replaces the
+           per-TIER full column scans in sat_wall_cross_lo and sat_wall_cut_floor.  EXACT: yh(x)
+           is linear, so max(yh1,yh2) < min(floorclip) proves "crosses nowhere" in O(1).
+     3 = + L3 reciprocal hoist: rw_scale is CONSTANT throughout the whole claim phase (it is only
+           stepped in the column loop, which runs AFTER), so SAT_VROWS's 0xffffffff/rw_scale --
+           re-evaluated up to 3 tiers x (1 + SUBDIV) = 21 times per seg, always with the same
+           operand -- is computed ONCE.  Byte-identical.
+     4 = + L4 subdivision cap SAT_WALL_SUBDIV_MAX(6) -> sat_wall_subdiv_max(3): fewer VDP1 quads
+           AND fewer SAT_VROWS divides on magnified walls.  **NOT byte-identical** -- slightly
+           more affine error on a near face-on wall.  The only step with a visible tradeoff.
+   Default 4.  DoomJo compiles and runs this unchanged; only step 4 alters pixels. */
+int sat_opt = 4;
+int sat_wall_subdiv_max = 3;   /* the L4 cap (sat_opt >= 4); SAT_WALL_SUBDIV_MAX is the level-0 one */
+
+/* SATURN L2: the per-SEG hoisted extremes of the two clip arrays over [rw_x, rw_stopx).
+   Valid for the whole tier-claim phase because NOTHING writes floorclip/ceilingclip between the
+   scan and the column loop.  sat_clip_have = 0 makes every consumer fall back to its own scan
+   (so sat_opt < 2 is byte-identical, and so is a seg the scan skipped). */
+static int sat_clip_fcm, sat_clip_ccm, sat_clip_have;
+
+/* LAZY on purpose (Ymir A/B 2026-07-30): the first cut of L2 ran this eagerly once per seg and
+   measured EXACTLY ZERO -- because sat_wall_cross_lo returns on its two END-column tests for most
+   segs and never reaches its own scan, so an eager pass ADDS a full sweep instead of replacing one.
+   Scanning on first demand makes L2 monotonically >= 0: the caller that asks was about to sweep
+   anyway, and every later tier (plus sat_wall_cut_floor) then reuses the result for free. */
+static void sat_wall_clip_need (void)
+{
+    int x, fcm = viewheight, ccm = -1;
+    if (sat_clip_have) return;
+    for (x = rw_x; x < rw_stopx; x++)
+    {
+	if (floorclip[x]   < fcm) fcm = floorclip[x];
+	if (ceilingclip[x] > ccm) ccm = ceilingclip[x];
+    }
+    sat_clip_fcm = fcm; sat_clip_ccm = ccm; sat_clip_have = 1;
+}
+
 /* EXTRA CPU FRAMES on EXIT (Romain): when a one-sided wall leaves the CPU path (moves away,
    CPU->VDP1), the VDP1 presents several frames late -> a sky gap at the seam.  So for N frames after
    it stops being CPU, the CPU ALSO draws it (overlap) while VDP1 catches up.  N=2.  Per-seg (not a
@@ -345,11 +392,15 @@ static int sat_wall_cut_floor(fixed_t texmid, int v0, int yl1, int yl2,
     unsigned int is1, is2;
     int ylim, vc1, vc2, vcut, e1, e2, tries;
     fixed_t dv = 0;
-    for (x = rw_x; x < rw_stopx; x++)
-    {
-	if (floorclip[x]   < fcm) fcm = floorclip[x];
-	if (ceilingclip[x] > ccm) ccm = ceilingclip[x];
-    }
+    if (sat_opt >= 2)                              /* SATURN L2: reuse the per-seg scan (identical range).
+                                                      Reached only via cross_lo, which already forced it. */
+	{ sat_wall_clip_need(); fcm = sat_clip_fcm; ccm = sat_clip_ccm; }
+    else
+	for (x = rw_x; x < rw_stopx; x++)
+	{
+	    if (floorclip[x]   < fcm) fcm = floorclip[x];
+	    if (ceilingclip[x] > ccm) ccm = ceilingclip[x];
+	}
     if (fcm <= 1) return 0;                        /* some column fully occluded -> not worth it */
     /* SUBSET invariant (owner's Ymir z-order report 2026-07-03): the software tier painted on
        NBG1 (above ALL VDP1) and per-column clipped, so it could never lose to a farther wall.
@@ -467,6 +518,16 @@ static int sat_wall_cross_lo(int yh1, int yh2)
     fixed_t f, s;
     if (yh1 >= floorclip[rw_x] || yh2 >= floorclip[rw_stopx - 1]) return 1;
     if (!sat_wall_clamp || n <= 1) return 0;
+    /* SATURN L2: yh(x) interpolates yh1..yh2 linearly and the >>12 (arithmetic, = floor) only
+       LOWERS it, so every column obeys yh(x) <= max(yh1,yh2).  If that bound is already under the
+       seg's minimum floorclip, no column can cross -- O(1), and it also skips the divide below.
+       EXACT (same predicate, not an approximation). */
+    if (sat_opt >= 2)
+    {
+	int m = yh1 > yh2 ? yh1 : yh2;
+	sat_wall_clip_need();          /* we were about to sweep anyway -> sweep the CHEAP way, once */
+	if (m < sat_clip_fcm) return 0;
+    }
     f = yh1 << 12; s = ((yh2 - yh1) << 12) / n;
     for (x = rw_x; x < rw_stopx; x++)
     {
@@ -540,6 +601,10 @@ void R_RenderSegLoop (void)
     fixed_t		sat_wcl_mid_ef = 0, sat_wcl_mid_es = 0;
     fixed_t		sat_wcl_up_ef = 0,  sat_wcl_up_es = 0;
     fixed_t		sat_wcl_lo_ef = 0,  sat_wcl_lo_es = 0;
+    /* SATURN L3: 0xffffffff/rw_scale, hoisted.  rw_scale does NOT change during the tier-claim
+       phase below (it is only stepped inside the column loop, which runs after), so every
+       SAT_VROWS in this seg divides the SAME operand.  0 = not computed -> fall back. */
+    unsigned int	sat_is0 = 0;
 
     /* Keep doors/switches (special lines) textured even in Potato walls, so they
        stay readable against the flat-shaded plain walls. */
@@ -551,13 +616,14 @@ void R_RenderSegLoop (void)
        executor's solid test exactly (cm->unused = in_masked||sat_wall_textured,
        and in_masked is 0 during opaque wall generation). */
     wall_solid = sat_potato_walls && !sat_wall_textured && !rp_disabled;
+    sat_clip_have = 0;   /* SATURN L2: per-SEG validity -- never inherit the previous seg's scan */
 
     /* texture ROW (v) at a wall's top/bottom screen y, so the platform maps the right
        vertical SUBRANGE of the texture (charAddr/height) instead of stretching the whole
        texture onto the band (the "vertical squish").  ~constant across the seg, so compute
        it at x1 (rw_scale = scale1 here). */
 #define SAT_VROWS(texmid, ytop, ybot, v0o, v1o) do { \
-	unsigned int _is = 0xffffffffu / (unsigned int)rw_scale; \
+	unsigned int _is = (sat_opt >= 3 && sat_is0) ? sat_is0 : (0xffffffffu / (unsigned int)rw_scale); \
 	(v0o) = (int)(((texmid) + (fixed_t)(((ytop) - centery) * (int)_is)) >> FRACBITS); \
 	(v1o) = (int)(((texmid) + (fixed_t)(((ybot) - centery) * (int)_is)) >> FRACBITS); \
 	} while (0)
@@ -570,6 +636,10 @@ void R_RenderSegLoop (void)
     if (sat_wall_hook && SAT_WALL_VDP1_OK && sat_wall_skip && rw_stopx > rw_x)
     {
 	int n = rw_stopx - 1 - rw_x;
+	/* SATURN L3: hoist the SAT_VROWS reciprocal -- rw_scale is constant for the whole claim
+	   phase, so every tier (and every sub-segment) below divides the SAME operand.
+	   (L2's clip scan is deliberately NOT done here: it is lazy, see sat_wall_clip_need.) */
+	if (sat_opt >= 3 && rw_scale > 0) sat_is0 = 0xffffffffu / (unsigned int)rw_scale;
 	/* MAGNIFICATION = screen px per texel of u (du = the seg's tex u-span over its visible columns,
 	   tier-independent).  HIGH = close/face-on -> the VDP1 world-anchored tiling extrapolates past
 	   the screen edge and the platform squishes ("ecrasement", worst on DOORS) -> render in CPU.
@@ -751,7 +821,7 @@ void R_RenderSegLoop (void)
 	       yl/yh -> no squish, no swim.  Sub-segs abut column-for-column (no seam).  N ~ columns-per-texel
 	       (the same magnification quantity), capped.  Whole wall -> CPU on a bank-full reject. */
 	    int sx = rw_stopx - rw_x, mdu = u2 - u1; if (mdu < 0) mdu = -mdu; if (mdu < 1) mdu = 1;
-	    int N = 1 + sx / mdu; if (N < 2) N = 2; if (N > SAT_WALL_SUBDIV_MAX) N = SAT_WALL_SUBDIV_MAX;
+	    int N = 1 + sx / mdu; if (N < 2) N = 2; { int cap = (sat_opt >= 4) ? sat_wall_subdiv_max : SAT_WALL_SUBDIV_MAX; if (N > cap) N = cap; }   /* SATURN L4 */
 	    int tw = texturewidthmask[midtexture] + 1;
 	    int prev_b = rw_x, k;
 	    for (k = 1; k <= N; k++)
@@ -838,7 +908,7 @@ void R_RenderSegLoop (void)
 	    else if (sat_v1_up_sub && !sat_v1_up)   /* magnified door LINTEL -> perspective subdivision (top=topfrac, bottom=pixhigh) */
 	    {
 		int sx = rw_stopx - rw_x, mdu = u2 - u1; if (mdu < 0) mdu = -mdu; if (mdu < 1) mdu = 1;
-		int N = 1 + sx / mdu; if (N < 2) N = 2; if (N > SAT_WALL_SUBDIV_MAX) N = SAT_WALL_SUBDIV_MAX;
+		int N = 1 + sx / mdu; if (N < 2) N = 2; { int cap = (sat_opt >= 4) ? sat_wall_subdiv_max : SAT_WALL_SUBDIV_MAX; if (N > cap) N = cap; }   /* SATURN L4 */
 		int tw = texturewidthmask[toptexture] + 1;
 		int prev_b = rw_x, k;
 		for (k = 1; k <= N; k++)
@@ -909,7 +979,7 @@ void R_RenderSegLoop (void)
 	    else if (sat_v1_lo_sub && !sat_v1_lo)   /* magnified door SILL -> perspective subdivision (top=pixlow, bottom=bottomfrac) */
 	    {
 		int sx = rw_stopx - rw_x, mdu = u2 - u1; if (mdu < 0) mdu = -mdu; if (mdu < 1) mdu = 1;
-		int N = 1 + sx / mdu; if (N < 2) N = 2; if (N > SAT_WALL_SUBDIV_MAX) N = SAT_WALL_SUBDIV_MAX;
+		int N = 1 + sx / mdu; if (N < 2) N = 2; { int cap = (sat_opt >= 4) ? sat_wall_subdiv_max : SAT_WALL_SUBDIV_MAX; if (N > cap) N = cap; }   /* SATURN L4 */
 		int tw = texturewidthmask[bottomtexture] + 1;
 		int prev_b = rw_x, k;
 		for (k = 1; k <= N; k++)

@@ -60,6 +60,8 @@ extern int   columnofs[];
 extern int   fuzzoffset[];
 extern int   fuzzpos;
 extern int   detailshift;
+extern int   sat_lowres;          /* SATURN M7: packed-160 render -> the REC executors must PACK, not
+                                     double to x<<1 (=[160,320) off-screen), see rp_exec / rp_exec_fuzz */
 extern int   sat_potato_floors;   /* SATURN: solid-colour floors/ceilings (Potato) */
 extern int   sat_potato_walls;    /* SATURN: solid-colour walls (opaque RP_COL only) */
 extern int   sat_wall_color;      /* SATURN: current wall's dominant colour (r_segs) */
@@ -358,7 +360,7 @@ static void rp_exec_fuzz(const rp_cmd_t *cm)
     if (yh==viewheight-1) yh=viewheight-2;
     count=yh-yl;
     if (count<0 || count>=SCREENHEIGHT) return;
-    if (detailshift)   /* SATURN PERF 2.3: blocky fuzz, mirrors R_DrawFuzzColumnLow */
+    if (detailshift && !sat_lowres)   /* SATURN PERF 2.3: blocky fuzz (NON-lowres); M7 packs via the path below */
     {
         int   x = (int)cm->a << 1;
         byte *dest2;
@@ -493,7 +495,9 @@ static void rp_exec_span_low(const rp_cmd_t *cm, const int *colofs)
 static void rp_exec(const rp_cmd_t *cm, int parity, const int *colofs)
 {
     if ((cm->a & 1) != parity) return;
-    if (detailshift)
+    if (detailshift && !sat_lowres)   /* SATURN M7: pack in lowres (fall to the packed executors below) --
+                                         the *_low executors double to x<<1=[160,320), off the blitted 160
+                                         region (same bug class as the slave sprite drawers, r_things.c). */
     {
         switch (cm->type)
         {
@@ -722,11 +726,26 @@ static void rp_slave_wrapper(void *arg) { (void)arg; rp_slave_body(); }
    masked-split -- the reported freeze).  Bound by the FRT (real wall clock) instead.  rp_timeout_count
    (shown on the overlay) tallies every fallback, so a persistently-dead slave is visible, not silent. */
 #define RP_WAIT_TIMEOUT_FRT 5376u   /* ~24ms @ ~224 FRT ticks/ms: > any live slave half, << a frame-hang */
-static int rp_wait(volatile int *flag)
+/* SATURN 2026-07-31: rp_timeout_count is a SINGLE aggregate over five call sites and is NEVER
+   reset, so "it climbs" could not distinguish a level-load burst from a steady leak, and could not
+   say WHICH wait failed -- it cannot support any conclusion on its own.  Tally per site too; the
+   platform prints a per-second RATE plus the split (overlay `to<rate>:<A><P><M><W>`). */
+#define RP_TO_AUX   0   /* RP_AuxWait                    -- clear-on-slave / F-build aux job */
+#define RP_TO_PLANE 1   /* RP_WaitPlanes + RP_PlaneJoin  -- plane-split                      */
+#define RP_TO_MASK  2   /* RP_DispatchMasked             -- masked/sprite split              */
+#define RP_TO_WALL  3   /* RP_WaitWallPrep + the (1p-dead) REC joins                         */
+#define RP_TO_SITES 4
+int rp_to_site[RP_TO_SITES] = { 0, 0, 0, 0 };
+
+static int rp_wait(volatile int *flag, int site)
 {
     unsigned short t0 = rp_frt();
     while (!*flag) {
-        if ((unsigned short)(rp_frt() - t0) >= RP_WAIT_TIMEOUT_FRT) { rp_timeout_count++; return 0; }
+        if ((unsigned short)(rp_frt() - t0) >= RP_WAIT_TIMEOUT_FRT) {
+            rp_timeout_count++;
+            if ((unsigned int)site < (unsigned int)RP_TO_SITES) rp_to_site[site]++;
+            return 0;
+        }
     }
     return 1;
 }
@@ -739,7 +758,8 @@ static int rp_wait(volatile int *flag)
    slave-resync (which our manual write-pointer-only reset omits). */
 #define RP_GBR_RESET 1
 
-void RP_AuxWait(void);   /* fwd: join the platform's aux slave job before any rewind */
+void RP_AuxWait(void);     /* fwd: join the platform's aux slave job before any rewind */
+void RP_PlaneJoin(void);   /* fwd: join an OUTSTANDING plane dispatch before any rewind (see below) */
 
 /* SATURN: THE ~1-2min freeze fix.  slSlaveFunc bump-allocates a 12-byte record
    {0x30, func, arg} from the SGL transient work buffer at GBR+72 and advances
@@ -758,6 +778,17 @@ void rp_sgl_workptr_reset(void)
        site funnels through this reset, so the slave job queue stays strictly sequential.
        No aux job pending (DoomJo: always) => a single uncached read. */
     RP_AuxWait();
+    /* SATURN 2026-07-30 (`to` climbing on Ymir, root-caused): the aux job was NOT the only record
+       the slave could still own.  RP_DrawPlanesSplit's `m < 0` fast path -- the master's work-steal
+       claimed EVERY plane before the slave got scheduled -- returns WITHOUT joining, yet slSlaveFunc
+       has already queued a plane record.  The rewind below then reuses SGL slot 0 under that live
+       record: the slave either loses the next dispatch (master spins the full 24ms -> rp_timeout_count++)
+       or wakes onto the NEXT frame's rp_plane_lock[]/worklist (the .bss-stomp class).  Joining here --
+       at the rewind, which is where correctness actually demands it, not at the end of the plane phase --
+       keeps the `m < 0` fast path free (the master never blocks in the plane phase) while guaranteeing
+       the slot is idle before it is reused.  By this point the slave has had a whole phase to finish,
+       so the join is normally a single uncached read. */
+    RP_PlaneJoin();
     /* The SGL slave work area has TWO pointers that slSlaveFunc/the slave bump
        +12B per frame and that slSynch normally resets together: the WRITE pointer
        at GBR+72 and the slave's READ pointer at GBR+68 (confirmed on hardware via
@@ -885,7 +916,7 @@ void RP_AuxWait(void)
 {
     /* FRT-bounded (see rp_wait).  No master fallback: the aux job is a cosmetic VDP1-floor build --
        a missed frame is a 1-frame floor glitch, not a crash, and the next frame re-dispatches. */
-    rp_wait(&RP_AUX_DONE);
+    rp_wait(&RP_AUX_DONE, RP_TO_AUX);
 }
 
 /* SATURN PERF (2026-07-08): slave self-timing brackets for the MEASURED busy%.  BEGIN forces the
@@ -1000,20 +1031,49 @@ void RP_WaitPlanes(void);   /* defined just below */
 /* Visplane split: master + slave via TAS.B meet-in-the-middle work-steal (the shipped default;
    the static + row-split + cursor-steal A/B losers were removed 2026-07-16, docs/TOGGLE_AUDIT.md). */
 static int rp_plane_disp_n;                  /* # planes dispatched, for the RP_WaitPlanes timeout fallback */
+/* MASTER-ONLY: a plane record has been queued with slSlaveFunc and not yet joined.  It exists purely
+   so the deferred join in rp_sgl_workptr_reset knows whether the slave still owns SGL slot 0. */
+static int rp_plane_pending;
+
+/* Deferred join of an outstanding plane dispatch.  Called from rp_sgl_workptr_reset (i.e. from the
+   NEXT dispatch of any kind), never from the plane phase itself, so the `m < 0` fast path stays
+   non-blocking.  Deliberately does NOT run RP_WaitPlanes's idempotent redraw: by now the worklist
+   may belong to the next frame, and a slave that really stalled cost us at most one frame of
+   not-drawn planes (cosmetic, self-correcting) -- never a redraw into the wrong frame. */
+static int rp_plane_join_fails;              /* consecutive deferred-join timeouts */
+static int rp_plane_dead;                    /* latched: stop dispatching, draw planes master-only */
+
+void RP_PlaneJoin(void)
+{
+    if (!rp_plane_pending) return;
+    rp_plane_pending = 0;                    /* clear FIRST: a timed-out join must not re-arm itself */
+    if (rp_wait(&PLANE_DONE, RP_TO_PLANE))   /* FRT-bounded; tallies rp_timeout_count if the slave died */
+        rp_plane_join_fails = 0;
+    /* SELF-HEAL: a genuinely dead slave would otherwise burn the full 24ms timeout on EVERY frame's
+       deferred join -- far worse than the un-joined record we are fixing.  After 4 consecutive
+       failures, latch the split off and draw planes master-only (correct, just serial).  `to` still
+       shows the 4 failures, so the degradation is visible rather than silent. */
+    else if (++rp_plane_join_fails >= 4)
+        rp_plane_dead = 1;
+    master_cache_purge();                    /* read whatever the slave drew before anything else runs */
+}
 
 void RP_DrawPlanesSplit(int n)
 {
     int m = n - 1;
+    if (rp_plane_dead) { R_DrawPlaneWorklist(0, n); return; }   /* self-healed to master-only */
     rp_plane_disp_n = n;
-    PLANE_DONE = 0;
-    rp_sgl_workptr_reset();                  /* GBR-creep guard for this 2nd dispatch/frame */
+    rp_sgl_workptr_reset();                  /* GBR-creep guard + joins aux AND any outstanding plane job */
+    PLANE_DONE = 0;                          /* AFTER the join above -- it waits on this very flag */
     for (int i = 0; i < n; i++) rp_plane_lock[i] = 0;         /* arm claims (write-through to RAM) */
     slSlaveFunc(rp_plane_tas_body, (void *)(unsigned int)n);  /* slave claims UP from 0 */
+    rp_plane_pending = 1;                    /* a record is now live -> must be joined before any rewind */
     while (m >= 0) { if (!rp_tas_claim(m)) break; R_DrawPlaneWorklist(m, m + 1); m--; }  /* master DOWN */
-    /* m<0 => the master's meet-in-the-middle steal claimed+drew EVERY plane, i.e. the slave never
-       started (the freeze case) => there is nothing to wait for.  Only wait when the master broke on a
-       plane the slave had locked (m>=0), meaning the slave IS alive; RP_WaitPlanes bounds that too. */
-    if (m >= 0) RP_WaitPlanes();             /* slave sets PLANE_DONE; bounded + fallback + purge */
+    /* m<0 => the master's meet-in-the-middle steal claimed+drew EVERY plane before the slave got
+       scheduled => there is no WORK to wait for, so we do not block here.  The record is still live
+       though: rp_plane_pending leaves it to the deferred join (rp_sgl_workptr_reset).  Only block now
+       when the master broke on a plane the slave had locked (m>=0) -- the slave is provably alive. */
+    if (m >= 0) { RP_WaitPlanes(); rp_plane_pending = 0; }    /* joined here; bounded + fallback + purge */
     else        master_cache_purge();
 }
 
@@ -1022,7 +1082,7 @@ void RP_WaitPlanes(void)
 #if RP_PROF
     unsigned short t0 = rp_frt();             /* master idle while the slave finishes = imbalance */
 #endif
-    int ok = rp_wait(&PLANE_DONE);            /* FRT-bounded (see rp_wait) -- never a 26s wedge */
+    int ok = rp_wait(&PLANE_DONE, RP_TO_PLANE);   /* FRT-bounded (see rp_wait) -- never a 26s wedge */
 #if RP_PROF
     p3_wait_ticks = (unsigned short)(rp_frt() - t0);
 #endif
@@ -1106,7 +1166,7 @@ void RP_WaitMasked(void)
        slave may still own its SGL command slot was the mode-switch whole-screen corruption suspect
        (2026-07-19).  A missed half is ONE frame of not-drawn masked sprites (cosmetic), which the
        next frame corrects -- a far safer failure mode than risking VDP1 command-list corruption. */
-    rp_wait(&MASK_DONE);
+    rp_wait(&MASK_DONE, RP_TO_MASK);
     master_cache_purge();                     /* read the slave's drawn sprite pixels before the blit */
 }
 
@@ -1169,7 +1229,7 @@ void RP_WaitWallPrep(void)
 #if RP_PROF
     unsigned short t0 = rp_frt();          /* master idle while the slave flushes = the flush time */
 #endif
-    int ok = rp_wait(&WP_DONE);            /* FRT-bounded (see rp_wait) -- never a 26s wedge */
+    int ok = rp_wait(&WP_DONE, RP_TO_WALL);   /* FRT-bounded (see rp_wait) -- never a 26s wedge */
 #if RP_PROF
     prof_wpwait = (unsigned short)(rp_frt() - t0);
 #endif
@@ -1206,12 +1266,27 @@ int sat_dbg_overlay_mode = 0;
 int sat_prof_planepix    = 0;
 
 #if RP_PROF
-/* Read the SH-2 free-running timer (FRC @ 0xFFFFFE12/13).  Read H then L so the
-   low byte is latched coherently. */
+/* Read the SH-2 free-running timer (FRC @ 0xFFFFFE12/13).  Read H then L: the H read latches the
+   low byte into a temp register that the L read returns.
+   SATURN MEASUREMENT FIX 2026-07-31 -- INTERRUPTS MUST BE MASKED ACROSS THE PAIR.  That temp
+   register is GLOBAL to the CPU, and dg_saturn's vblank_handler calls its own frt_read 60x/s
+   (src/dg_saturn.cxx:1593).  A vblank IRQ landing between our H and L reads hands us the ISR's
+   latched low byte instead of ours -> a composed value up to 256 ticks BELOW the truth.  Inside
+   rp_wait's tight spin, during the first ~1.14ms of a wait the true elapsed is under 256 ticks, so
+   that underflows (unsigned short)(now - t0) to ~65000 >= RP_WAIT_TIMEOUT_FRT and fires an INSTANT
+   FALSE TIMEOUT (rp_timeout_count++ = the overlay `to` climbing).  It also silently perturbs every
+   master-side RP_PROF delta built on this function.  dg_saturn's frt_read has always masked for
+   exactly this reason (src/dg_saturn.cxx:1565-1576); this one never did.  Same 4-instruction guard. */
 static unsigned short rp_frt(void)
 {
-    unsigned char h = *(volatile unsigned char *)0xFFFFFE12;
-    unsigned char l = *(volatile unsigned char *)0xFFFFFE13;
+    unsigned int  sr, sr_masked;
+    unsigned char h, l;
+    __asm__ volatile ("stc sr, %0" : "=r"(sr));
+    sr_masked = sr | 0xF0;
+    __asm__ volatile ("ldc %0, sr" :: "r"(sr_masked) : "memory");
+    h = *(volatile unsigned char *)0xFFFFFE12;
+    l = *(volatile unsigned char *)0xFFFFFE13;
+    __asm__ volatile ("ldc %0, sr" :: "r"(sr) : "memory");
     return (unsigned short)((h << 8) | l);
 }
 static unsigned short prof_begin, prof_recend, prof_wait;
@@ -1531,19 +1606,19 @@ static void rp_finish(void)
     }
 #if RP_PROF
     { unsigned short w=rp_frt();
-      ok=rp_wait(&SYNC->slave_opaque_done);
+      ok=rp_wait(&SYNC->slave_opaque_done, RP_TO_WALL);
       prof_wait += (unsigned short)(rp_frt()-w); }
 #else
-    ok=rp_wait(&SYNC->slave_opaque_done);
+    ok=rp_wait(&SYNC->slave_opaque_done, RP_TO_WALL);
 #endif
     SYNC->go_masked=1;
     for (i=mat; i<tot; ++i) rp_exec(&cmds[i],0,columnofs);
 #if RP_PROF
     if (ok) { unsigned short w=rp_frt();
-              ok=rp_wait(&SYNC->slave_masked_done);
+              ok=rp_wait(&SYNC->slave_masked_done, RP_TO_WALL);
               prof_wait += (unsigned short)(rp_frt()-w); }
 #else
-    if (ok) ok=rp_wait(&SYNC->slave_masked_done);
+    if (ok) ok=rp_wait(&SYNC->slave_masked_done, RP_TO_WALL);
 #endif
 
     if (!ok)
@@ -1967,10 +2042,12 @@ void RP_EndFrame(void)
         unsigned int exe10 = exe * 10u / 224u;
         unsigned int wai10 = prof_wait * 10u / 224u;   /* slave-wait within EX */
         static char p[44];
-        snprintf(p, sizeof p, "REC%u.%u EX%u.%u W%u.%u c%-4d ",
-                 rec10/10, rec10%10, exe10/10, exe10%10,
-                 wai10/10, wai10%10, rec_count);
-        dbg_print(0, 4, p);
+        (void)wai10;
+        /* SATURN OVERLAY 2026-07-29: level-4 REC must NOT clobber dg_saturn's shared rows.
+           The record/execute split (rec10/exe10) that used to own row 4 (over PK) is folded into
+           the row-5 headline below; the old rows 11/12 (over LIM/V1) are dropped entirely.  Only
+           rows 2 + 5 differ from the levels-0-3 layout now -- every other row stays dg_saturn's
+           shared content, so s0..s4 are directly comparable line-for-line. */
         /* Row 20 (SATURN PERF 2.4 Stage 1): B (the BSP walk) split into pure BSP
            traversal (Bw) vs wall-prep (Bp = time in R_StoreWallRange), plus the
            planes (P) and masked (M) generation.  Bp is what 2.4 would offload to
@@ -1988,29 +2065,15 @@ void RP_EndFrame(void)
             snprintf(p, sizeof p, "Bw%u.%u Bp%u.%u P%u.%u M%u.%u ",
                      bw10/10, bw10%10, bp10/10, bp10%10,
                      p10/10, p10%10, m10/10, m10%10);
-            dbg_print(0, 5, p);
-            /* Phase-0a fine split (rows 11/12).  Bp -> setup (per-seg trig/scale)
-               + loop (R_RenderSegLoop per-column).  P -> alloc (flat W_Cache/
-               Release) + makespans (R_MakeSpans walk + R_MapPlane) + other. */
-            {
-                unsigned int sll  = prof_segloop;
-                unsigned int slps = (bpt > sll) ? (bpt - sll) : 0u;   /* Bp setup */
-                unsigned int bps10 = slps * 10u / 224u;
-                unsigned int bpl10 = sll  * 10u / 224u;
-                unsigned int ptot = (unsigned short)(prof_planes_end - prof_bsp_end);
-                unsigned int pa   = prof_flatalloc;
-                unsigned int pm   = prof_makespans;
-                unsigned int po   = (ptot > pa + pm) ? (ptot - pa - pm) : 0u;
-                unsigned int pa10 = pa * 10u / 224u;
-                unsigned int pm10 = pm * 10u / 224u;
-                unsigned int po10 = po * 10u / 224u;
-                snprintf(p, sizeof p, "BP s%u.%u l%u.%u   ",
-                         bps10/10, bps10%10, bpl10/10, bpl10%10);
-                dbg_print(0, 11, p);
-                snprintf(p, sizeof p, "P a%u.%u m%u.%u o%u.%u ",
-                         pa10/10, pa10%10, pm10/10, pm10%10, po10/10, po10%10);
-                dbg_print(0, 12, p);
-            }
+            /* SATURN OVERLAY 2026-07-29: REC (level-4) phase-split -> ROW 2, the SAME row the
+               parity-off path (rp_p3_prof_show, levels 0-3) uses.  Was row 5, which left row 2
+               showing a FROZEN level-0-3 phase-split (nobody rewrote it in level 4) = the
+               "parasité" the tester saw.  Row 5 is now the slave-occupancy line in BOTH regimes. */
+            dbg_print(0, 2, p);
+            /* (2026-07-29) The BP s/l (row 11) + P a/m/o (row 12) fine-split writes were removed
+               here: they overwrote dg_saturn's LIM (zone/frag) and V1 (VDP1 budget) rows -- both
+               more valuable during an s0..s4 A/B than the record-phase micro-breakdown, which row 2
+               (Bw/Bp/P/M) already summarises. */
         }
         /* Row 13 (SATURN PERF, RBG0 candidate sizing): floor/ceiling FILL and the
            share owned by the single largest flat -- the VDP2 RBG0 offload candidate.
@@ -2054,10 +2117,17 @@ void RP_EndFrame(void)
             unsigned int st = (unsigned int)SYNC->slave_opq_total;
             unsigned int sd = (unsigned int)SYNC->slave_opq_draw;
             unsigned int busy = (st > 0u) ? (sd * 100u / st) : 0u;
-            unsigned int idle = (st > sd) ? ((st - sd) * 100u / st) : 0u;
-            snprintf(p, sizeof p, "MST%ums SLV i%u%% b%u%% t%u d%u  ",
-                     rp_master_ms, idle, busy, st, sd);
-            dbg_print(0, 3, p);   /* OVERLAY 2026-06-24: critical-path packed to rows 3-5 */
+            /* SATURN OVERLAY 2026-07-29: single level-4 headline on ROW 5 (same row as the levels-
+               0-3 `SLV` line, for a direct A/B; leading token `L4` disambiguates the regime).
+               R = record ms (master-serial command GENERATION -- the real M7 bottleneck), X =
+               execute ms (the ONLY phase the REC slave can share; near-zero in M7 because walls/
+               things live on VDP1 and the dominant floor on RBG0), SLVb = slave draw share of the
+               opaque phase, d = raw slave draw ticks, c = commands recorded.  R>>X ⇒ record-bound
+               ⇒ the REC slave has almost nothing to steal -- which is why s4 shows the slave LESS
+               active than plane-split s2/s3 (those parallelise the plane phase P itself). */
+            snprintf(p, sizeof p, "L4 R%u.%u X%u.%u SLVb%u%% d%u c%u ",
+                     rec10/10, rec10%10, exe10/10, exe10%10, busy, sd, (unsigned)rec_count);
+            dbg_print(0, 5, p);
         }
     }
 #endif

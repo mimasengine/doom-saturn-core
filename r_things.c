@@ -1288,6 +1288,14 @@ void R_DrawSprite (vissprite_t* spr)
  * players' colours in local MP) are handled too (R_SlaveDrawTransColumn), so the
  * slave (right) half shows the correct per-player colour, not the base green. */
 int sat_masked_parallel = 0;          /* gate, set by the platform (src/main.cxx) */
+/* SATURN M7 slave: the `!sat_lowres` hard-offs that kept the SGL slave 100% idle in M7 are GONE
+   (2026-07-30).  The `sat_m7_slave` 0-3 A/B level and its pad chord were REMOVED once level 3 --
+   masked-split + plane-split + clear-on-slave, i.e. the whole plane-split model -- was validated on
+   REAL HARDWARE as the shipped default: the slave takes its half of the software things/floors/
+   ceilings fill (HW: SLV b23% Pb59%, to=0, 27 fps vs 24 master-only).  Level 4 (unified
+   parallel-REC) had already been removed 2026-07-29 as generation-bound.  The three gates
+   (here, r_plane.c plane-split, dg_saturn.cxx clear-on-slave) now test only sat_local_players --
+   still never slave-split in MP.  [[m7-slave-share-per-category]] */
 int g_mask_x1 = 32767;                 /* master vissprite right clip [0,x1); reset to viewwidth each use */
 extern int sat_local_players;          /* core g_game.c: LIVE local-coop count (1 = single player) */
 
@@ -1313,7 +1321,11 @@ static void R_SlaveDrawColumn (void)
     byte *source = s_dc_source, *colormap = (byte *)s_dc_colormap;
     unsigned fracstep = s_dc_iscale<<9;
     unsigned frac = (s_dc_texturemid + (s_dc_yl-centery)*s_dc_iscale)<<9;
-    if (detailshift)   /* low-detail: s_dc_x is the HALVED column -> pixel-double into 2 screen px */
+    if (detailshift && !sat_lowres)   /* low-detail (NON-lowres): s_dc_x HALVED -> pixel-double into 2 screen px.
+       SATURN M7 FIX 2026-07-29: in lowres the fb is PACKED 160-wide (master colfunc = packed R_DrawColumn,
+       r_main.c:721), so the slave must PACK too (else-branch, columnofs[s_dc_x]).  Doubling to s_dc_x<<1 wrote
+       fb cols [160,320) which the M7 blit never copies -> the slave's half was invisible = the "software things
+       marche sur msh2 pas ssh2" bug.  The R_SlaveDrawVisSprite :1494 guard alone was insufficient. */
     {
 	int sx = s_dc_x << 1;
 	byte *d0 = ylookup[s_dc_yl] + columnofs[sx];
@@ -1338,7 +1350,11 @@ static void R_SlaveDrawTransColumn (void)
     byte *source = s_dc_source, *colormap = (byte *)s_dc_colormap, *xlat = s_dc_translation;
     unsigned fracstep = s_dc_iscale<<9;
     unsigned frac = (s_dc_texturemid + (s_dc_yl-centery)*s_dc_iscale)<<9;
-    if (detailshift)   /* low-detail: s_dc_x is the HALVED column -> pixel-double into 2 screen px */
+    if (detailshift && !sat_lowres)   /* low-detail (NON-lowres): s_dc_x HALVED -> pixel-double into 2 screen px.
+       SATURN M7 FIX 2026-07-29: in lowres the fb is PACKED 160-wide (master colfunc = packed R_DrawColumn,
+       r_main.c:721), so the slave must PACK too (else-branch, columnofs[s_dc_x]).  Doubling to s_dc_x<<1 wrote
+       fb cols [160,320) which the M7 blit never copies -> the slave's half was invisible = the "software things
+       marche sur msh2 pas ssh2" bug.  The R_SlaveDrawVisSprite :1494 guard alone was insufficient. */
     {
 	int sx = s_dc_x << 1;
 	byte *d0 = ylookup[s_dc_yl] + columnofs[sx];
@@ -1360,7 +1376,9 @@ static void R_SlaveFuzzColumn (void)
     if (s_dc_yh == viewheight-1) s_dc_yh = viewheight - 2;
     count = s_dc_yh - s_dc_yl;
     if (count < 0) return;
-    if (detailshift)   /* low-detail: pixel-double the fuzz into the 2 screen columns */
+    if (detailshift && !sat_lowres)   /* low-detail (NON-lowres): pixel-double the fuzz into 2 screen cols.
+       SATURN M7 FIX 2026-07-29: pack in lowres (else-branch, columnofs[s_dc_x]) -- doubling to s_dc_x<<1
+       writes off the blitted fb[0,160) so the slave's fuzz half was invisible.  See R_SlaveDrawColumn. */
     {
 	int sx = s_dc_x << 1;
 	byte *d0 = ylookup[s_dc_yl] + columnofs[sx];
@@ -1481,8 +1499,14 @@ static void R_SlaveDrawVisSprite (vissprite_t* vis)
             R_SlaveDrawSpriteCol (column, s_dc_x, s_dc_x, wide);
         }
     }
-    else if (normal && detailshift && !sat_sprite_ld)
-    {   /* walls LD, sprite FULL: upsample -- 2 distinct texels per half-column */
+    else if (normal && detailshift && !sat_sprite_ld && !sat_lowres)
+    {   /* walls LD, sprite FULL: upsample -- 2 distinct texels per half-column.
+           SATURN M7 FIX (2026-07-29): the `&& !sat_lowres` guard was on the MASTER twin
+           R_DrawVisSprite (~641) but MISSING here -- so in M7 the master fell to the packed
+           else-branch while the slave upsampled to s_dc_x<<1=320, writing past the packed
+           160-wide fb + cutting the sprite at g_mask_x1.  THAT mismatch is the whole reason
+           the masked-split was hard-gated off in lowres.  With the guard, M7 falls to the
+           packed R_SlaveDrawMaskedColumn else-branch below = byte-consistent with the master. */
         for (s_dc_x=vis->x1 ; s_dc_x<=vis->x2 ; s_dc_x++, frac += vis->xiscale)
         {
             int sx, tcL, tcR;
@@ -1850,10 +1874,10 @@ void R_DrawMasked (void)
 	   master when the AIMD cap declines, e.g. ec0 -> th0 -> every sprite software).  Was gated off
 	   (!sat_things_emitted) as a shipping shortcut when world-things landed; measured slave busy%
 	   showed the slave sitting ~90% idle while M ran master-only -> re-enabled 2026-07-09. */
-	if (sat_masked_parallel && !sat_lowres && sat_local_players <= 1)   /* SATURN 2026-07-20: never slave-split in MP -- a New-Game-into-coop from a 1p pause renders one split frame with sat_lowres still 0, which used to dispatch the slave into a split it was never set up for -> wedge/freeze (see r_plane.c) */
-	{   /* SATURN lowres: the slave's R_SlaveDrawMasked upsamples its half to 320 (a separate impl),
-	       which would cut the sprite at g_mask_x1 ("entre les deux SH2").  Draw all software sprites
-	       on the master (packed 160) in lowres -- already ~half the fill, so the slave loss is small. */
+	if (sat_masked_parallel && sat_local_players <= 1)   /* SATURN 2026-07-20: never slave-split in MP -- a New-Game-into-coop from a 1p pause renders one split frame with sat_lowres still 0, which used to dispatch the slave into a split it was never set up for -> wedge/freeze (see r_plane.c).  SATURN M7 2026-07-30: the `!sat_lowres` hard-off is GONE (shipped default) now that R_SlaveDrawVisSprite writes packed-160 (the !sat_lowres drawer guard above). */
+	{   /* SATURN: the two CPUs draw DISJOINT packed columns -- master [0,g_mask_x1=half), slave
+	       [half,viewwidth) -- and columnofs[x]=x is packed in lowres, so their fb writes never overlap.
+	       (Pre-2026-07-29 the slave upsampled its half to 320 = the mismatch that gated lowres off.) */
 	    int half = viewwidth >> 1;
 	    /* pre-cache every sprite patch on the master so the slave's W_CacheLumpNum only ever
 	       finds them already cached -> no concurrent zone alloc (which would race the heap

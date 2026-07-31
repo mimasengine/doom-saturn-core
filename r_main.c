@@ -1316,7 +1316,14 @@ void R_RenderPlayerView (player_t* player)
            untouched), sprites/masked draw direct (master) -- cheap in the 1p ship config; the
            win is the master-only P phase split across both CPUs.  One full-width pass. */
         extern int sat_plane_parallel;
-        if (sat_plane_parallel) rp_disabled = 1;
+        /* Force the command-renderer parity OFF (rp_disabled=1) so the slave SH-2 is free for the
+           plane/masked-split dispatch -- the productive M7 slave path, hard-wired ON since
+           2026-07-30 (the sat_m7_slave 0-3 A/B level was removed once level 3 shipped).
+           (The level-4 unified-REC path was REMOVED 2026-07-29: HW proved M7 is command-GENERATION-
+           bound -- record ~26ms vs execute ~0.4ms -- so REC, which only parallelises the draw/execute
+           phase, left the slave near-idle and was SLOWER than plane-split.  See m7-slave-share notes.) */
+        if (sat_plane_parallel)
+            rp_disabled = 1;
         R_RenderViewPass (1);            /* single full-width pass (sat_view_* default to full) */
     }
 }

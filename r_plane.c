@@ -810,6 +810,21 @@ static void R_DrawVisplanePotato (visplane_t *pl, int color,
    ds_* globals (so two CPU can work-steal it, P3).  High-detail only (detailshift==0, the
    native 320 render); low-detail keeps the global path.  Render-identical to R_MapPlane +
    R_DrawSpan (basexscale/baseyscale/distscale/viewangle are shared read-only). */
+/* SATURN L1 (sat_opt >= 1, see core/r_segs.c for the lever registry).  This span fill is the #1
+   inner loop of the whole M7 frame: the shipped SQ is ld for BOTH floor and ceiling, so every
+   software plane pixel goes through the `ld` branch below.  At level 0 it costs two separate BYTE
+   stores plus an `if (count)` branch per pixel PAIR -- yet the pair is two IDENTICAL bytes.  So
+   emit the pair as ONE 16-bit store and hoist the tail out of the loop.
+   The framebuffer is 8bpp with a constant 320-byte stride and columnofs[x] == x in M7, so a span
+   is a contiguous byte run and `dest` parity alone selects which of the two shapes applies.
+   Output is BYTE-IDENTICAL to level 0 (checked for spans of 1..4 px, both parities); big-endian
+   SH-2 puts the high byte at the lower address, which is what the odd-start carry relies on.
+   may_alias is required: the build passes -Wno-strict-aliasing (the WARNING only, NOT
+   -fno-strict-aliasing), so the wide store must be declared to alias the byte buffer.  Supported
+   by GCC 9.3 (DoomJo) and 14.2 alike. */
+typedef unsigned short __attribute__((__may_alias__)) sat_u16a_t;
+extern int sat_opt;
+
 static inline void R_TexturedSpan (int y, int x1, int x2, fixed_t plheight,
                                    lighttable_t **plzlight, byte *src, int ld)
 {
@@ -849,6 +864,38 @@ static inline void R_TexturedSpan (int y, int x1, int x2, fixed_t plheight,
     if (ld)   /* SQ low-detail (per-plane): 1 texel fetch per 2 screen px */
     {
         step <<= 1;     /* advance two source steps between fetches */
+        if (sat_opt >= 1)   /* SATURN L1: same bytes, half the stores, no in-loop tail branch */
+        {
+            int   npx = count + 1;                  /* pixels this span writes */
+            byte *d   = dest;
+            byte  t;
+#define SAT_LD_TEXEL()  cmap[src[(int)(position >> 26) | (int)((position >> 4) & 0x0fc0)]]
+            if ((unsigned int)(unsigned long)d & 1u)
+            {   /* odd start: px0 goes out alone, then every aligned 16-bit unit carries
+                   (second half of pair k, first half of pair k+1) -- identical byte sequence. */
+                t = SAT_LD_TEXEL(); position += step;
+                *d++ = t; npx--;
+                while (npx >= 2)
+                {
+                    byte t2 = SAT_LD_TEXEL(); position += step;
+                    *(sat_u16a_t *)d = (unsigned short)(((unsigned int)t << 8) | t2);
+                    d += 2; npx -= 2; t = t2;
+                }
+                if (npx) *d = t;                    /* trailing half of the carried pair */
+            }
+            else
+            {   /* even start: one aligned 16-bit store per pair, both bytes equal */
+                while (npx >= 2)
+                {
+                    t = SAT_LD_TEXEL(); position += step;
+                    *(sat_u16a_t *)d = (unsigned short)(((unsigned int)t << 8) | t);
+                    d += 2; npx -= 2;
+                }
+                if (npx) { t = SAT_LD_TEXEL(); *d = t; }
+            }
+#undef SAT_LD_TEXEL
+            return;
+        }
         do {
             byte t;
             ytemp = (position >> 4) & 0x0fc0;
@@ -1807,11 +1854,17 @@ void R_DrawPlanes (void)
            the reported freeze.  In the parked-M7 world split is always master-only anyway, so this
            only makes it explicit + race-proof.  (Un-parked M4 co-op would lose dual-CPU planes here --
            acceptable, flagged: M7 split is already >= M4 split on HW.) */
-        if (sat_plane_parallel && n > 1 && !sat_lowres && sat_local_players <= 1)
-            RP_DrawPlanesSplit(n);           /* master+slave: static half-split or work-steal (pad Y) */
+        if (sat_plane_parallel && n > 1 && sat_local_players <= 1)
+            RP_DrawPlanesSplit(n);           /* master+slave: static half-split or work-steal (pad Y).
+                                                SATURN M7 2026-07-30: the `!sat_lowres` hard-off is GONE --
+                                                HW-validated as the shipped default (SLV b23% Pb59%, to=0,
+                                                27fps vs 24).  The 2026-07-18 freeze it guarded against is
+                                                gone (RP_WaitPlanes is FRT-bounded + m<0-skips + idempotent
+                                                fallback, r_parallel.c); the packed spanfunc is identical
+                                                on both CPUs so the disjoint visplanes write byte-correct.
+                                                The masked-split (r_things.c) primes SGL slave scheduling. */
         else
-            R_DrawPlaneWorklist(0, n);       /* M7 lowres: MASTER-ONLY -- the slave plane-split fights SGL
-                                                slave scheduling (s0/Pb0 on HW), see r_parallel.c */
+            R_DrawPlaneWorklist(0, n);       /* MP / single plane / DoomJo: MASTER-ONLY */
         for (i = 0; i < n; i++)
             W_ReleaseLumpNum(plane_worklist[i].lumpnum);
     }
