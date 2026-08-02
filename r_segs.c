@@ -418,6 +418,53 @@ static void sat_wall_clip_need (void)
 #define SAT_SEG_MAX 4096
 static unsigned char sat_seg_cpu[SAT_SEG_MAX];
 
+/* EXTRA CPU FRAMES on ENTRY (SATURN 2026-08-02) -- the missing symmetry of the exit overlap above.
+   A wall that was NOT visible last frame and goes straight to VDP1 is drawn by NOBODY on its first
+   frame: VDP1 owns it so the software column loop skips it, but the VDP1 list only reaches the
+   screen a field later, so those pixels stay index 0 (sky) for one frame.  Nil at rest, and it
+   scales with movement speed because that is what governs how many walls come into view per frame.
+   No shift of the VDP1 layer can fix it -- the quad is not misplaced, it is not there yet.  So the
+   CPU also draws a NEW VDP1 wall for its first sat_wall_entry frames.  Only walls that actually
+   appear pay, and only those frames.
+
+   Packed into the EXISTING per-seg byte, no new RAM (the TLSF pool has ~4.4KB of headroom and a
+   second [4096] array would black-screen the boot -- [[boot-loop-can-be-tlsf-pool-starvation]]):
+       [7:4] frame tag     [3:2] entry countdown     [1:0] exit countdown
+   The tag is the low nibble of sat_seg_frame, so "was visible last frame" is a gap of exactly 1.
+   A seg absent for exactly 16 (or 32, ...) frames aliases back onto the current tag and silently
+   misses its coverage -- ~1.2s at M7 rates, and that failure mode is just today's behaviour. */
+#define SAT_SEG_ENTRY_MAX 3
+int sat_wall_entry = 1;   /* CPU frames covering a newly-visible VDP1 wall, 0..3; 0 = off.
+                             Live on pad L+Left / L+Right (1p), read back as row-13 `En<n>`. */
+int sat_seg_frame  = 0;   /* advanced ONCE PER RENDERED FRAME by the platform, after the BSP walk.
+                             A port that never advances it (DoomJo) sees gap 0 -> coverage inert. */
+
+#define SAT_SEG_EXIT(st)      ((*(st)) & 3)
+#define SAT_SEG_EXIT_ARM(st)  (*(st) = (unsigned char)(((*(st)) & 0xfc) | 2))
+#define SAT_SEG_EXIT_DEC(st)  (*(st) = (unsigned char)((*(st)) - 1))   /* guarded by EXIT() != 0 */
+
+/* Fold this frame's visit into the seg byte; returns 1 while the CPU must cover a wall that just
+   came into view.  A seg clipped into several fragments calls R_StoreWallRange more than once per
+   frame, so only the FIRST visit advances the tag and the countdown -- the others just read it. */
+static int sat_seg_entry_cover (unsigned char *st)
+{
+    unsigned char b, tag;
+    if (!st || !sat_wall_entry) return 0;
+    b   = *st;
+    tag = (unsigned char)(sat_seg_frame & 15);
+    if ((unsigned char)(b >> 4) != tag)                       /* first visit this frame */
+    {
+	int e = (b >> 2) & 3;
+	int n = sat_wall_entry;
+	if (n > SAT_SEG_ENTRY_MAX) n = SAT_SEG_ENTRY_MAX;
+	if (((unsigned int)(tag - (b >> 4)) & 15u) != 1u) e = n;  /* gap != 1 -> not visible last frame */
+	else if (e) e--;
+	b = (unsigned char)((tag << 4) | (e << 2) | (b & 3));
+	*st = b;
+    }
+    return ((b >> 2) & 3) != 0;
+}
+
 /* SATURN Phase-1 wall clamp ([[wall-clamp-world-anchored]]), below-floor side.  The failed 1b
    (owner's red/purple 2026-07-02) attached the quad bottom to floorclip = a SCREEN-anchored
    sloped edge -> squish + holes.  This is the WORLD-anchored version: cut the tier at a WHOLE
@@ -756,17 +803,19 @@ void R_RenderSegLoop (void)
 	    int cpu_now = span_close || magnified;
 	    int idx = (int)(curline - segs);
 	    unsigned char *st = (idx >= 0 && idx < SAT_SEG_MAX) ? &sat_seg_cpu[idx] : 0;
+	    int entry;
 	    sat_v1_mid = (s < sat_wall_cpu_v1) && !magnified;  /* magnified -> NO VDP1 quad (it squishes) */
 #if SAT_WALL_SUBDIV
 	    if (magnified && !span_close) { sat_v1_mid_sub = 1; cpu_now = 0; }  /* keep on VDP1 via perspective subdivision (emit site), not CPU */
 #endif
+	    entry = sat_seg_entry_cover(st);   /* just came into view -> the CPU covers VDP1's first frame */
 	    if (cpu_now)
 	    {
 		if (!sat_v1_mid) {   /* Phase-0: count only the FULLY-CPU tiers (not the [SPAN,V1] VDP1-also pre-warm) */
 		    if (magnified)                  sat_fb_mag_t++;                             /* squish -> clamp can't fix   */
 		    else if (span_close)            { sat_fb_clamp_t++; sat_fb_px += s * sx; }  /* pure span  -> clampable     */
 		}
-		sat_sw_mid = 1;  if (st) *st = 2;   /* CPU draws (close/magnified); arm 2 CPU exit-frames */
+		sat_sw_mid = 1;  if (st) SAT_SEG_EXIT_ARM(st);   /* CPU draws (close/magnified); arm 2 CPU exit-frames */
 		    /* SATURN L5: this tier is about to cost a FULL-SCREEN software wall (the ~22ms
 		       nose-to-wall Bp).  Let the emit site below try the CPU-borders/VDP1-core split
 		       first; it silently leaves everything as-is when the interior is too thin. */
@@ -774,8 +823,8 @@ void R_RenderSegLoop (void)
 	    }
 	    else
 	    {
-		sat_sw_mid = (st && *st) ? 1 : 0;   /* CPU also draws for 2 frames after exit */
-		if (st && *st) (*st)--;
+		sat_sw_mid = ((st && SAT_SEG_EXIT(st)) || entry) ? 1 : 0;   /* CPU also draws 2 frames after exit, and the first frames after entry */
+		if (st && SAT_SEG_EXIT(st)) SAT_SEG_EXIT_DEC(st);
 	    }
 	}
 	else if (curline->backsector)
@@ -807,9 +856,9 @@ void R_RenderSegLoop (void)
 #endif
 		int idx = (int)(curline - segs);
 		unsigned char *st = (idx >= 0 && idx < SAT_SEG_MAX) ? &sat_seg_cpu[idx] : 0;
-		int overlap = 0;
-		if (cpu_now) { if (st) *st = 2; }       /* arm 2 CPU exit-frames */
-		else if (st && *st) { overlap = 1; (*st)--; }  /* CPU also draws 2 frames after exit */
+		int overlap = sat_seg_entry_cover(st);  /* just came into view -> CPU covers VDP1's first frame */
+		if (cpu_now) { if (st) SAT_SEG_EXIT_ARM(st); }       /* arm 2 CPU exit-frames */
+		else if (st && SAT_SEG_EXIT(st)) { overlap = 1; SAT_SEG_EXIT_DEC(st); }  /* CPU also draws 2 frames after exit */
 		/* VDP1 owns a tier only when it is neither magnified nor span-close (so it never draws the
 		   squishing quad); the CPU draws it when close/magnified OR during the exit overlap. */
 		sat_v1_up = (toptexture    && !magnified && !cpu_up) ? 1 : 0;

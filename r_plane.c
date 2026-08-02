@@ -1050,6 +1050,20 @@ int sat_vdp1_floor = 0;
    VDP1 content cannot cover (a diagonal band along a moving wall junction).  Platform-armed
    via sat_plane_fill_mode=1; default 0 = the uniform-B legacy path (DoomJo untouched). */
 int sat_plane_fill_mode = 0;
+/* (Two SOFTWARE-side attempts at the VDP1 wall-lag gap were tried and REMOVED on 2026-08-02 -- the
+   fix that shipped grows the VDP1 WALL instead, which is the layer that is actually late:
+   dg_saturn.cxx sat_wall_grow + the matelas.
+     - sat_plane_wallband: extend each plane to its own junction row of the previous frame.  Dead by
+       construction -- ONE history slot per column (sat_ceil_bot_cur) against a doorway/window column
+       holding SEVERAL ceilings, so the high ceiling reads the low one's edge as its own and bleeds
+       over the wall between them, at rest as much as in motion.  Per-plane history is the only
+       correct form and this build has no RAM for it.
+     - sat_plane_grow: let the plane simply overflow its junction by 1-2 px, all four sides.  Owner
+       tested: it does not close what he sees, and growing the ON-TIME layer to chase the LATE one is
+       the wrong end of the problem anyway.
+   The `fclaim == 3` machinery they drove is untouched and still reachable through ftex mode 5; its
+   two real bugs found on the way ARE fixed (the lowres double-write, and the reject/hole-only band
+   guards).  Do not re-derive either attempt from that code without reading this note.) */
 /* SATURN partial claim (hook returns 2): per-column VDP1/CPU split edge for the plane being
    claimed, filled by the platform hook BEFORE returning.  For a FLOOR, rows [edge..bottom]
    are punched (VDP1 tiles own them) and rows [top..edge-1] fall through to the normal
@@ -1073,8 +1087,12 @@ extern int sat_split_active;                     /* split shares one fb: per-vie
                                                     border, forced 0 in split by r_main.c) */
 static short sat_ceil_bot_cur[SCREENWIDTH];      /* this frame: lowest claimed-CEILING row per column */
 static short sat_floor_top_cur[SCREENWIDTH];     /* this frame: highest claimed-FLOOR row per column  */
-static short sat_ceil_bot_hist[2][SCREENWIDTH];  /* [0] = 1 frame ago, [1] = 2 frames ago             */
-static short sat_floor_top_hist[2][SCREENWIDTH];
+/* ONE level of history (1 frame ago).  The 2-frame slot was dropped 2026-08-02: it cost 1280 bytes
+   of .bss against a TLSF pool sitting AT its 4 KB floor ([[boot-loop-can-be-tlsf-pool-starvation]]),
+   and its only user was the wall-lag band's Wb2 depth -- speculative, same day.  If the VDP1 lag
+   turns out to be 2 frames rather than 1, this comes back WITH a real diet, not instead of one. */
+static short sat_ceil_bot_hist[SCREENWIDTH];
+static short sat_floor_top_hist[SCREENWIDTH];
 
 int (*sat_floor_vdp1_hook)(int picnum, int height, int minx, int maxx,
                            const unsigned char *top, const unsigned char *bottom,
@@ -1084,6 +1102,7 @@ int (*sat_floor_vdp1_hook)(int picnum, int height, int minx, int maxx,
    _border_v = vertical (forward-motion + viewz) on the top/bottom edge.  Both 0 = pure punch (rest / DoomJo). */
 extern int sat_plane_border;
 extern int sat_plane_border_v;
+extern int sat_plane_border_max;   /* px cap on both borders -- also the wall-lag band's reject limit */
 
 /* SATURN: the player's CURRENT floor (height + flat) -- the single floor RBG0 renders.
    Set each frame in R_DrawPlanes from the view sector.  The floor-skip leaves ONLY the
@@ -1198,7 +1217,7 @@ static void sat_plane_texcol(int x, int y0, int y1)
 	{
 	    byte v = (fixedcolormap ? fixedcolormap : planezlight[zi])
 		     [ds_source[((yf >> 10) & 0x0FC0) | ((xf >> 16) & 63)]];
-	    if (detailshift)
+	    if (detailshift && !sat_lowres)
 	    {
 		int sx = x << 1;
 		ylookup[y][columnofs[sx]]     = v;
@@ -1227,10 +1246,8 @@ void R_DrawPlanes (void)
 	int c;
 	for (c = 0; c < SCREENWIDTH; c++)
 	{
-	    sat_ceil_bot_hist[1][c]  = sat_ceil_bot_hist[0][c];
-	    sat_floor_top_hist[1][c] = sat_floor_top_hist[0][c];
-	    sat_ceil_bot_hist[0][c]  = sat_ceil_bot_cur[c];
-	    sat_floor_top_hist[0][c] = sat_floor_top_cur[c];
+	    sat_ceil_bot_hist[c]  = sat_ceil_bot_cur[c];
+	    sat_floor_top_hist[c] = sat_floor_top_cur[c];
 	    sat_ceil_bot_cur[c]  = -1;
 	    sat_floor_top_cur[c] = (short)viewheight;
 	}
@@ -1532,9 +1549,16 @@ void R_DrawPlanes (void)
 	       CRAM-lit VDP1 flat instead of glowing full-bright in dark rooms. */
 	    int swept = sat_plane_fill_mode && !sat_split_active;
 	    int is_ceil = (pl->height > viewz);
-	    int hist_i = (sat_plane_lag >= 2) ? 1 : 0;
+	    int swband  = (fclaim == 3);   /* SOFTWARE plane + textured wall-lag catch-up band */
+	    /* How far back to extend the plane.  The hook-driven mode 5 uses the owner-tuned
+	       sat_plane_lag; the forced M7 band carries its own depth so the toggle IS the tuning
+	       (1 = last frame = the VDP1 plot lag; 2 = two frames = wider band, more master fill). */
+	    /* Largest junction move the band will believe.  Doubles as the contamination reject
+	       below: further than this and the history slot is holding ANOTHER plane's edge. */
+	    int band_cap = sat_plane_border_max; if (band_cap < 1) band_cap = 1; else if (band_cap > 40) band_cap = 40;
 	    byte bc = 0;
-	    if (swept)
+	    if (swband) { }              /* the band computes its own texels -- no border colour needed */
+	    else if (swept)
 	    {
 		int li = (pl->lightlevel >> LIGHTSEGSHIFT) + extralight;
 		if (li < 0) li = 0; else if (li >= LIGHTLEVELS) li = LIGHTLEVELS - 1;
@@ -1548,7 +1572,6 @@ void R_DrawPlanes (void)
 	       are trimmed to the SOFTWARE leftover (far field + chunk-clip wedges) which then
 	       falls through to the normal span draw below -- real texels, aligned latency. */
 	    int partial = (fclaim == 2 && sat_floor_punch_edge != NULL);
-	    int swband  = (fclaim == 3);   /* SOFTWARE plane + textured wall-lag catch-up band */
 	    for (x = pl->minx ; x <= pl->maxx ; x++)
 	    {
 		int yl = pl->top[x];
@@ -1567,18 +1590,30 @@ void R_DrawPlanes (void)
 		    int e0, e1;
 		    if (is_ceil)
 		    {
-			int j_old = sat_ceil_bot_hist[hist_i][x];
+			int j_old = sat_ceil_bot_hist[x];
 			if (yh > sat_ceil_bot_cur[x]) sat_ceil_bot_cur[x] = (short)yh;
 			e0 = yh + 1;
-			e1 = j_old; if (e1 > yh + 40) e1 = yh + 40;
+			/* SATURN 2026-08-02 -- REJECT, do not CLAMP (owner: "certains petits murs sont
+			   integralement ecrases par de la texture du plafond").  There is ONE history slot
+			   per column, but a column can hold SEVERAL ceilings: the front ceiling, the upper
+			   texture, then the BACK sector's ceiling seen through the opening.  `cur` keeps the
+			   MAX, so next frame the HIGH ceiling reads the LOW ceiling's bottom as its own
+			   previous edge and paints its texels straight down over the wall between them -- at
+			   rest as much as in motion, since that mismatch never goes away.  Clamping to 40
+			   rows only shortened the bleed.  A genuine one-frame junction move is a few rows;
+			   beyond that it is another plane's edge, so DROP the band.  Cost: doorway/window
+			   columns get no band at all -- which is what Wb0 gives, so never worse. */
+			e1 = j_old;
+			if (e1 > yh + band_cap) continue;   /* another plane's edge, not our junction */
 			if (e1 > viewheight - 1) e1 = viewheight - 1;
 		    }
 		    else
 		    {
-			int k_old = sat_floor_top_hist[hist_i][x];
+			int k_old = sat_floor_top_hist[x];
 			if (yl < sat_floor_top_cur[x]) sat_floor_top_cur[x] = (short)yl;
 			e1 = yl - 1;
-			e0 = k_old; if (e0 < yl - 40) e0 = yl - 40;
+			e0 = k_old;
+			if (e0 < yl - band_cap) continue;   /* idem, floor side */
 			if (e0 < 0) e0 = 0;
 		    }
 		    if (e0 <= e1)
@@ -1587,8 +1622,26 @@ void R_DrawPlanes (void)
 			fixed_t tcos = finecosine[tang], tsin = finesine[tang];
 			fixed_t tdsc = distscale[x];
 			int y2;
+			/* HOLE-ONLY: never repaint a pixel the software renderer already owns.  The
+			   band runs inside R_DrawPlanes, i.e. AFTER the seg loop, so a software wall
+			   (close/magnified fallback, or one held by sat_wall_entry) and the software
+			   sky are already in the framebuffer AT THE CORRECT POSITION -- painting plane
+			   texels over those is always wrong.  Index 0 means nobody drew: a real hole,
+			   or a surface VDP1 owns.  One byte read per band pixel, and a hit skips the
+			   whole perspective texel fetch. */
+			/* `detailshift && !sat_lowres` -- NOT bare detailshift.  M7 runs at
+			   detailshift=1 with the PACKED drawers (r_main.c ~721/855 select them on
+			   the same predicate): one byte per logical column into a 160-wide
+			   framebuffer, x2-zoomed by NBG1 afterwards.  Doubling to x<<1 there writes
+			   at twice the column, into the neighbour's pixels -- the owner's "positions
+			   calculees en high res alors qu'on est en low res".  Only split low-detail
+			   (detailshift=1, sat_lowres=0) uses the duplicating layout. */
+			int dup = (detailshift && !sat_lowres);
+			int co  = columnofs[dup ? (x << 1) : x];
 			for (y2 = e0; y2 <= e1; y2++)
 			{
+			    byte *p = ylookup[y2] + co;
+			    if (p[0] && (!dup || p[1])) continue;
 			    fixed_t dist = FixedMul(planeheight, yslope[y2]);
 			    fixed_t len  = FixedMul(dist, tdsc);
 			    fixed_t xf   = viewx + FixedMul(tcos, len);
@@ -1596,14 +1649,8 @@ void R_DrawPlanes (void)
 			    int zi = dist >> LIGHTZSHIFT; if (zi >= MAXLIGHTZ) zi = MAXLIGHTZ - 1;
 			    byte v = (fixedcolormap ? fixedcolormap : planezlight[zi])
 				     [ds_source[((yf >> 10) & 0x0FC0) | ((xf >> 16) & 63)]];
-			    if (detailshift)
-			    {
-				int sx2 = x << 1;
-				ylookup[y2][columnofs[sx2]]     = v;
-				ylookup[y2][columnofs[sx2 + 1]] = v;
-			    }
-			    else
-				ylookup[y2][columnofs[x]] = v;
+			    if (!p[0])         p[0] = v;
+			    if (dup && !p[1])  p[1] = v;
 			}
 		    }
 		    continue;      /* bounds untouched -> the plane renders fully in software */
@@ -1649,14 +1696,14 @@ void R_DrawPlanes (void)
 		    int fb2, fe;                    /* paint bc on [fb2..fe], punch 0 elsewhere */
 		    if (is_ceil)
 		    {
-			int j_old = sat_ceil_bot_hist[hist_i][x];
+			int j_old = sat_ceil_bot_hist[x];
 			if (pb1 > sat_ceil_bot_cur[x]) sat_ceil_bot_cur[x] = (short)pb1;
 			fb2 = j_old + 1; if (fb2 < pb0) fb2 = pb0;  /* newly-ceiling rows only */
 			fe  = pb1;
 		    }
 		    else
 		    {
-			int k_old = sat_floor_top_hist[hist_i][x];
+			int k_old = sat_floor_top_hist[x];
 			if (pb0 < sat_floor_top_cur[x]) sat_floor_top_cur[x] = (short)pb0;
 			fb2 = pb0;                                  /* newly-floor rows only */
 			fe  = k_old - 1; if (fe > pb1) fe = pb1;
@@ -1682,7 +1729,7 @@ void R_DrawPlanes (void)
 			    tcos = finecosine[tang]; tsin = finesine[tang];
 			    tdsc = distscale[x];
 			}
-			if (detailshift)
+			if (detailshift && !sat_lowres)
 			{
 			    int sx = x << 1;
 			    byte *d0 = ylookup[fb2] + columnofs[sx];
@@ -1746,7 +1793,7 @@ void R_DrawPlanes (void)
 		    int b0 = pb1 - B + 1;                 /* first row of the bottom border band */
 		    int m;
 		    if (col_edge || t1 >= b0 - 1) { t1 = pb1; b0 = pb1 + 1; }   /* whole column */
-		    if (detailshift)
+		    if (detailshift && !sat_lowres)
 		    {
 			int sx = x << 1;
 			byte *d0 = ylookup[pb0] + columnofs[sx];
@@ -1785,6 +1832,7 @@ void R_DrawPlanes (void)
 	       loop end). */
 	}
 	}
+
 
 #if SAT_PLANE_LOCAL
 	/* P3: QUEUE this regular flat (potato or textured high-detail) for the master+slave
