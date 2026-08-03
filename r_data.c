@@ -591,6 +591,17 @@ int R_FlatPotatoColor (int lumpnum)
    colormap).  Subsampled (step 2) for cheapness; computed lazily on first use and cached.
    sat_wall_color is the global the wall recorder reads (set per wall section in r_segs.c). */
 int sat_wall_color = 0;
+/* SATURN DEBUG PAINT (owner 2026-08-03: *"est-ce que j'ai un moyen de changer les murs vdp1 ou cpu
+   (exclusivement) en flat pour m'assurer que c'est bien a la transition que le mur disparait"*).
+   bit0 = every VDP1 wall drawn as a flat GREEN quad (platform side, dg_saturn wall_emit_flat).
+   bit1 = every CPU wall drawn as flat RED columns (this file's SAT_WALL_PAINT_CPU, forced through
+          the existing Potato-walls executor -- the platform must also set sat_potato_walls).
+   With both on, every wall on screen is green or red and NOTHING else, so: which path owns a wall
+   is readable at a glance, a wall CHANGING path changes colour on the exact frame it happens, and a
+   wall that is drawn by NEITHER is a hole with no texture to hide it.  Debug only, default 0;
+   DoomJo never sets it. */
+int sat_wall_paint = 0;
+#define SAT_WALL_PAINT_CPU 176   /* PLAYPAL: base of the red ramp = bright red */
 /* SATURN Potato walls: set per seg in r_segs.c = (the seg's linedef has a special).
    Interactive surfaces (doors, switches, ...) are special lines; keep them TEXTURED
    even in Potato so they stay readable (a flat-grey door in a flat-grey corridor

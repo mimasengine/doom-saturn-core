@@ -65,6 +65,7 @@ extern int   sat_lowres;          /* SATURN M7: packed-160 render -> the REC exe
 extern int   sat_potato_floors;   /* SATURN: solid-colour floors/ceilings (Potato) */
 extern int   sat_potato_walls;    /* SATURN: solid-colour walls (opaque RP_COL only) */
 extern int   sat_wall_color;      /* SATURN: current wall's dominant colour (r_segs) */
+extern int   sat_wall_paint;      /* SATURN debug paint (r_data.c): bit1 = CPU walls flat red */
 extern int   sat_wall_textured;   /* SATURN: keep this wall textured (special line) */
 /* Potato: one FIXED texel of the 64x64 flat (centre = v32,u32 = 32*64+32) as the
    span's base colour.  Using a fixed texel (not the view-dependent span-start one)
@@ -224,7 +225,7 @@ static void rp_exec_col(const rp_cmd_t *cm, const int *colofs)
        distance-shaded colour (a fixed texel of its source) -- vertical detail is
        lost but the per-column horizontal variation stays.  cm->unused==1 = a
        masked sprite column (also RP_COL): leave it textured. */
-    if (sat_potato_walls && !cm->unused)
+    if ((sat_potato_walls || (sat_wall_paint & 2)) && !cm->unused)
     {
         byte c = cmap[(unsigned char)cm->f3];   /* wall's dominant colour, light-shaded */
         do { *dest = c; dest += SCREENWIDTH; } while (--count);
@@ -414,7 +415,7 @@ static void rp_exec_col_low(const rp_cmd_t *cm, const int *colofs)
     x     = (int)cm->a << 1;
     dest  = ylookup[cm->b] + colofs[x];
     dest2 = ylookup[cm->b] + colofs[x + 1];
-    if (sat_potato_walls && !cm->unused)   /* opaque wall column -> single colour */
+    if ((sat_potato_walls || (sat_wall_paint & 2)) && !cm->unused)   /* opaque wall column -> single colour */
     {
         byte c = cmap[(unsigned char)cm->f3];
         do { *dest = *dest2 = c; dest += SCREENWIDTH; dest2 += SCREENWIDTH; }
@@ -840,7 +841,10 @@ static void rp_restart(void)
     SYNC->m_pos=-1;
     SYNC->s_pos=0x7fffffff;
     /* publish the Potato state for the slave (uncached -> coherent this frame) */
-    SYNC->potato = (sat_potato_floors ? 1 : 0) | (sat_potato_walls ? 2 : 0);
+    SYNC->potato = (sat_potato_floors ? 1 : 0)
+                 | ((sat_potato_walls || (sat_wall_paint & 2)) ? 2 : 0);        /* the debug paint rides the
+                       existing SYNC bit so the SLAVE's solid-wall test agrees without reading the
+                       (cached, master-written) sat_wall_paint itself */
 #if RP_CDIAG
     SYNC->slave_bad=0;
 #endif
@@ -1722,7 +1726,14 @@ static void RP_RecordColumn(void)
        Sprites (in_masked) and interactive walls (special lines: doors/switches,
        sat_wall_textured) stay textured so they remain readable. */
     cm->unused=(unsigned char)((in_masked || sat_wall_textured) ? 1 : 0);
-    cm->f3=sat_wall_color;                 /* Potato walls: dominant colour (opaque only) */
+    cm->f3=(sat_wall_paint & 2) ? 176 : sat_wall_color;
+                                           /* Potato walls: dominant colour (opaque only).  DEBUG
+                                              PAINT bit1 -> flat RED instead, so a CPU wall is
+                                              unmistakable next to a green VDP1 one; one site
+                                              because every sat_wall_color assignment funnels here.
+                                              ⚠ THIS EXECUTOR IS DEAD in the shipping config
+                                              (rp_disabled) -- the live solid-column path is
+                                              sat_dc_solid in r_draw.c.  See that note. */
     rp_commit();
 }
 

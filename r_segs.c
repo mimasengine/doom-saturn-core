@@ -35,6 +35,7 @@
 
 #include "r_local.h"
 #include "r_sky.h"
+#include "z_zone.h"	/* SATURN: Z_Malloc for the lead-fill quad history (Doom heap, not the pool) */
 #include "r_parallel.h"	/* SATURN PERF: RP_WallPrep{Enter,Leave} (profiler) */
 
 
@@ -207,6 +208,7 @@ R_RenderMaskedSegRange
 extern int  sat_potato_walls;
 extern int  sat_wall_nocpu;     /* SATURN: banded/flat VDP1 modes skip the close-wall CPU fallback */
 extern int  sat_wall_color;
+extern int  sat_wall_paint;   /* SATURN debug paint (r_data.c): bit1 = CPU walls flat red */
 extern int  sat_wall_textured;
 extern int  R_WallPotatoColor (int tex);
 extern int* texturewidthmask;   /* r_data.c: texture u-period, for the subdiv squish guards */
@@ -286,6 +288,12 @@ int sat_wall_cpu_span = SAT_WALL_CPU_SPAN;
    V1 is the true VDP1-exit threshold (s >= V1 -> off VDP1), so LOWERING it is what actually frees the
    VDP1 raster.  DoomJo links it, never writes it -> stays 576 = old behaviour. */
 int sat_wall_cpu_v1 = SAT_WALL_CPU_V1;
+/* SATURN 2026-08-03: hysteresis width on the CPU<->VDP1 span threshold, in screen px.  A seg that
+   was on the CPU within the last 2 frames (= its exit countdown is still armed) keeps the CPU until
+   `s` falls this far BELOW sat_wall_cpu_span, instead of flipping the instant it crosses.  Sized as
+   half the one-sided pre-warm band (96): wide enough that ordinary walking cannot oscillate across
+   it, narrow enough that it never holds a wall on the CPU that clearly belongs on VDP1. */
+#define SAT_WALL_HYST     48
 #define SAT_WALL_CPU_MAG  3     /* MAGNIFICATION (screen px per texel of u) above which a wall is so
                                    close/face-on that its VDP1 tiling extrapolates past the screen edge
                                    and the platform SQUISHES it ("ecrasement", worst on doors) -- and
@@ -438,18 +446,153 @@ int sat_wall_entry = 1;   /* CPU frames covering a newly-visible VDP1 wall, 0..3
                              Live on pad L+Left / L+Right (1p), read back as row-13 `En<n>`. */
 int sat_seg_frame  = 0;   /* advanced ONCE PER RENDERED FRAME by the platform, after the BSP walk.
                              A port that never advances it (DoomJo) sees gap 0 -> coverage inert. */
+/* ORPHAN COUNT (2026-08-03).  Wall TIERS claimed by NEITHER path this frame -- neither the software
+   column loop (sat_sw_*) nor VDP1 (sat_v1_*, incl. the subdivided variants).  Such a tier is a hole
+   by construction: it is exactly the "mur qui disparait" the owner sees, and the count says whether
+   it happens WITHOUT having to catch the frame by eye (row 13 `N<n>`, summed over the ~1 s overlay
+   window, reset at print).  N0 while a wall still vanishes => the routing is fine and the loss is
+   further down, at emission or in the VDP1 plot -- a completely different search. */
+int sat_wall_nodraw = 0;
+/* PATH FLIPS (2026-08-03).  Segs that were on the CPU last frame and are not this frame -- i.e. a
+   CPU -> VDP1 handoff actually happened.  Detected with no new state: the exit countdown is ARMed to
+   2 on every CPU frame and decremented once per frame after, so reading exactly 2 while cpu_now is
+   false means "CPU last frame, VDP1 now".  This is the number the HYSTERESIS is supposed to drive to
+   ~0; if it stays high the hysteresis is not biting, and if it reaches 0 while walls still vanish
+   then the flip was never the cause. */
+int sat_wall_flip = 0;
+extern int sat_dc_solid;   /* r_draw.c: this colfunc() call is an opaque WALL column -> solid colour */
+
+/* ===== SATURN VDP1 LEAD-FILL (owner's spec, 2026-08-03) ==================================
+   *"JE VEUX QUE TU IMPLEMENTE, SUR LE CPU, LE DESSIN DE CE QUI N'EST PAS COUVERT PAR LA POSITION
+   DE L'ANCIEN MUR A LA FRAME N-X.  TON TOGGLE DEVRAIT ME PERMETTRE DE CHANGER X.  SPOILER, CE
+   N'EST PAS UNE BANDE, C'EST SURFACE DU NOUVEAU MUR AMPUTEE DE CE QUI ETAIT DEJA COUVERT PAR
+   L'ANCIEN MUR"*
+
+   VDP1 shows a list that is X rendered frames old.  Wherever the wall is NOW but was NOT then,
+   NBG1 has been left at index 0 (the software skipped the tier, VDP1 owns it) and nothing is drawn
+   -- that is the hole.  So the software draws exactly the SET DIFFERENCE, per column:
+
+       new tier rows [yl(x), yh(x)]   MINUS   old quad rows [oyl(x), oyh(x)]
+
+   which is 0, 1 or 2 spans per column (the old quad can sit inside the new one), plus the whole
+   column wherever the old quad did not reach at all.  The complement -- where the old wall was and
+   the new one is not -- needs nothing: the software draws the plane there and NBG1 sits ABOVE VDP1,
+   so the stale quad is erased for free.
+
+   SELF-CALIBRATING: if VDP1 is in phase, old == new, the difference is empty and it costs nothing.
+   It never needs to know how late VDP1 actually is -- only X, which the owner sets on the pad.
+
+   History = the quads actually handed to VDP1, one ring slot per rendered frame, keyed by
+   (seg << 2 | tier).  Z_Malloc'd on first use so it lives in the Doom heap (LWRAM) and costs the
+   HWRAM TLSF pool nothing.  Walls past SAT_LEADH_MAX in a frame simply get no history (they draw
+   as before) -- a bounded degradation, never a wrong pixel. */
+int sat_wall_lead_x = 1;   /* 0 = off, else compare against the quad emitted X frames ago (pad R+A) */
+int sat_lead_cols   = 0;   /* diagnostic: extra software column-spans drawn, per overlay window     */
+
+#define SAT_LEADH_DEPTH 4     /* ring slots: current + X up to 3 */
+#define SAT_LEADH_MAX   128   /* quads recorded per frame (matches the platform's WALL_ACC_MAX) */
+
+typedef struct { short key, x1, x2, yl1, yh1, yl2, yh2; } sat_leadq_t;
+static sat_leadq_t *sat_leadh[SAT_LEADH_DEPTH];
+static short        sat_leadh_n[SAT_LEADH_DEPTH];
+static int          sat_leadh_cur = 0;
+static int          sat_leadh_hint = 0;   /* rolling scan start: BSP order is stable frame to frame */
+
+/* Per-tier state for the fragment being drawn: the old quad, stepped per column. */
+typedef struct { int on, x1, x2; fixed_t ylf, ylstep, yhf, yhstep; } sat_lead_t;
+static sat_lead_t sat_lead_mid, sat_lead_up, sat_lead_lo;
+
+void sat_lead_frame_begin (void)   /* once per view, from R_ClearDrawSegs */
+{
+    int i;
+    if (!sat_wall_lead_x) return;
+    if (!sat_leadh[0])
+	for (i = 0 ; i < SAT_LEADH_DEPTH ; i++)
+	    sat_leadh[i] = Z_Malloc (sizeof(sat_leadq_t) * SAT_LEADH_MAX, PU_STATIC, NULL);
+    sat_leadh_cur  = (sat_leadh_cur + 1) % SAT_LEADH_DEPTH;
+    sat_leadh_n[sat_leadh_cur] = 0;
+    sat_leadh_hint = 0;
+}
+
+static void sat_lead_record (int key, int x1, int yl1, int yh1, int x2, int yl2, int yh2)
+{
+    sat_leadq_t *q;
+    if (!sat_wall_lead_x || !sat_leadh[0]) return;
+    if (sat_leadh_n[sat_leadh_cur] >= SAT_LEADH_MAX) return;
+    q = &sat_leadh[sat_leadh_cur][sat_leadh_n[sat_leadh_cur]++];
+    q->key = (short)key;
+    q->x1  = (short)x1;  q->yl1 = (short)yl1;  q->yh1 = (short)yh1;
+    q->x2  = (short)x2;  q->yl2 = (short)yl2;  q->yh2 = (short)yh2;
+}
+
+/* Arm L with the quad this tier had X frames ago, evaluated from column x0.  No record (the wall
+   was not on VDP1 then -- it just came into view, or handed over from the CPU) -> L->on = 0 and
+   nothing extra is drawn: that case belongs to sat_wall_entry / the exit countdown, not here. */
+static void sat_lead_arm (sat_lead_t *L, int key, int x0)
+{
+    const sat_leadq_t *q = 0;
+    int f, n, i, j, dx;
+    L->on = 0;
+    if (!sat_wall_lead_x || !sat_leadh[0]) return;
+    f = (sat_leadh_cur - sat_wall_lead_x + SAT_LEADH_DEPTH * 2) % SAT_LEADH_DEPTH;
+    n = sat_leadh_n[f];
+    for (i = 0 ; i < n ; i++)
+    {
+	j = sat_leadh_hint + i; if (j >= n) j -= n;
+	if (sat_leadh[f][j].key == (short)key) { sat_leadh_hint = j; q = &sat_leadh[f][j]; break; }
+    }
+    if (!q) return;
+    dx = q->x2 - q->x1;
+    L->x1 = q->x1; L->x2 = q->x2;
+    L->ylstep = dx > 0 ? (((fixed_t)(q->yl2 - q->yl1)) << FRACBITS) / dx : 0;
+    L->yhstep = dx > 0 ? (((fixed_t)(q->yh2 - q->yh1)) << FRACBITS) / dx : 0;
+    L->ylf = ((fixed_t)q->yl1 << FRACBITS) + L->ylstep * (x0 - q->x1);
+    L->yhf = ((fixed_t)q->yh1 << FRACBITS) + L->yhstep * (x0 - q->x1);
+    L->on  = 1;
+}
+
+/* Draw [yl,yh] MINUS the old quad's rows at column x.  dc_source / sat_wall_color / dc_texturemid
+   are already set by the caller; this only chooses the spans. */
+static void sat_lead_draw (sat_lead_t *L, int x, int yl, int yh)
+{
+    int cyl, cyh;
+    if (yl > yh) return;
+    if (x < L->x1 || x > L->x2)                /* the old quad did not reach this column at all */
+	{ dc_yl = yl; dc_yh = yh; colfunc (); sat_lead_cols++; return; }
+    cyl = L->ylf >> FRACBITS;
+    cyh = L->yhf >> FRACBITS;
+    if (cyh < yl || cyl > yh)                  /* ...or reached it, but not these rows */
+	{ dc_yl = yl; dc_yh = yh; colfunc (); sat_lead_cols++; return; }
+    if (cyl > yl) { dc_yl = yl;      dc_yh = cyl - 1; colfunc (); sat_lead_cols++; }   /* above */
+    if (cyh < yh) { dc_yl = cyh + 1; dc_yh = yh;      colfunc (); sat_lead_cols++; }   /* below */
+}
+
 
 #define SAT_SEG_EXIT(st)      ((*(st)) & 3)
 #define SAT_SEG_EXIT_ARM(st)  (*(st) = (unsigned char)(((*(st)) & 0xfc) | 2))
 #define SAT_SEG_EXIT_DEC(st)  (*(st) = (unsigned char)((*(st)) - 1))   /* guarded by EXIT() != 0 */
 
-/* Fold this frame's visit into the seg byte; returns 1 while the CPU must cover a wall that just
-   came into view.  A seg clipped into several fragments calls R_StoreWallRange more than once per
-   frame, so only the FIRST visit advances the tag and the countdown -- the others just read it. */
+/* Fold this frame's visit into the seg byte.  Returns bit0 = the CPU must cover a wall that just
+   came into view, bit1 = this was the FIRST visit this frame.  A seg clipped into several fragments
+   calls R_StoreWallRange more than once per frame, so only the first visit advances the tag and the
+   countdown -- the others just read it.
+
+   ⚠ bit1 EXISTS BECAUSE THE EXIT COUNTDOWN HAD THE SAME MULTI-VISIT DEFECT AND NO GUARD (owner
+   2026-08-03, seen through the wall-path paint: *"la disparition a l'air d'être sur une frame entre
+   le texturé et le vert"* -- a wall drawn by NOBODY on the frame it moves CPU -> VDP1).  The exit
+   overlap is the ONLY cover the door tiers have: unlike the one-sided mid tier, which gets a 96 px
+   pre-warm band where both paths draw ([SPAN, V1], sat_wall_cpu_v1 = span + 96), `sat_v1_up/lo` key
+   straight off `!cpu_up/!cpu_lo`, so VDP1 takes the tier the instant the CPU drops it.  The exit
+   countdown was decremented once per VISIT, so a seg clipped into 2 fragments burned its 2 frames of
+   overlap inside a SINGLE frame and the handoff went uncovered.  Now it decrements once per frame,
+   like the entry countdown next to it, and the 2 frames mean 2 frames.  (The `sat_wall_entry` gate
+   moved off the early return: the visit must be folded even at En0, or the tag stops advancing and
+   every seg reads as "not visible last frame" forever.) */
 static int sat_seg_entry_cover (unsigned char *st)
 {
     unsigned char b, tag;
-    if (!st || !sat_wall_entry) return 0;
+    int first = 0;
+    if (!st) return 0;
     b   = *st;
     tag = (unsigned char)(sat_seg_frame & 15);
     if ((unsigned char)(b >> 4) != tag)                       /* first visit this frame */
@@ -461,8 +604,9 @@ static int sat_seg_entry_cover (unsigned char *st)
 	else if (e) e--;
 	b = (unsigned char)((tag << 4) | (e << 2) | (b & 3));
 	*st = b;
+	first = 2;
     }
-    return ((b >> 2) & 3) != 0;
+    return first | ((sat_wall_entry && (((b >> 2) & 3) != 0)) ? 1 : 0);
 }
 
 /* SATURN Phase-1 wall clamp ([[wall-clamp-world-anchored]]), below-floor side.  The failed 1b
@@ -726,6 +870,9 @@ void R_RenderSegLoop (void)
     /* SATURN per-tier draw gates: sat_sw_* = the software draws this tier (CPU + transition zone);
        sat_v1_* = the VDP1 hook draws it (VDP1 + transition zone).  Both true in [LOW,HIGH] = overlap. */
     int			sat_sw_mid = 0, sat_sw_up = 0, sat_sw_lo = 0;
+    /* SATURN: seg index at FUNCTION scope -- the lead-fill keys its per-tier quad history on it and
+       needs it at the emit sites AND in the column loop, not just inside the claim block. */
+    int			segidx0 = (int)(curline - segs);
     int			sat_v1_mid = 0, sat_v1_up = 0, sat_v1_lo = 0;
     int			sat_v1_mid_sub = 0, sat_v1_up_sub = 0, sat_v1_lo_sub = 0;   /* magnified tier -> perspective-subdivide on VDP1 (not CPU) */
     int			sat_v1_mid_edge = 0;   /* SATURN L5: try CPU-borders + VDP1-core instead of a full CPU wall */
@@ -744,15 +891,25 @@ void R_RenderSegLoop (void)
 
     /* Keep doors/switches (special lines) textured even in Potato walls, so they
        stay readable against the flat-shaded plain walls. */
-    sat_wall_textured = (curline->linedef->special != 0);
+    /* DEBUG PAINT bit1 (r_data.c sat_wall_paint): paint EVERY CPU wall, doors and switches too --
+       the point is to see which path owns each wall, and an exception would read as a hole. */
+    sat_wall_textured = (sat_wall_paint & 2) ? 0 : (curline->linedef->special != 0);
     /* SATURN PERF (step 2): a plain opaque wall in Potato mode is drawn as one
        solid colour by rp_exec_col (it reads cm->f3 + cm->cmap, NEVER cm->src) ->
        skip R_GetColumn (the memory-bound texture composite = the bulk of wall-prep
        "Bp") and the per-column dc_iscale division.  wall_solid matches the
        executor's solid test exactly (cm->unused = in_masked||sat_wall_textured,
        and in_masked is 0 during opaque wall generation). */
-    wall_solid = sat_potato_walls && !sat_wall_textured && !rp_disabled;
+    /* The `&& !rp_disabled` this test used to carry was a BUG, not a guard: it said "flat walls only
+       when the parity executors run", and rp_disabled is 1 in the SHIPPING config (main.cxx
+       sat_plane_parallel -> r_main.c), so every flat-wall mode was dead.  r_draw.c now implements
+       the solid column on the master path too, which is the one that actually runs. */
+    wall_solid = (sat_potato_walls || (sat_wall_paint & 2))
+	         && !sat_wall_textured;
     sat_clip_have = 0;   /* SATURN L2: per-SEG validity -- never inherit the previous seg's scan */
+    /* LEAD-FILL: same rule.  The arm sites live inside the VDP1 emit blocks, which are gated, so
+       without this a tier VDP1 does not own would inherit the previous seg's old quad. */
+    sat_lead_mid.on = sat_lead_up.on = sat_lead_lo.on = 0;
     sat_we_on     = 0;   /* SATURN L5: edge-split disarmed until this seg's claim block arms it */
 
     /* texture ROW (v) at a wall's top/bottom screen y, so the platform maps the right
@@ -787,22 +944,41 @@ void R_RenderSegLoop (void)
 	int mdu = ((rw_offset - FixedMul(finetangent[ma1], rw_distance)) >> FRACBITS)
 		- ((rw_offset - FixedMul(finetangent[ma2], rw_distance)) >> FRACBITS);
 	int magnified;
+	/* Per-seg CPU memory, hoisted up here because BOTH terms of cpu_now need it: the exit countdown
+	   is still armed <=> this seg was on the CPU within the last 2 frames. */
+	int segidx = (int)(curline - segs);
+	unsigned char *segst = (segidx >= 0 && segidx < SAT_SEG_MAX) ? &sat_seg_cpu[segidx] : 0;
+	int seg_hyst = (segst && SAT_SEG_EXIT(segst)) ? 1 : 0;
 	if (mdu < 0) mdu = -mdu;
 	if (mdu < 1) mdu = 1;
-	magnified = (sx > mdu * SAT_WALL_CPU_MAG);
+	/* HYSTERESIS ON MAGNIFICATION.  The span threshold got one first and the owner still saw the
+	   alternation -- because cpu_now is `span_close || magnified` and this is the OTHER term, the
+	   one that moves when you walk AT a wall, i.e. exactly his "avant / arriere" case.  Quarter
+	   steps so the band is half a MAG unit (~17%), enough that ordinary walking cannot dither
+	   across it, small enough never to hold a genuinely magnified wall on VDP1 (where it squishes). */
+	magnified = (sx * 4 > mdu * (SAT_WALL_CPU_MAG * 4 - (seg_hyst ? 2 : 0)));
 
 	if (midtexture && !curline->backsector)
 	{
 	    int s1 = (bottomfrac - topfrac) >> HEIGHTBITS;
 	    int s2 = ((bottomfrac + bottomstep * n) - (topfrac + topstep * n)) >> HEIGHTBITS;
 	    int s = s1 > s2 ? s1 : s2;
-	    int span_close = (s > sat_wall_cpu_span);   /* kept for the FBK counter */
+	    unsigned char *st = segst;
+	    /* HYSTERESIS on the CPU<->VDP1 span threshold (owner 2026-08-03, read off the wall-path
+	       paint: *"c'est sur une alternance : le mur ne reste pas vert.  On passe de texture - vert
+	       - texture"*).  The wall was not migrating, it was OSCILLATING: `s` jitters either side of
+	       a bare threshold as the player moves, so the tier flips path every frame or two, and each
+	       flip is a handoff that has to be covered.  Hysteresis makes a wall that was recently on
+	       the CPU keep a LOWER bar to stay there, so `s` has to move a real distance to flip -- no
+	       flip, no handoff, no hole, and the texture stops strobing against the flat quad either
+	       way.  No new state: the exit countdown already means "this seg was on the CPU within the
+	       last 2 frames", which is exactly the memory hysteresis needs. */
+	    int span_close = (s > sat_wall_cpu_span - (seg_hyst ? SAT_WALL_HYST : 0));
 	    /* SPAN clamp DISABLED (v0 near-wall affine perspective warp = "moche", owner 2026-07-02):
 	       span-close one-sided walls stay on the CPU (shipping).  sat_wall_clamp now drives ONLY the
 	       BELOW-FLOOR cut (Phase 1b).  Revisit SPAN only with finer near-tile u-subdivision. */
 	    int cpu_now = span_close || magnified;
-	    int idx = (int)(curline - segs);
-	    unsigned char *st = (idx >= 0 && idx < SAT_SEG_MAX) ? &sat_seg_cpu[idx] : 0;
+	    if (!cpu_now && st && SAT_SEG_EXIT(st) == 2) sat_wall_flip++;   /* CPU last frame, VDP1 now */
 	    int entry;
 	    sat_v1_mid = (s < sat_wall_cpu_v1) && !magnified;  /* magnified -> NO VDP1 quad (it squishes) */
 #if SAT_WALL_SUBDIV
@@ -815,7 +991,7 @@ void R_RenderSegLoop (void)
 		    if (magnified)                  sat_fb_mag_t++;                             /* squish -> clamp can't fix   */
 		    else if (span_close)            { sat_fb_clamp_t++; sat_fb_px += s * sx; }  /* pure span  -> clampable     */
 		}
-		sat_sw_mid = 1;  if (st) SAT_SEG_EXIT_ARM(st);   /* CPU draws (close/magnified); arm 2 CPU exit-frames */
+		sat_sw_mid = 1;  if (st) SAT_SEG_EXIT_ARM(st);           /* CPU draws (close/magnified); arm 2 CPU exit-frames */
 		    /* SATURN L5: this tier is about to cost a FULL-SCREEN software wall (the ~22ms
 		       nose-to-wall Bp).  Let the emit site below try the CPU-borders/VDP1-core split
 		       first; it silently leaves everything as-is when the interior is too thin. */
@@ -823,8 +999,12 @@ void R_RenderSegLoop (void)
 	    }
 	    else
 	    {
-		sat_sw_mid = ((st && SAT_SEG_EXIT(st)) || entry) ? 1 : 0;   /* CPU also draws 2 frames after exit, and the first frames after entry */
-		if (st && SAT_SEG_EXIT(st)) SAT_SEG_EXIT_DEC(st);
+		sat_sw_mid = ((st && SAT_SEG_EXIT(st)) || (entry & 1)) ? 1 : 0;   /* CPU also draws 2 frames after exit, and the first frames after entry */
+		if (st && SAT_SEG_EXIT(st) && (entry & 2)) SAT_SEG_EXIT_DEC(st);  /* ONCE PER FRAME (entry&2 = first visit), not per fragment */
+	    }
+	    /* ORPHAN COUNT -- see sat_wall_nodraw. */
+	    if (!sat_sw_mid && !sat_v1_mid && !sat_v1_mid_sub) sat_wall_nodraw++;
+	    {
 	    }
 	}
 	else if (curline->backsector)
@@ -833,32 +1013,43 @@ void R_RenderSegLoop (void)
 	       they squish at the edge when magnified.  Route the whole seg (both tiers) to CPU on span
 	       OR magnification, with the same per-seg 3-frame exit handoff as the one-sided mid. */
 	    int cpu_up = 0, cpu_lo = 0;
+	    unsigned char *dst = segst;
+	    /* Same HYSTERESIS as the one-sided mid tier above, and these tiers need it MORE: they have
+	       no [SPAN,V1] pre-warm band, so every flip is a bare handoff.  See the note there. */
+	    int dhy = seg_hyst ? SAT_WALL_HYST : 0;
 	    if (toptexture)
 	    {
 		int s1 = (pixhigh - topfrac) >> HEIGHTBITS;
 		int s2 = ((pixhigh + pixhighstep * n) - (topfrac + topstep * n)) >> HEIGHTBITS;
 		int s = s1 > s2 ? s1 : s2;
-		cpu_up = (s > sat_wall_cpu_span);
+		cpu_up = (s > sat_wall_cpu_span - dhy);
 	    }
 	    if (bottomtexture)
 	    {
 		int s1 = (bottomfrac - pixlow) >> HEIGHTBITS;
 		int s2 = ((bottomfrac + bottomstep * n) - (pixlow + pixlowstep * n)) >> HEIGHTBITS;
 		int s = s1 > s2 ? s1 : s2;
-		cpu_lo = (s > sat_wall_cpu_span);
+		cpu_lo = (s > sat_wall_cpu_span - dhy);
 	    }
 	    {
 		int cpu_now = cpu_up || cpu_lo || magnified;
+		if (!cpu_now && dst && SAT_SEG_EXIT(dst) == 2) sat_wall_flip++;   /* CPU last frame, VDP1 now */
 		if (cpu_up) sat_fb_clamp_t++;                        /* Phase-0: clampable span (upper door tier) */
 		if (cpu_lo) sat_fb_clamp_t++;                        /* Phase-0: clampable span (lower door tier) */
 #if !SAT_WALL_SUBDIV
 		if (magnified && !cpu_up && !cpu_lo) sat_fb_mag_t++; /* Phase-0: magnified-only door residue      */
 #endif
-		int idx = (int)(curline - segs);
-		unsigned char *st = (idx >= 0 && idx < SAT_SEG_MAX) ? &sat_seg_cpu[idx] : 0;
-		int overlap = sat_seg_entry_cover(st);  /* just came into view -> CPU covers VDP1's first frame */
-		if (cpu_now) { if (st) SAT_SEG_EXIT_ARM(st); }       /* arm 2 CPU exit-frames */
-		else if (st && SAT_SEG_EXIT(st)) { overlap = 1; SAT_SEG_EXIT_DEC(st); }  /* CPU also draws 2 frames after exit */
+		unsigned char *st = dst;
+		int vis     = sat_seg_entry_cover(st);  /* bit0 = just came into view, bit1 = first visit this frame */
+		int overlap = vis & 1;                  /* -> CPU covers VDP1's first frame */
+		if (cpu_now) { if (st) SAT_SEG_EXIT_ARM(st); }                    /* arm 2 CPU exit-frames */
+		else if (st && SAT_SEG_EXIT(st))
+		{   /* CPU also draws 2 frames after exit.  These tiers have NO pre-warm band (sat_v1_up/lo
+		       key straight off !cpu_up/!cpu_lo), so this overlap is their only handoff cover --
+		       decrement it ONCE PER FRAME, never once per clipped fragment. */
+		    overlap = 1;
+		    if (vis & 2) SAT_SEG_EXIT_DEC(st);
+		}
 		/* VDP1 owns a tier only when it is neither magnified nor span-close (so it never draws the
 		   squishing quad); the CPU draws it when close/magnified OR during the exit overlap. */
 		sat_v1_up = (toptexture    && !magnified && !cpu_up) ? 1 : 0;
@@ -873,6 +1064,9 @@ void R_RenderSegLoop (void)
 		sat_sw_up = (toptexture    && (cpu_up || magnified || overlap)) ? 1 : 0;
 		sat_sw_lo = (bottomtexture && (cpu_lo || magnified || overlap)) ? 1 : 0;
 #endif
+		/* ORPHAN COUNT -- see sat_wall_nodraw. */
+		if (toptexture    && !sat_sw_up && !sat_v1_up && !sat_v1_up_sub) sat_wall_nodraw++;
+		if (bottomtexture && !sat_sw_lo && !sat_v1_lo && !sat_v1_lo_sub) sat_wall_nodraw++;
 	    }
 	}
     }
@@ -909,6 +1103,10 @@ void R_RenderSegLoop (void)
 	int u1 = (rw_offset - FixedMul(finetangent[a1], rw_distance)) >> FRACBITS;
 	int u2 = (rw_offset - FixedMul(finetangent[a2], rw_distance)) >> FRACBITS;
 	int v0, v1; SAT_VROWS(rw_midtexturemid, yl1, yh1, v0, v1);
+	/* LEAD-FILL: this tier's quad as it was X frames ago (-> the software draws the difference in
+	   the column loop), then this frame's for the next lookup.  Recorded from the tier extent, not
+	   per sub-quad: the subdivided/edge emitters cover exactly the same area. */
+	sat_lead_arm (&sat_lead_mid, (segidx0 << 2) | 0, rw_x);
 	/* distance-correct light = the colormap the software loop picks (was a FIXED mid-level,
 	   so VDP1 walls did not match the room's per-distance lighting). */
 	int _li = rw_scale >> LIGHTSCALESHIFT;
@@ -1018,6 +1216,12 @@ void R_RenderSegLoop (void)
 #endif
 	else if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, midtexture, u1, u2, v0, v1, cm))
 	    { sat_sw_mid = 1; sat_fb_starve_t++; }   /* VDP1 starved (command list full) -> draw this wall in SOFTWARE, not sky */
+	/* LEAD-FILL: record ONLY what VDP1 really took.  Every branch above can hand the tier back to
+	   the software (cull, floor clamp, edge split, starve) -- recording those would make the next
+	   frame subtract an area VDP1 never covered, i.e. UNDER-draw and leave the hole we are here to
+	   close.  sat_sw_mid is the one flag they all set. */
+	if (!sat_sw_mid)
+	    sat_lead_record ((segidx0 << 2) | 0, rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2);
     }
 
     /* SATURN VDP1 world renderer: two-sided walls -> upper (toptexture) + lower
@@ -1041,6 +1245,7 @@ void R_RenderSegLoop (void)
 	    int yh1 = pixhigh >> HEIGHTBITS;
 	    int yh2 = (pixhigh + pixhighstep * n) >> HEIGHTBITS;
 	    int v0, v1; SAT_VROWS(rw_toptexturemid, yl1, yh1, v0, v1);
+	    sat_lead_arm (&sat_lead_up, (segidx0 << 2) | 1, rw_x);   /* LEAD-FILL, see the mid tier */
 	    /* SATURN: same floor handling as the other tiers -- cull an upper (toptexture) wall
 	       entirely below the RBG0 floor line; hand a partially-below one to the CPU (clips to
 	       floorclip).  (Rare for a ceiling-side tier, but completes the set.) */
@@ -1101,6 +1306,8 @@ void R_RenderSegLoop (void)
 	    else
 		if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, toptexture, u1, u2, v0, v1, cm))
 		    { sat_sw_up = 1; sat_fb_starve_t++; }   /* VDP1 starved (list full) -> upper in SOFTWARE, not sky */
+	    if (!sat_sw_up)   /* LEAD-FILL: record only what VDP1 really took (see the mid tier) */
+		sat_lead_record ((segidx0 << 2) | 1, rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2);
 	}
 	if (bottomtexture && (sat_v1_lo || sat_v1_lo_sub))   /* bottom of the opening -> floor.
 	       sat_v1_lo_sub MUST be in this gate like the mid/top tiers: a magnified lower tier
@@ -1112,6 +1319,7 @@ void R_RenderSegLoop (void)
 	    int yh1 = bottomfrac >> HEIGHTBITS;
 	    int yh2 = (bottomfrac + bottomstep * n) >> HEIGHTBITS;
 	    int v0, v1; SAT_VROWS(rw_bottomtexturemid, yl1, yh1, v0, v1);
+	    sat_lead_arm (&sat_lead_lo, (segidx0 << 2) | 2, rw_x);   /* LEAD-FILL, see the mid tier */
 	    /* SATURN: same floor handling as the one-sided wall -- cull a lower (bottomtexture)
 	       wall entirely below the floor; hand a partially-below one to the CPU, which clips
 	       each column to floorclip (no VDP1 bleed-through, no squish). */
@@ -1172,6 +1380,8 @@ void R_RenderSegLoop (void)
 	    else
 		if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, bottomtexture, u1, u2, v0, v1, cm))
 		    { sat_sw_lo = 1; sat_fb_starve_t++; }   /* VDP1 starved (list full) -> lower in SOFTWARE, not sky */
+	    if (!sat_sw_lo)   /* LEAD-FILL: record only what VDP1 really took (see the mid tier) */
+		sat_lead_record ((segidx0 << 2) | 2, rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2);
 	}
     }
 #undef SAT_VROWS
@@ -1187,6 +1397,10 @@ void R_RenderSegLoop (void)
     else
         sw_draws = (toptexture    && (!sat_wall_skip || sat_sw_up))
                 || (bottomtexture && (!sat_wall_skip || sat_sw_lo));
+
+    /* LEAD-FILL: the difference spans are drawn by the SOFTWARE, so the per-column lighting and
+       dc_iscale must be computed for this seg even when VDP1 owns every tier. */
+    if (sat_lead_mid.on || sat_lead_up.on || sat_lead_lo.on) sw_draws = 1;
 
 #if SAT_WALL_EDGE_FILL
     int sat_ef_x0 = rw_x, sat_ef_x1 = rw_stopx - 1;   /* seg screen extent, for the edge-fill margin */
@@ -1297,7 +1511,18 @@ void R_RenderSegLoop (void)
 		    sat_wall_color = R_WallPotatoColor(midtexture);
 		else
 		    dc_source = R_GetColumn(midtexture,texturecolumn);
+		sat_dc_solid = wall_solid;   /* SATURN: armed for WALL columns only (see r_draw.c) */
 		colfunc ();
+		sat_dc_solid = 0;
+	    }
+	    else if (sat_lead_mid.on)   /* LEAD-FILL: VDP1 owns it -> draw only what the OLD quad missed */
+	    {
+		dc_texturemid = rw_midtexturemid;
+		if (wall_solid) sat_wall_color = R_WallPotatoColor(midtexture);
+		else            dc_source = R_GetColumn(midtexture, texturecolumn);
+		sat_dc_solid = wall_solid;
+		sat_lead_draw (&sat_lead_mid, rw_x, yl, yh);
+		sat_dc_solid = 0;
 	    }
 	    if (sat_wcl_mid) sat_wcl_mid_ef += sat_wcl_mid_es;
 	    ceilingclip[rw_x] = viewheight;
@@ -1330,7 +1555,18 @@ void R_RenderSegLoop (void)
 			    sat_wall_color = R_WallPotatoColor(toptexture);
 			else
 			    dc_source = R_GetColumn(toptexture,texturecolumn);
+			sat_dc_solid = wall_solid;   /* SATURN: WALL columns only (see r_draw.c) */
 			colfunc ();
+			sat_dc_solid = 0;
+		    }
+		    else if (sat_lead_up.on)   /* LEAD-FILL, see the mid tier */
+		    {
+			dc_texturemid = rw_toptexturemid;
+			if (wall_solid) sat_wall_color = R_WallPotatoColor(toptexture);
+			else            dc_source = R_GetColumn(toptexture, texturecolumn);
+			sat_dc_solid = wall_solid;
+			sat_lead_draw (&sat_lead_up, rw_x, yl, mid);
+			sat_dc_solid = 0;
 		    }
 		    ceilingclip[rw_x] = mid;
 		}
@@ -1371,7 +1607,18 @@ void R_RenderSegLoop (void)
 			else
 			    dc_source = R_GetColumn(bottomtexture,
 						    texturecolumn);
+			sat_dc_solid = wall_solid;   /* SATURN: WALL columns only (see r_draw.c) */
 			colfunc ();
+			sat_dc_solid = 0;
+		    }
+		    else if (sat_lead_lo.on)   /* LEAD-FILL, see the mid tier */
+		    {
+			dc_texturemid = rw_bottomtexturemid;
+			if (wall_solid) sat_wall_color = R_WallPotatoColor(bottomtexture);
+			else            dc_source = R_GetColumn(bottomtexture, texturecolumn);
+			sat_dc_solid = wall_solid;
+			sat_lead_draw (&sat_lead_lo, rw_x, mid, yh);
+			sat_dc_solid = 0;
 		    }
 		    floorclip[rw_x] = mid;
 		}
@@ -1397,6 +1644,10 @@ void R_RenderSegLoop (void)
 	rw_scale += rw_scalestep;
 	topfrac += topstep;
 	bottomfrac += bottomstep;
+	/* LEAD-FILL: step each armed tier's OLD quad edges one column, like the wedge edges above. */
+	if (sat_lead_mid.on) { sat_lead_mid.ylf += sat_lead_mid.ylstep; sat_lead_mid.yhf += sat_lead_mid.yhstep; }
+	if (sat_lead_up.on)  { sat_lead_up.ylf  += sat_lead_up.ylstep;  sat_lead_up.yhf  += sat_lead_up.yhstep;  }
+	if (sat_lead_lo.on)  { sat_lead_lo.ylf  += sat_lead_lo.ylstep;  sat_lead_lo.yhf  += sat_lead_lo.yhstep;  }
     }
 }
 

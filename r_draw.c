@@ -89,8 +89,20 @@ fixed_t			dc_texturemid;
 // first pixel in a column (possibly virtual) 
 byte*			dc_source;		
 
-// just for profiling 
+// just for profiling
 int			dccount;
+
+/* SATURN SOLID WALL COLUMN.  The flat-wall modes (Potato SQ_FLAT, Wm2's sat_wall_cpu_flat, the L+X
+   debug paint) were implemented ONLY in r_parallel.c's rp_exec_col* executors -- which NEVER RUN in
+   the shipping config: src/main.cxx sets sat_plane_parallel=1, r_main.c forces rp_disabled=1, and
+   RP_RecordColumn then short-circuits straight to R_DrawColumn/R_DrawColumnLow here (r_parallel.c
+   :1721).  So every one of those modes was silently inert on the master -- the owner's *"je n'ai pas
+   de cpu rouge"* and *"wn2 ne dessine pas des flats"* are the same dead path, reported twice.
+   The colour lives in sat_wall_color (r_segs.c funnels every assignment); r_segs arms sat_dc_solid
+   for wall tiers only, immediately around their colfunc() call, so sprites and masked columns never
+   see it.  dc_source is NOT valid when it is armed (R_GetColumn was skipped). */
+int			sat_dc_solid = 0;
+extern int		sat_wall_color;
 
 //
 // A column is a vertical slice/span from a wall texture that,
@@ -128,7 +140,15 @@ void R_DrawColumn (void)
     // Framebuffer destination address.
     // Use ylookup LUT to avoid multiply with ScreenWidth.
     // Use columnofs LUT for subwindows? 
-    dest = ylookup[dc_yl] + columnofs[dc_x];  
+    dest = ylookup[dc_yl] + columnofs[dc_x];
+
+    /* SATURN: solid wall column -- one distance-shaded colour, no source read (see sat_dc_solid). */
+    if (sat_dc_solid)
+    {
+	byte c = dc_colormap[(unsigned char)sat_wall_color];
+	do { *dest = c; dest += SCREENWIDTH; } while (count--);
+	return;
+    }
 
     // Determine scaling,
     //  which is the only mapping to be done.
@@ -246,8 +266,16 @@ void R_DrawColumnLow (void)
     
     dest = ylookup[dc_yl] + columnofs[x];
     dest2 = ylookup[dc_yl] + columnofs[x+1];
-    
-    fracstep = dc_iscale; 
+
+    /* SATURN: solid wall column (see sat_dc_solid in R_DrawColumn). */
+    if (sat_dc_solid)
+    {
+	byte c = dc_colormap[(unsigned char)sat_wall_color];
+	do { *dest2 = *dest = c; dest += SCREENWIDTH; dest2 += SCREENWIDTH; } while (count--);
+	return;
+    }
+
+    fracstep = dc_iscale;
     frac = dc_texturemid + (dc_yl-centery)*fracstep;
     
     do

@@ -87,6 +87,14 @@ void R_ClearDrawSegs (void)
     int n = (int)(ds_p - drawsegs);          /* SATURN: fold the prior pass's count into the peak */
     if (n > r_drawseg_peak) r_drawseg_peak = n;
     ds_p = drawsegs;
+    /* SATURN LEAD-FILL: advance the per-frame quad-history ring -- it has exactly this lifetime,
+       one view's front-to-back BSP walk, so it rides the drawsegs it reasons about.  1p only: in
+       split both views share this call site and would interleave two histories into one ring. */
+    {
+	extern int sat_split_active;
+	extern void sat_lead_frame_begin (void);
+	if (!sat_split_active) sat_lead_frame_begin ();
+    }
 }
 
 
