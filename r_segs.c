@@ -488,8 +488,13 @@ extern int sat_dc_solid;   /* r_draw.c: this colfunc() call is an opaque WALL co
    as before) -- a bounded degradation, never a wrong pixel. */
 int sat_wall_lead_x = 1;   /* 0 = off, else compare against the quad emitted X frames ago (pad R+A) */
 int sat_lead_cols   = 0;   /* diagnostic: extra software column-spans drawn, per overlay window     */
+/* FLAT DIFFERENCE SPANS (pad R+Right, row-13 `L<X><f>/<spans>`).  The spans this system adds are
+   slivers a few pixels wide on the edge of a wall IN MOTION -- nobody resolves texture there.  Drawn
+   solid (the texture's own dominant colour) they skip R_GetColumn entirely, which is the composite,
+   i.e. the memory-bound half of wall-prep, on exactly the columns this system invents.  1 = flat. */
+int sat_lead_flat   = 0;
 
-#define SAT_LEADH_DEPTH 4     /* ring slots: current + X up to 3 */
+#define SAT_LEADH_DEPTH 6     /* ring slots: current + X up to 3, and the jitter pair needs X+1 */
 #define SAT_LEADH_MAX   128   /* quads recorded per frame (matches the platform's WALL_ACC_MAX) */
 
 typedef struct { short key, x1, x2, yl1, yh1, yl2, yh2; } sat_leadq_t;
@@ -499,7 +504,8 @@ static int          sat_leadh_cur = 0;
 static int          sat_leadh_hint = 0;   /* rolling scan start: BSP order is stable frame to frame */
 
 /* Per-tier state for the fragment being drawn: the old quad, stepped per column. */
-typedef struct { int on, x1, x2; fixed_t ylf, ylstep, yhf, yhstep; } sat_lead_t;
+typedef struct { int on, x1, x2;   fixed_t ylf,  ylstep,  yhf,  yhstep;
+                 int on2, x1b, x2b; fixed_t ylfb, ylstepb, yhfb, yhstepb; } sat_lead_t;
 static sat_lead_t sat_lead_mid, sat_lead_up, sat_lead_lo;
 
 void sat_lead_frame_begin (void)   /* once per view, from R_ClearDrawSegs */
@@ -525,48 +531,88 @@ static void sat_lead_record (int key, int x1, int yl1, int yh1, int x2, int yl2,
     q->x2  = (short)x2;  q->yl2 = (short)yl2;  q->yh2 = (short)yh2;
 }
 
-/* Arm L with the quad this tier had X frames ago, evaluated from column x0.  No record (the wall
-   was not on VDP1 then -- it just came into view, or handed over from the CPU) -> L->on = 0 and
-   nothing extra is drawn: that case belongs to sat_wall_entry / the exit countdown, not here. */
-static void sat_lead_arm (sat_lead_t *L, int key, int x0)
+/* Find this tier's quad in ring slot `back` frames ago.  ⚠ MATCHED ON THE KEY **AND** ON COLUMN
+   OVERLAP: a seg clipped by solidsegs calls R_StoreWallRange once per FRAGMENT, and every fragment
+   records under the same (seg<<2)|tier -- keying on the key alone hands back a sibling fragment's
+   geometry, i.e. the wrong subtraction.  (Owner's review, 2026-08-03.) */
+static const sat_leadq_t *sat_lead_look (int key, int back, int x0, int x1)
 {
-    const sat_leadq_t *q = 0;
-    int f, n, i, j, dx;
-    L->on = 0;
-    if (!sat_wall_lead_x || !sat_leadh[0]) return;
-    f = (sat_leadh_cur - sat_wall_lead_x + SAT_LEADH_DEPTH * 2) % SAT_LEADH_DEPTH;
+    int f, n, i, j;
+    if (!sat_leadh[0]) return 0;
+    f = (sat_leadh_cur - back + SAT_LEADH_DEPTH * 4) % SAT_LEADH_DEPTH;
     n = sat_leadh_n[f];
     for (i = 0 ; i < n ; i++)
     {
+	const sat_leadq_t *q;
 	j = sat_leadh_hint + i; if (j >= n) j -= n;
-	if (sat_leadh[f][j].key == (short)key) { sat_leadh_hint = j; q = &sat_leadh[f][j]; break; }
+	q = &sat_leadh[f][j];
+	if (q->key == (short)key && q->x1 <= x1 && q->x2 >= x0)
+	    { sat_leadh_hint = j; return q; }
     }
-    if (!q) return;
-    dx = q->x2 - q->x1;
-    L->x1 = q->x1; L->x2 = q->x2;
-    L->ylstep = dx > 0 ? (((fixed_t)(q->yl2 - q->yl1)) << FRACBITS) / dx : 0;
-    L->yhstep = dx > 0 ? (((fixed_t)(q->yh2 - q->yh1)) << FRACBITS) / dx : 0;
-    L->ylf = ((fixed_t)q->yl1 << FRACBITS) + L->ylstep * (x0 - q->x1);
-    L->yhf = ((fixed_t)q->yh1 << FRACBITS) + L->yhstep * (x0 - q->x1);
-    L->on  = 1;
+    return 0;
 }
 
-/* Draw [yl,yh] MINUS the old quad's rows at column x.  dc_source / sat_wall_color / dc_texturemid
-   are already set by the caller; this only chooses the spans. */
+/* Arm one edge pair from a recorded quad, evaluated from column x0. */
+static void sat_lead_set (int *on, int *px1, int *px2, fixed_t *ylf, fixed_t *ylst,
+			  fixed_t *yhf, fixed_t *yhst, const sat_leadq_t *q, int x0)
+{
+    int dx;
+    if (!q) { *on = 0; return; }
+    dx = q->x2 - q->x1;
+    *px1 = q->x1; *px2 = q->x2;
+    *ylst = dx > 0 ? (((fixed_t)(q->yl2 - q->yl1)) << FRACBITS) / dx : 0;
+    *yhst = dx > 0 ? (((fixed_t)(q->yh2 - q->yh1)) << FRACBITS) / dx : 0;
+    *ylf  = ((fixed_t)q->yl1 << FRACBITS) + *ylst * (x0 - q->x1);
+    *yhf  = ((fixed_t)q->yh1 << FRACBITS) + *yhst * (x0 - q->x1);
+    *on   = 1;
+}
+
+/* Arm L for the fragment [x0,x1].  No record (the wall was not on VDP1 then -- it just came into
+   view, or handed over from the CPU) -> L->on = 0 and nothing extra is drawn: that case belongs to
+   sat_wall_entry / the exit countdown, not here.
+
+   JITTER GUARD (owner's review, 2026-08-03): VDP1's lag is not necessarily a constant, so no single
+   X can be right if it oscillates.  Arm frames n-X **and** n-(X+1) and subtract only their
+   INTERSECTION -- what BOTH covered.  A row VDP1 showed on one of the two frames but not the other
+   is then redrawn, so either lag is covered, at the cost of a slightly wider difference.  Only one
+   of the two recorded -> use it alone (the pair is a refinement, not a requirement). */
+static void sat_lead_arm (sat_lead_t *L, int key, int x0, int x1)
+{
+    const sat_leadq_t *qa, *qb;
+    L->on = L->on2 = 0;
+    if (!sat_wall_lead_x || !sat_leadh[0]) return;
+    qa = sat_lead_look (key, sat_wall_lead_x,     x0, x1);
+    qb = sat_lead_look (key, sat_wall_lead_x + 1, x0, x1);
+    if (!qa) { qa = qb; qb = 0; }
+    sat_lead_set (&L->on,  &L->x1,  &L->x2,  &L->ylf,  &L->ylstep,  &L->yhf,  &L->yhstep,  qa, x0);
+    sat_lead_set (&L->on2, &L->x1b, &L->x2b, &L->ylfb, &L->ylstepb, &L->yhfb, &L->yhstepb, qb, x0);
+}
+
+/* Draw [yl,yh] MINUS the rows BOTH armed quads covered at column x.  dc_source / sat_wall_color /
+   dc_texturemid are already set by the caller; this only chooses the spans. */
 static void sat_lead_draw (sat_lead_t *L, int x, int yl, int yh)
 {
     int cyl, cyh;
     if (yl > yh) return;
-    if (x < L->x1 || x > L->x2)                /* the old quad did not reach this column at all */
-	{ dc_yl = yl; dc_yh = yh; colfunc (); sat_lead_cols++; return; }
+    if (x < L->x1 || x > L->x2) goto full;      /* the older quad did not reach this column */
     cyl = L->ylf >> FRACBITS;
     cyh = L->yhf >> FRACBITS;
-    if (cyh < yl || cyl > yh)                  /* ...or reached it, but not these rows */
-	{ dc_yl = yl; dc_yh = yh; colfunc (); sat_lead_cols++; return; }
+    if (L->on2)                                 /* intersect with frame n-(X+1) */
+    {
+	int c2l, c2h;
+	if (x < L->x1b || x > L->x2b) goto full;
+	c2l = L->ylfb >> FRACBITS;
+	c2h = L->yhfb >> FRACBITS;
+	if (c2l > cyl) cyl = c2l;
+	if (c2h < cyh) cyh = c2h;
+    }
+    if (cyh < cyl || cyh < yl || cyl > yh) goto full;   /* empty intersection, or misses these rows */
     if (cyl > yl) { dc_yl = yl;      dc_yh = cyl - 1; colfunc (); sat_lead_cols++; }   /* above */
     if (cyh < yh) { dc_yl = cyh + 1; dc_yh = yh;      colfunc (); sat_lead_cols++; }   /* below */
+    return;
+full:
+    dc_yl = yl; dc_yh = yh; colfunc (); sat_lead_cols++;
 }
-
 
 #define SAT_SEG_EXIT(st)      ((*(st)) & 3)
 #define SAT_SEG_EXIT_ARM(st)  (*(st) = (unsigned char)(((*(st)) & 0xfc) | 2))
@@ -910,6 +956,7 @@ void R_RenderSegLoop (void)
     /* LEAD-FILL: same rule.  The arm sites live inside the VDP1 emit blocks, which are gated, so
        without this a tier VDP1 does not own would inherit the previous seg's old quad. */
     sat_lead_mid.on = sat_lead_up.on = sat_lead_lo.on = 0;
+    sat_lead_mid.on2 = sat_lead_up.on2 = sat_lead_lo.on2 = 0;
     sat_we_on     = 0;   /* SATURN L5: edge-split disarmed until this seg's claim block arms it */
 
     /* texture ROW (v) at a wall's top/bottom screen y, so the platform maps the right
@@ -1106,7 +1153,7 @@ void R_RenderSegLoop (void)
 	/* LEAD-FILL: this tier's quad as it was X frames ago (-> the software draws the difference in
 	   the column loop), then this frame's for the next lookup.  Recorded from the tier extent, not
 	   per sub-quad: the subdivided/edge emitters cover exactly the same area. */
-	sat_lead_arm (&sat_lead_mid, (segidx0 << 2) | 0, rw_x);
+	sat_lead_arm (&sat_lead_mid, (segidx0 << 2) | 0, rw_x, rw_stopx - 1);
 	/* distance-correct light = the colormap the software loop picks (was a FIXED mid-level,
 	   so VDP1 walls did not match the room's per-distance lighting). */
 	int _li = rw_scale >> LIGHTSCALESHIFT;
@@ -1245,7 +1292,7 @@ void R_RenderSegLoop (void)
 	    int yh1 = pixhigh >> HEIGHTBITS;
 	    int yh2 = (pixhigh + pixhighstep * n) >> HEIGHTBITS;
 	    int v0, v1; SAT_VROWS(rw_toptexturemid, yl1, yh1, v0, v1);
-	    sat_lead_arm (&sat_lead_up, (segidx0 << 2) | 1, rw_x);   /* LEAD-FILL, see the mid tier */
+	    sat_lead_arm (&sat_lead_up, (segidx0 << 2) | 1, rw_x, rw_stopx - 1);   /* LEAD-FILL, see the mid tier */
 	    /* SATURN: same floor handling as the other tiers -- cull an upper (toptexture) wall
 	       entirely below the RBG0 floor line; hand a partially-below one to the CPU (clips to
 	       floorclip).  (Rare for a ceiling-side tier, but completes the set.) */
@@ -1319,7 +1366,7 @@ void R_RenderSegLoop (void)
 	    int yh1 = bottomfrac >> HEIGHTBITS;
 	    int yh2 = (bottomfrac + bottomstep * n) >> HEIGHTBITS;
 	    int v0, v1; SAT_VROWS(rw_bottomtexturemid, yl1, yh1, v0, v1);
-	    sat_lead_arm (&sat_lead_lo, (segidx0 << 2) | 2, rw_x);   /* LEAD-FILL, see the mid tier */
+	    sat_lead_arm (&sat_lead_lo, (segidx0 << 2) | 2, rw_x, rw_stopx - 1);   /* LEAD-FILL, see the mid tier */
 	    /* SATURN: same floor handling as the one-sided wall -- cull a lower (bottomtexture)
 	       wall entirely below the floor; hand a partially-below one to the CPU, which clips
 	       each column to floorclip (no VDP1 bleed-through, no squish). */
@@ -1518,9 +1565,10 @@ void R_RenderSegLoop (void)
 	    else if (sat_lead_mid.on)   /* LEAD-FILL: VDP1 owns it -> draw only what the OLD quad missed */
 	    {
 		dc_texturemid = rw_midtexturemid;
-		if (wall_solid) sat_wall_color = R_WallPotatoColor(midtexture);
-		else            dc_source = R_GetColumn(midtexture, texturecolumn);
-		sat_dc_solid = wall_solid;
+		int lflat = wall_solid || sat_lead_flat;   /* see sat_lead_flat */
+		if (lflat) sat_wall_color = R_WallPotatoColor(midtexture);
+		else       dc_source = R_GetColumn(midtexture, texturecolumn);
+		sat_dc_solid = lflat;
 		sat_lead_draw (&sat_lead_mid, rw_x, yl, yh);
 		sat_dc_solid = 0;
 	    }
@@ -1562,9 +1610,10 @@ void R_RenderSegLoop (void)
 		    else if (sat_lead_up.on)   /* LEAD-FILL, see the mid tier */
 		    {
 			dc_texturemid = rw_toptexturemid;
-			if (wall_solid) sat_wall_color = R_WallPotatoColor(toptexture);
-			else            dc_source = R_GetColumn(toptexture, texturecolumn);
-			sat_dc_solid = wall_solid;
+			int lflat = wall_solid || sat_lead_flat;   /* see sat_lead_flat */
+			if (lflat) sat_wall_color = R_WallPotatoColor(toptexture);
+			else       dc_source = R_GetColumn(toptexture, texturecolumn);
+			sat_dc_solid = lflat;
 			sat_lead_draw (&sat_lead_up, rw_x, yl, mid);
 			sat_dc_solid = 0;
 		    }
@@ -1614,9 +1663,10 @@ void R_RenderSegLoop (void)
 		    else if (sat_lead_lo.on)   /* LEAD-FILL, see the mid tier */
 		    {
 			dc_texturemid = rw_bottomtexturemid;
-			if (wall_solid) sat_wall_color = R_WallPotatoColor(bottomtexture);
-			else            dc_source = R_GetColumn(bottomtexture, texturecolumn);
-			sat_dc_solid = wall_solid;
+			int lflat = wall_solid || sat_lead_flat;   /* see sat_lead_flat */
+			if (lflat) sat_wall_color = R_WallPotatoColor(bottomtexture);
+			else       dc_source = R_GetColumn(bottomtexture, texturecolumn);
+			sat_dc_solid = lflat;
 			sat_lead_draw (&sat_lead_lo, rw_x, mid, yh);
 			sat_dc_solid = 0;
 		    }
@@ -1648,6 +1698,9 @@ void R_RenderSegLoop (void)
 	if (sat_lead_mid.on) { sat_lead_mid.ylf += sat_lead_mid.ylstep; sat_lead_mid.yhf += sat_lead_mid.yhstep; }
 	if (sat_lead_up.on)  { sat_lead_up.ylf  += sat_lead_up.ylstep;  sat_lead_up.yhf  += sat_lead_up.yhstep;  }
 	if (sat_lead_lo.on)  { sat_lead_lo.ylf  += sat_lead_lo.ylstep;  sat_lead_lo.yhf  += sat_lead_lo.yhstep;  }
+	if (sat_lead_mid.on2){ sat_lead_mid.ylfb += sat_lead_mid.ylstepb; sat_lead_mid.yhfb += sat_lead_mid.yhstepb; }
+	if (sat_lead_up.on2) { sat_lead_up.ylfb  += sat_lead_up.ylstepb;  sat_lead_up.yhfb  += sat_lead_up.yhstepb;  }
+	if (sat_lead_lo.on2) { sat_lead_lo.ylfb  += sat_lead_lo.ylstepb;  sat_lead_lo.yhfb  += sat_lead_lo.yhstepb;  }
     }
 }
 
