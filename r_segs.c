@@ -519,6 +519,14 @@ int sat_lead_span_drop;      /* spans the cap refused this frame -- silence woul
 void R_LeadSlaveDraw (void)
 {
     extern byte *ylookup[]; extern int columnofs[];   /* r_draw.c, no header */
+    extern int sat_lowres;                           /* r_main.c */
+    /* ⚠ MIRROR R_ExecuteSetViewSize'S DRAWER CHOICE EXACTLY.  In M7 detailshift is 1 -- it drives
+       the 160-column projection and the VDP1 x<<1 -- but the master still uses the NORMAL
+       R_DrawColumn, because the framebuffer is PACKED 160 wide (one byte per logical column) and
+       the *Low drawers would re-duplicate it back to 320.  Branching on detailshift alone put every
+       slave span at double x, duplicated: the owner's *"les dessins du slave ne sont pas au bon
+       endroit sur l'image"*. */
+    int lowdraw = (detailshift && !sat_lowres);
     int i;
     for (i = 0 ; i < sat_lead_span_n ; i++)
     {
@@ -527,7 +535,7 @@ void R_LeadSlaveDraw (void)
 	byte *dest;
 	if (count < 0) continue;
 	if ((unsigned)sp->x >= (unsigned)SCREENWIDTH || sp->yl < 0 || sp->yh >= viewheight) continue;
-	if (detailshift)
+	if (lowdraw)
 	{
 	    int x = sp->x << 1;
 	    byte *d2;
