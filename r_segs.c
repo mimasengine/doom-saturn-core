@@ -488,11 +488,97 @@ extern int sat_dc_solid;   /* r_draw.c: this colfunc() call is an opaque WALL co
    as before) -- a bounded degradation, never a wrong pixel. */
 int sat_wall_lead_x = 1;   /* 0 = off, else compare against the quad emitted X frames ago (pad R+A) */
 int sat_lead_cols   = 0;   /* diagnostic: extra software column-spans drawn, per overlay window     */
-/* FLAT DIFFERENCE SPANS (pad R+Right, row-13 `L<X><f>/<spans>`).  The spans this system adds are
-   slivers a few pixels wide on the edge of a wall IN MOTION -- nobody resolves texture there.  Drawn
-   solid (the texture's own dominant colour) they skip R_GetColumn entirely, which is the composite,
-   i.e. the memory-bound half of wall-prep, on exactly the columns this system invents.  1 = flat. */
-int sat_lead_flat   = 0;
+/* DIFFERENCE-SPAN DRAW MODE (pad R+Right, row-13 `L<X><m>/<spans>`).
+     0 = '-' master, TEXTURED -- the reference.
+     1 = 's' SLAVE, textured (owner 2026-08-03: *"le mode flat n'est pas ideal (visible meme en
+         mouvement), je prefere qu'on garde texture. deporte sur le slave"*).  The spans are
+         RECORDED during the BSP walk and drawn by the 2nd SH-2 while the master draws the planes.
+         See sat_lead_spans / R_LeadSlaveDraw.
+     2 = 'f' master, FLAT (the texture's own dominant colour): skips R_GetColumn, the composite,
+         i.e. the memory-bound half of wall-prep.  Kept as the cheap fallback -- the owner judged it
+         visible in motion, so it is no longer the default.
+   ⚠ Mode 1 moves the FILL, not the composite: R_GetColumn mutates the shared texture cache, so it
+   has to stay on the master (that is what killed wall-prep-on-slave three times over). */
+int sat_lead_mode   = 1;
+#define sat_lead_flat (sat_lead_mode == 2)
+
+/* Recorded difference spans, drained by the slave.  Z_Malloc'd with the quad history (Doom heap,
+   LWRAM) so the HWRAM pool pays nothing.  src == 0 means SOLID, colour in `col`. */
+typedef struct { short x, yl, yh, col; const byte *src; const byte *cmap;
+		 fixed_t iscale, texmid; } sat_leadspan_t;
+#define SAT_LEADSPAN_MAX 1536
+static sat_leadspan_t *sat_lead_spans;
+static int sat_lead_span_n;
+int sat_lead_span_drop;      /* spans the cap refused this frame -- silence would read as "nothing to do" */
+
+/* Drain the recorded spans.  Runs on the SLAVE, CONCURRENTLY with the master's R_DrawPlanes, so it
+   must not touch a single dc_* global (the master's sky columns use them).  Everything it needs is
+   in the record; the inner loops mirror R_DrawColumn / R_DrawColumnLow with locals.
+   Pixel-safe against the planes it overlaps: Doom clips every visplane to the ceilingclip/floorclip
+   the wall loop just wrote, so a plane never owns a row a wall tier owns. */
+void R_LeadSlaveDraw (void)
+{
+    extern byte *ylookup[]; extern int columnofs[];   /* r_draw.c, no header */
+    int i;
+    for (i = 0 ; i < sat_lead_span_n ; i++)
+    {
+	const sat_leadspan_t *sp = &sat_lead_spans[i];
+	int count = sp->yh - sp->yl;
+	byte *dest;
+	if (count < 0) continue;
+	if ((unsigned)sp->x >= (unsigned)SCREENWIDTH || sp->yl < 0 || sp->yh >= viewheight) continue;
+	if (detailshift)
+	{
+	    int x = sp->x << 1;
+	    byte *d2;
+	    dest = ylookup[sp->yl] + columnofs[x];
+	    d2   = ylookup[sp->yl] + columnofs[x + 1];
+	    if (!sp->src)
+	    {
+		byte c = sp->cmap[(unsigned char)sp->col];
+		do { *d2 = *dest = c; dest += SCREENWIDTH; d2 += SCREENWIDTH; } while (count--);
+	    }
+	    else
+	    {
+		fixed_t frac = sp->texmid + (sp->yl - centery) * sp->iscale;
+		do { byte px = sp->cmap[sp->src[(frac >> FRACBITS) & 127]];
+		     *d2 = *dest = px; dest += SCREENWIDTH; d2 += SCREENWIDTH; frac += sp->iscale; }
+		while (count--);
+	    }
+	}
+	else
+	{
+	    dest = ylookup[sp->yl] + columnofs[sp->x];
+	    if (!sp->src)
+	    {
+		byte c = sp->cmap[(unsigned char)sp->col];
+		do { *dest = c; dest += SCREENWIDTH; } while (count--);
+	    }
+	    else
+	    {
+		fixed_t frac = sp->texmid + (sp->yl - centery) * sp->iscale;
+		do { *dest = sp->cmap[sp->src[(frac >> FRACBITS) & 127]];
+		     dest += SCREENWIDTH; frac += sp->iscale; }
+		while (count--);
+	    }
+	}
+    }
+}
+
+int  R_LeadSpanCount (void) { return sat_lead_span_n; }
+void R_LeadSpanReset (void) { sat_lead_span_n = 0; }
+
+static void sat_lead_span_add (int yl, int yh)
+{
+    sat_leadspan_t *sp;
+    if (sat_lead_span_n >= SAT_LEADSPAN_MAX || !sat_lead_spans) { sat_lead_span_drop++; return; }
+    sp = &sat_lead_spans[sat_lead_span_n++];
+    sp->x = (short)dc_x; sp->yl = (short)yl; sp->yh = (short)yh;
+    sp->cmap = dc_colormap;
+    if (sat_dc_solid) { sp->src = 0; sp->col = (short)sat_wall_color; sp->iscale = 0; sp->texmid = 0; }
+    else              { sp->src = dc_source; sp->col = 0;
+			sp->iscale = dc_iscale; sp->texmid = dc_texturemid; }
+}
 
 #define SAT_LEADH_DEPTH 6     /* ring slots: current + X up to 3, and the jitter pair needs X+1 */
 #define SAT_LEADH_MAX   128   /* quads recorded per frame (matches the platform's WALL_ACC_MAX) */
@@ -513,8 +599,11 @@ void sat_lead_frame_begin (void)   /* once per view, from R_ClearDrawSegs */
     int i;
     if (!sat_wall_lead_x) return;
     if (!sat_leadh[0])
-	for (i = 0 ; i < SAT_LEADH_DEPTH ; i++)
-	    sat_leadh[i] = Z_Malloc (sizeof(sat_leadq_t) * SAT_LEADH_MAX, PU_STATIC, NULL);
+	{
+	    for (i = 0 ; i < SAT_LEADH_DEPTH ; i++)
+		sat_leadh[i] = Z_Malloc (sizeof(sat_leadq_t) * SAT_LEADH_MAX, PU_STATIC, NULL);
+	    sat_lead_spans = Z_Malloc (sizeof(sat_leadspan_t) * SAT_LEADSPAN_MAX, PU_STATIC, NULL);
+	}
     sat_leadh_cur  = (sat_leadh_cur + 1) % SAT_LEADH_DEPTH;
     sat_leadh_n[sat_leadh_cur] = 0;
     sat_leadh_hint = 0;
@@ -588,6 +677,9 @@ static void sat_lead_arm (sat_lead_t *L, int key, int x0, int x1)
     sat_lead_set (&L->on2, &L->x1b, &L->x2b, &L->ylfb, &L->ylstepb, &L->yhfb, &L->yhstepb, qb, x0);
 }
 
+/* One difference span: straight to the framebuffer, or into the slave's list. */
+#define SAT_LEAD_EMIT(a,b) do { 	if (sat_lead_mode == 1) sat_lead_span_add ((a), (b)); 	else { dc_yl = (a); dc_yh = (b); colfunc (); } 	sat_lead_cols++; } while (0)
+
 /* Draw [yl,yh] MINUS the rows BOTH armed quads covered at column x.  dc_source / sat_wall_color /
    dc_texturemid are already set by the caller; this only chooses the spans. */
 static void sat_lead_draw (sat_lead_t *L, int x, int yl, int yh)
@@ -607,11 +699,11 @@ static void sat_lead_draw (sat_lead_t *L, int x, int yl, int yh)
 	if (c2h < cyh) cyh = c2h;
     }
     if (cyh < cyl || cyh < yl || cyl > yh) goto full;   /* empty intersection, or misses these rows */
-    if (cyl > yl) { dc_yl = yl;      dc_yh = cyl - 1; colfunc (); sat_lead_cols++; }   /* above */
-    if (cyh < yh) { dc_yl = cyh + 1; dc_yh = yh;      colfunc (); sat_lead_cols++; }   /* below */
+    if (cyl > yl) SAT_LEAD_EMIT (yl,      cyl - 1);   /* above */
+    if (cyh < yh) SAT_LEAD_EMIT (cyh + 1, yh);        /* below */
     return;
 full:
-    dc_yl = yl; dc_yh = yh; colfunc (); sat_lead_cols++;
+    SAT_LEAD_EMIT (yl, yh);
 }
 
 #define SAT_SEG_EXIT(st)      ((*(st)) & 3)

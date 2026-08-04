@@ -1225,7 +1225,30 @@ static void R_RenderViewPass (int last_pass)
     // Check for new console commands.
     NetUpdate ();
 
-    R_DrawPlanes ();
+    /* SATURN LEAD-FILL on the SLAVE (sat_lead_mode 1).  The difference spans were RECORDED during
+       the BSP walk instead of drawn; hand them to the 2nd SH-2 here and let it fill them while the
+       master draws the planes.  This is the ONE window where the slave is provably usable in M7:
+       planes are master-only there (see the r_parallel gate) and the aux dispatch is the same path
+       the shipped, HW-validated framebuffer clear already takes every frame.
+       Pixel-safe against the planes it overlaps -- Doom clips every visplane to the ceilingclip /
+       floorclip the wall loop just wrote, so no plane owns a row a wall tier owns -- and register-
+       safe, because R_LeadSlaveDraw touches no dc_* global (the master's sky columns use them). */
+    {
+	extern int  sat_lead_mode, sat_local_players;
+	extern int  R_LeadSpanCount (void);
+	extern void R_LeadSpanReset (void), R_LeadSlaveDraw (void);
+	extern void RP_AuxDispatch (void (*fn)(void)), RP_LeadJoin (void);
+	int lead_slave = (sat_lead_mode == 1 && !sat_split_active && sat_local_players <= 1
+			  && R_LeadSpanCount () > 0);
+	if (lead_slave) RP_AuxDispatch (R_LeadSlaveDraw);
+
+	R_DrawPlanes ();
+
+	/* Join BEFORE the masked pass: sprites must land on top of the wall pixels. */
+	if (lead_slave) { RP_LeadJoin (); R_LeadSpanReset (); }
+	else if (R_LeadSpanCount () > 0)   /* mode changed mid-frame, or the dispatch was skipped */
+	    { R_LeadSlaveDraw (); R_LeadSpanReset (); }
+    }
 
     V_Canary ("planes");
 

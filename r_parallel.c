@@ -760,6 +760,7 @@ static int rp_wait(volatile int *flag, int site)
 #define RP_GBR_RESET 1
 
 void RP_AuxWait(void);     /* fwd: join the platform's aux slave job before any rewind */
+static void master_cache_purge(void);   /* fwd: defined below, used by RP_LeadJoin */
 void RP_PlaneJoin(void);   /* fwd: join an OUTSTANDING plane dispatch before any rewind (see below) */
 
 /* SATURN: THE ~1-2min freeze fix.  slSlaveFunc bump-allocates a 12-byte record
@@ -915,6 +916,15 @@ static void rp_run_on_stack(void (*fn)(void))
 static volatile int rp_aux_done_v = 1;
 #define RP_AUX_DONE (*(volatile int *)((unsigned int)&rp_aux_done_v | 0x20000000u))
 static void (*rp_aux_fn)(void);
+
+/* Join the aux job AND purge -- for a job that wrote PIXELS (the lead-fill spans).  The plain
+   RP_AuxWait skips the purge because the framebuffer clear it was built for is read next by the
+   blit, which purges itself; the masked pass that follows the lead spans does not. */
+void RP_LeadJoin(void)
+{
+    RP_AuxWait();
+    master_cache_purge();
+}
 
 void RP_AuxWait(void)
 {
