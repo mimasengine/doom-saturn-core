@@ -714,6 +714,48 @@ full:
     SAT_LEAD_EMIT (yl, yh);
 }
 
+/* ===== PATH DWELL (owner 2026-08-05) =====================================================
+   *"on devrait aussi limiter ces bascules pour eviter des changements trop frequents (ex:
+   bloquer le mur pendant x frames sur le chemin bascule)"*.
+
+   The hysteresis widened the THRESHOLD; this bounds the RATE.  After a seg changes path, it is
+   pinned for `sat_wall_dwell` frames -- and pinned to the CPU, never to VDP1.  That asymmetry is
+   deliberate and it is what makes this safe:
+     - the software can draw any tier, so forcing CPU is never wrong, only slower;
+     - forcing VDP1 could hit a tier with no VDP1 claim at all (magnified, no subdivision, bank
+       full) and produce a tier drawn by NOBODY -- a hole, which is the bug we are chasing.
+   So it is exactly the existing 2-frame exit overlap, generalised to X frames and made symmetric:
+   whichever way the wall just flipped, the CPU keeps covering it for X frames.  Costs software
+   columns -> watch row-2 `Bp`.  0 = off = the 2-frame overlap alone.
+
+   State: bit7 = the last path seen (1 = CPU), bits 3:0 = the countdown.  Its own array because the
+   per-seg byte's 4+2+2 bits are full; Z_Malloc'd into the Doom heap so the HWRAM pool pays nothing.
+   Advanced ONCE PER FRAME (first visit), like every other per-seg countdown here. */
+int sat_wall_dwell = 0;      /* frames a flipped seg stays covered by the CPU, 0..15 (pad R+Up) */
+static unsigned char *sat_seg_dwell;
+
+static int sat_dwell_cpu (int segidx, int cpu_now, int first_visit)
+{
+    unsigned char *d;
+    if (!sat_wall_dwell || segidx < 0 || segidx >= SAT_SEG_MAX) return cpu_now;
+    if (!sat_seg_dwell)
+    {
+	sat_seg_dwell = Z_Malloc (SAT_SEG_MAX, PU_STATIC, NULL);
+	memset (sat_seg_dwell, 0, SAT_SEG_MAX);
+    }
+    d = &sat_seg_dwell[segidx];
+    if (first_visit)
+    {
+	int was = (*d >> 7) & 1;
+	if (was != (cpu_now & 1))                       /* a real flip -> arm the pin */
+	    *d = (unsigned char)((cpu_now ? 0x80 : 0)
+				 | (sat_wall_dwell > 15 ? 15 : sat_wall_dwell));
+	else if (*d & 0x0f)
+	    (*d)--;                                     /* count down (nibble > 0: no borrow into bit7) */
+    }
+    return (*d & 0x0f) ? 1 : cpu_now;                   /* pinned -> the CPU covers it */
+}
+
 #define SAT_SEG_EXIT(st)      ((*(st)) & 3)
 #define SAT_SEG_EXIT_ARM(st)  (*(st) = (unsigned char)(((*(st)) & 0xfc) | 2))
 #define SAT_SEG_EXIT_DEC(st)  (*(st) = (unsigned char)((*(st)) - 1))   /* guarded by EXIT() != 0 */
@@ -1132,6 +1174,7 @@ void R_RenderSegLoop (void)
 	    if (magnified && !span_close) { sat_v1_mid_sub = 1; cpu_now = 0; }  /* keep on VDP1 via perspective subdivision (emit site), not CPU */
 #endif
 	    entry = sat_seg_entry_cover(st);   /* just came into view -> the CPU covers VDP1's first frame */
+	    cpu_now = sat_dwell_cpu(segidx, cpu_now, entry & 2);   /* bound the FLIP RATE, see sat_wall_dwell */
 	    if (cpu_now)
 	    {
 		if (!sat_v1_mid) {   /* Phase-0: count only the FULLY-CPU tiers (not the [SPAN,V1] VDP1-also pre-warm) */
@@ -1188,6 +1231,7 @@ void R_RenderSegLoop (void)
 #endif
 		unsigned char *st = dst;
 		int vis     = sat_seg_entry_cover(st);  /* bit0 = just came into view, bit1 = first visit this frame */
+		cpu_now = sat_dwell_cpu(segidx, cpu_now, vis & 2);      /* bound the FLIP RATE */
 		int overlap = vis & 1;                  /* -> CPU covers VDP1's first frame */
 		if (cpu_now) { if (st) SAT_SEG_EXIT_ARM(st); }                    /* arm 2 CPU exit-frames */
 		else if (st && SAT_SEG_EXIT(st))
