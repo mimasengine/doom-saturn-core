@@ -825,7 +825,9 @@ void R_InitTextures (void)
     int*		maptex;
     int*		maptex2;
     int*		maptex1;
-    
+    byte*		tex_slab = NULL;   /* SATURN: one block for all texture_t (see below) */
+    byte*		tex_slab_end = NULL;
+
     char		name[9];
     char*		names;
     char*		name_p;
@@ -912,6 +914,39 @@ void R_InitTextures (void)
             printf("\b");
     }
 	
+    /* SATURN 2026-08-07: ONE SLAB for every texture_t, instead of one Z_Malloc per texture.
+       ~1500 textures in TNT = ~1500 separate PU_STATIC blocks, and THAT is the ~240 KB of small
+       unpurgeable blocks that chop the middle of the zone.  Measured consequence: the longest free
+       run sat at 19-38 KB all session, so a 256x128 patch (35080 B) could not be cached (the
+       garde-PATCH halt) AND r_flatcache never carved -- its smallest rung needs 48 KB, so the
+       resident flat pool shipped this morning read `p0` in every single capture.
+       Two passes over the SAME directory walk: sum, then carve pointers into one block.  Byte-
+       identical contents, identical API, but the zone sees 1 block instead of ~1500 -- and every
+       Z_Malloc stops walking them.  Judge it on LIM `lg` and on FLT `p`.
+       Fails soft: if the slab cannot be allocated, tex_slab stays NULL and the per-texture
+       Z_Malloc below runs exactly as before. */
+    {
+	int*  dscan = directory;
+	int*  mscan = maptex;
+	int   moff  = maxoff;
+	long  need  = 0;
+	for (i=0 ; i<numtextures ; i++, dscan++)
+	{
+	    maptexture_t* mt;
+	    int off;
+	    if (i == numtextures1) { mscan = maptex2; moff = maxoff2; dscan = mscan+1; }
+	    off = LONG(*dscan);
+	    if (off > moff) break;                      /* corrupt -> let the main loop I_Error */
+	    mt = (maptexture_t *)((byte *)mscan + off);
+	    need += (sizeof(texture_t) + sizeof(texpatch_t)*(SHORT(mt->patchcount)-1) + 3) & ~3L;
+	}
+	if (i == numtextures && need > 0 && Z_LargestAllocatable() > need + 128*1024)
+	{
+	    tex_slab     = (byte *)Z_Malloc((int)need, PU_STATIC, 0);
+	    tex_slab_end = tex_slab + need;
+	}
+    }
+
     for (i=0 ; i<numtextures ; i++, directory++)
     {
 	if (!(i&63))
@@ -932,10 +967,15 @@ void R_InitTextures (void)
 	
 	mtexture = (maptexture_t *) ( (byte *)maptex + offset);
 
-	texture = textures[i] =
-	    Z_Malloc (sizeof(texture_t)
-		      + sizeof(texpatch_t)*(SHORT(mtexture->patchcount)-1),
-		      PU_STATIC, 0);
+	{   /* SATURN: carve from the slab (see above); fall back to a private block if there is
+	       none, or -- defensively -- if the slab ran short of what the sizing pass computed. */
+	    int tsz = (sizeof(texture_t)
+		       + sizeof(texpatch_t)*(SHORT(mtexture->patchcount)-1) + 3) & ~3;
+	    if (tex_slab && tex_slab + tsz <= tex_slab_end)
+	    { texture = textures[i] = (texture_t *)tex_slab; tex_slab += tsz; }
+	    else
+		texture = textures[i] = Z_Malloc (tsz, PU_STATIC, 0);
+	}
 	
 	texture->width = SHORT(mtexture->width);
 	texture->height = SHORT(mtexture->height);
