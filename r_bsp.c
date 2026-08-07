@@ -95,6 +95,13 @@ void R_ClearDrawSegs (void)
 	extern void sat_lead_frame_begin (void);
 	if (!sat_split_active) sat_lead_frame_begin ();
     }
+    /* SATURN per-frame TEXTURE LOAD BUDGET: refill here, the one call site every rendered frame
+       passes through exactly once (split included -- the 4 views share one frame's disc budget,
+       which is what we want: the budget bounds the FRAME's stall, not the view's). */
+    {
+	extern int sat_tex_load_spent;
+	sat_tex_load_spent = 0;
+    }
 }
 
 

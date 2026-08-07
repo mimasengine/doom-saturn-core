@@ -38,6 +38,7 @@
 #include "r_local.h"
 #include "r_sky.h"
 #include "r_cache.h"
+#include "r_flatcache.h"
 
 
 
@@ -1159,11 +1160,13 @@ void (*sat_xsplit_wait)(void) = 0;
 #ifdef RP_SLAVE_BUILD
 #define SAT_RP_BEGIN()    ((void)0)
 #define SAT_RP_BSPDONE()  ((void)0)
+#define SAT_RP_MARKP(s)   ((void)0)
 #define SAT_RP_MASKED()   ((void)0)
 #define SAT_RP_END()      ((void)0)
 #else
 #define SAT_RP_BEGIN()    RP_BeginFrame()
 #define SAT_RP_BSPDONE()  RP_MarkBSPDone()
+#define SAT_RP_MARKP(s)   RP_MarkP(s)
 #define SAT_RP_MASKED()   RP_BeginMasked()
 #define SAT_RP_END()      RP_EndFrame()
 #endif
@@ -1219,6 +1222,11 @@ static void R_RenderViewPass (int last_pass)
 	extern void R_EmitWorldThingsVDP1 (void);
 	R_EmitWorldThingsVDP1 ();
     }
+
+    /* SATURN: `P` sub-bracket 0 -- the VDP1 wall kick is DONE.  Everything above this line is
+       charged to `P` today but is not a plane: the wall-list flush, the VDP1 kick, and
+       R_DrawPlayerSprites (weapon projection + VDP1 texture bake) inside the hook. */
+    SAT_RP_MARKP (0);
 
     V_Canary ("bsp");
 
@@ -1289,6 +1297,10 @@ void R_RenderPlayerView (player_t* player)
     // SATURN: age the bounded streaming texture cache once per view, before the
     // BSP walk re-touches the visible composites (no-op unless sat_streaming).
     R_PostTexCacheFrame ();
+    /* SATURN: age the resident flat pool on the same beat.  MUST be here -- before the BSP
+       walk re-touches this view's flats -- so "age 0" means exactly "in use by the view being
+       drawn" and the LRU can never reuse a slot a queued visplane still points into. */
+    R_PostFlatCacheFrame ();
 
     if (sat_xsplit)
     {

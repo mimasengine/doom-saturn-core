@@ -208,6 +208,52 @@ R_RenderMaskedSegRange
 extern int  sat_potato_walls;
 extern int  sat_wall_nocpu;     /* SATURN: banded/flat VDP1 modes skip the close-wall CPU fallback */
 extern int  sat_wall_color;
+/* SATURN per-frame texture LOAD BUDGET -- see the block above the column loop in R_StoreWallRange.
+   budget 0 = OFF = every texture faults in on sight (the pre-2026-08-06 behaviour). */
+int sat_tex_load_budget = 0;    /* textures allowed to fault in per frame (pad chord)          */
+int sat_tex_load_spent  = 0;    /* spent this frame (reset in R_ClearDrawSegs)                 */
+int sat_wall_flat_io    = 0;    /* tiers drawn flat for want of residency  (~1 s window)       */
+int sat_wall_flat_nocol = 0;    /* ...of which we had no cached colour either (~1 s window)    */
+/* Neutral index used when a texture has never been resident, so its dominant colour was never
+   computed and CANNOT be without loading it.  Mid-grey in the Doom palette; dc_colormap still
+   shades it by distance/sector light, so it reads as a lit surface, not a hole. */
+#define SAT_WALL_FLAT_UNKNOWN 100
+
+extern int  R_TextureIOFree (int tex);
+extern int  R_WallPotatoColorPeek (int tex);
+extern int  R_WallPotatoColor (int tex);
+
+/* 1 = draw this tier FLAT because texturing it would hit the disc and the frame's budget is spent. */
+static int sat_wall_io_flat (int tex)
+{
+    if (!sat_tex_load_budget)      return 0;   /* feature off */
+    if (R_TextureIOFree (tex))     return 0;   /* free -> draw it properly, budget untouched */
+    if (sat_tex_load_spent < sat_tex_load_budget)
+    {
+	/* Pay for it (BSP order => nearest walls win).  We are faulting the texture in anyway, so
+	   compute its DOMINANT COLOUR in the same breath: R_WallPotatoColor is only ever called by
+	   the potato mode, which is off in normal play, so without this the colour cache stays EMPTY
+	   and every flattened wall falls back to neutral grey -- measured `nocol` = 100% of `flat`
+	   on the owner's TNT MAP11 captures.  Priming here makes every later fallback for this
+	   texture exact, at the cost of one extra pass over a texture we are already loading. */
+	sat_tex_load_spent++;
+	R_WallPotatoColor (tex);
+	return 0;
+    }
+    sat_wall_flat_io++;
+    return 1;
+}
+
+/* Flat colour for an IO-flattened tier, resolved ONCE PER TIER (the draw sites below live INSIDE
+   the column loop -- calling this there counted `nocol` per COLUMN, which is why it read larger
+   than `flat`, and paid a peek per column for nothing).  MUST NOT call R_WallPotatoColor: that
+   walks the texture through R_GetColumn and would perform the very read we are avoiding. */
+static int sat_wall_flat_color (int tex)
+{
+    int c = R_WallPotatoColorPeek (tex);
+    if (c < 0) { c = SAT_WALL_FLAT_UNKNOWN; sat_wall_flat_nocol++; }
+    return c;
+}
 extern int  sat_wall_paint;   /* SATURN debug paint (r_data.c): bit1 = CPU walls flat red */
 extern int  sat_wall_textured;
 extern int  R_WallPotatoColor (int tex);
@@ -1596,6 +1642,21 @@ void R_RenderSegLoop (void)
 #if SAT_WALL_EDGE_FILL
     int sat_ef_x0 = rw_x, sat_ef_x1 = rw_stopx - 1;   /* seg screen extent, for the edge-fill margin */
 #endif
+    /* SATURN LOAD BUDGET (2026-08-06).  Decided ONCE per tier per seg, before the column loop.
+       In the CD-streaming build a texture that is not resident costs a SYNCHRONOUS ~42 ms disc read
+       inside R_GetColumn -- charged to `Bp`, for a wall that may be three screen columns wide.  That
+       is the whole of the 480..790 ms `Bp` frames in the owner's TNT captures.  Beyond
+       sat_tex_load_budget faults per frame we draw the tier FLAT instead: sat_dc_solid skips
+       R_GetColumn entirely, so no composite, no patch, NO DISC.  The wall textures itself over the
+       next frames as the budget refills -- bounded loading, no hitch, no async machinery.
+       No distance test is needed: the BSP walk is front-to-back, so the budget is spent on the
+       NEAREST walls by construction and the far ones are what degrades. */
+    int io_flat_mid = midtexture    ? sat_wall_io_flat (midtexture)    : 0;
+    int io_flat_up  = toptexture    ? sat_wall_io_flat (toptexture)    : 0;
+    int io_flat_lo  = bottomtexture ? sat_wall_io_flat (bottomtexture) : 0;
+    int io_col_mid  = io_flat_mid ? sat_wall_flat_color (midtexture)    : 0;
+    int io_col_up   = io_flat_up  ? sat_wall_flat_color (toptexture)    : 0;
+    int io_col_lo   = io_flat_lo  ? sat_wall_flat_color (bottomtexture) : 0;
     for ( ; rw_x < rw_stopx ; rw_x++)
     {
 	/* SATURN L5: the CPU border columns of an edge-split wall (sat_we_on, armed in the claim
@@ -1700,9 +1761,11 @@ void R_RenderSegLoop (void)
 		dc_texturemid = rw_midtexturemid;
 		if (wall_solid)
 		    sat_wall_color = R_WallPotatoColor(midtexture);
+		else if (io_flat_mid)
+		    sat_wall_color = io_col_mid;   /* SATURN load budget: no disc this frame */
 		else
 		    dc_source = R_GetColumn(midtexture,texturecolumn);
-		sat_dc_solid = wall_solid;   /* SATURN: armed for WALL columns only (see r_draw.c) */
+		sat_dc_solid = wall_solid || io_flat_mid;   /* SATURN: armed for WALL columns only (see r_draw.c) */
 		colfunc ();
 		sat_dc_solid = 0;
 	    }
@@ -1710,8 +1773,9 @@ void R_RenderSegLoop (void)
 	    {
 		dc_texturemid = rw_midtexturemid;
 		int lflat = wall_solid || sat_lead_flat;   /* see sat_lead_flat */
-		if (lflat) sat_wall_color = R_WallPotatoColor(midtexture);
-		else       dc_source = R_GetColumn(midtexture, texturecolumn);
+		if (lflat)            sat_wall_color = R_WallPotatoColor(midtexture);
+		else if (io_flat_mid) { sat_wall_color = io_col_mid; lflat = 1; }
+		else                  dc_source = R_GetColumn(midtexture, texturecolumn);
 		sat_dc_solid = lflat;
 		sat_lead_draw (&sat_lead_mid, rw_x, yl, yh);
 		sat_dc_solid = 0;
@@ -1745,9 +1809,11 @@ void R_RenderSegLoop (void)
 			dc_texturemid = rw_toptexturemid;
 			if (wall_solid)
 			    sat_wall_color = R_WallPotatoColor(toptexture);
+			else if (io_flat_up)
+			    sat_wall_color = io_col_up;
 			else
 			    dc_source = R_GetColumn(toptexture,texturecolumn);
-			sat_dc_solid = wall_solid;   /* SATURN: WALL columns only (see r_draw.c) */
+			sat_dc_solid = wall_solid || io_flat_up;   /* SATURN: WALL columns only (see r_draw.c) */
 			colfunc ();
 			sat_dc_solid = 0;
 		    }
@@ -1755,8 +1821,9 @@ void R_RenderSegLoop (void)
 		    {
 			dc_texturemid = rw_toptexturemid;
 			int lflat = wall_solid || sat_lead_flat;   /* see sat_lead_flat */
-			if (lflat) sat_wall_color = R_WallPotatoColor(toptexture);
-			else       dc_source = R_GetColumn(toptexture, texturecolumn);
+			if (lflat)           sat_wall_color = R_WallPotatoColor(toptexture);
+			else if (io_flat_up) { sat_wall_color = io_col_up; lflat = 1; }
+			else                 dc_source = R_GetColumn(toptexture, texturecolumn);
 			sat_dc_solid = lflat;
 			sat_lead_draw (&sat_lead_up, rw_x, yl, mid);
 			sat_dc_solid = 0;
@@ -1797,10 +1864,12 @@ void R_RenderSegLoop (void)
 			dc_texturemid = rw_bottomtexturemid;
 			if (wall_solid)
 			    sat_wall_color = R_WallPotatoColor(bottomtexture);
+			else if (io_flat_lo)
+			    sat_wall_color = io_col_lo;
 			else
 			    dc_source = R_GetColumn(bottomtexture,
 						    texturecolumn);
-			sat_dc_solid = wall_solid;   /* SATURN: WALL columns only (see r_draw.c) */
+			sat_dc_solid = wall_solid || io_flat_lo;   /* SATURN: WALL columns only (see r_draw.c) */
 			colfunc ();
 			sat_dc_solid = 0;
 		    }
@@ -1808,8 +1877,9 @@ void R_RenderSegLoop (void)
 		    {
 			dc_texturemid = rw_bottomtexturemid;
 			int lflat = wall_solid || sat_lead_flat;   /* see sat_lead_flat */
-			if (lflat) sat_wall_color = R_WallPotatoColor(bottomtexture);
-			else       dc_source = R_GetColumn(bottomtexture, texturecolumn);
+			if (lflat)           sat_wall_color = R_WallPotatoColor(bottomtexture);
+			else if (io_flat_lo) { sat_wall_color = io_col_lo; lflat = 1; }
+			else                 dc_source = R_GetColumn(bottomtexture, texturecolumn);
 			sat_dc_solid = lflat;
 			sat_lead_draw (&sat_lead_lo, rw_x, mid, yh);
 			sat_dc_solid = 0;

@@ -22,6 +22,15 @@
 /* Called from R_RenderPlayerView (r_main.c). */
 void RP_BeginFrame(void);
 void RP_MarkBSPDone(void);   /* after the BSP walk, before R_DrawPlanes (profiler) */
+/* SATURN 2026-08-06: SPLIT `P` INTO ITS PARTS.  Row-2 `P` is NOT "the planes" -- it is everything
+   between RP_MarkBSPDone and RP_BeginMasked, and the owner was right to challenge a 191.9 ms `P`
+   on a frame showing one floor, sky and distant walls.  That interval contains FIVE things, two of
+   which are WAITS: the VDP1 wall kick (`sat_walls_done_hook`, which also runs R_DrawPlayerSprites
+   -> weapon projection + its VDP1 texture bake, i.e. a possible disc read), 2x NetUpdate, the
+   lead-fill slave dispatch + RP_LeadJoin (an FRT-bounded spin on the 2nd SH-2), R_DrawPlanes
+   itself, and 2 canaries.  RP_MarkP stamps the boundaries so row 20 `PSP` can name the culprit.
+   Slots: 0 = after the VDP1 kick, 1 = just before R_DrawPlanes, 2 = just after R_DrawPlanes. */
+void RP_MarkP(int slot);
 void RP_BeginMasked(void);
 void RP_EndFrame(void);
 

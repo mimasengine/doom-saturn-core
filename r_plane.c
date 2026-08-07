@@ -35,6 +35,7 @@
 #include "r_local.h"
 #include "r_sky.h"
 #include "r_parallel.h"	/* SATURN PERF Phase-0a: RP_FlatCache/MakeSpans brackets (profiler) */
+#include "r_flatcache.h"	/* SATURN: resident flat pool -- kills the per-frame flat re-read */
 
 
 
@@ -1162,6 +1163,13 @@ unsigned char *sat_vdp2_floor_data(void)
    colour instead of texture-mapping them (big EX/fillrate win).  Set by the
    platform; default 0 (vanilla textured floors, incl. DoomJo). */
 int sat_potato_floors = 0;
+/* SATURN per-frame texture LOAD BUDGET, plane half (walls own the budget in r_segs.c). */
+extern int sat_tex_load_budget, sat_tex_load_spent;
+extern int W_LumpResident (int lump);
+extern int R_FlatPotatoColorPeek (int lumpnum);
+int sat_plane_flat_io    = 0;   /* visplanes drawn potato for want of residency (~1 s window)  */
+int sat_plane_flat_nocol = 0;   /* ...of which we had no cached dominant colour either         */
+#define SAT_FLAT_UNKNOWN 100    /* neutral index; ds_colormap still shades it by distance       */
 int sat_floor_ld = 0;   /* pot0.5: half-rate textured-floor fill (forward-declared above) */
 /* SATURN: independent CEILING software quality (M/SQ refactor).  sat_potato_floors/sat_floor_ld
    above act on floors; these mirror them for ceilings so SQ_ceil can differ from SQ_floor.
@@ -1493,10 +1501,59 @@ void R_DrawPlanes (void)
 	int is_ceil = (pl->height > viewz);
 	int eff_potato = is_ceil ? sat_ceil_potato : sat_potato_floors;
 	int eff_ld     = is_ceil ? sat_ceil_ld     : sat_floor_ld;
+	int   io_flat_plane = 0; /* SATURN load budget: 1 = flat NOT loaded this frame (see below) */
+	int   flat_locked   = 0; /* SATURN: 1 = a W_CacheLumpNum lock was taken -> MUST be released */
+	int   flat_paid     = 0; /* SATURN: 1 = the budget paid for a real load this frame */
+	byte *fc_src        = NULL;   /* SATURN: resident flat-pool slot (no zone block, no lock) */
 	if (eff_potato) sat_floor_color = R_FlatPotatoColor(lumpnum);  /* dominant/avg, cached */
+	else
+	{
+	/* SATURN RESIDENT FLAT POOL (r_flatcache.c).  Ask the pool FIRST: a pooled flat lives in
+	   the slab, NOT in lumpinfo[].cache, so W_LumpResident would report it missing and the
+	   load budget below would gate a flat that is already in RAM.  A hit here is the whole
+	   point of the pool -- no disc, no zone block, no lock to release. */
+	fc_src = R_FlatCachePeek (lumpnum);
+	/* SATURN LOAD BUDGET (flats, 2026-08-06 -- the `P` half of the same defect as the walls).
+	   The fetch below is a SYNCHRONOUS ~42 ms disc read in the streaming build when the flat
+	   is not resident, charged to `P`: that is the P=149/229/284 ms frames in the owner's TNT
+	   captures, and why an OUTDOOR map with almost no flat floor still spiked.  Past the frame's
+	   budget, draw the plane in POTATO (one dominant colour, the existing w->potato path, which
+	   reads w->color and never touches w->src) and skip the load entirely. */
+	if (!fc_src && sat_tex_load_budget && !W_LumpResident (lumpnum))
+	{
+	    if (sat_tex_load_spent < sat_tex_load_budget)
+	    {
+		sat_tex_load_spent++;
+		flat_paid = 1;
+	    }
+	    else
+	    {
+		int c = R_FlatPotatoColorPeek (lumpnum);   /* MUST peek: R_FlatPotatoColor reads the lump */
+		if (c < 0) { c = SAT_FLAT_UNKNOWN; sat_plane_flat_nocol++; }
+		sat_floor_color = c; eff_potato = 1; io_flat_plane = 1; sat_plane_flat_io++;
+	    }
+	}
+	/* Fill a pool slot -- THE disc read, once per flat per residency instead of once per plane
+	   per frame.  NULL = not poolable (no slab, not 4096 bytes, or every slot is already in use
+	   by this view) -> fall through to the classic zone path below, exactly as before. */
+	if (!fc_src && !io_flat_plane)
+	    fc_src = R_FlatCacheGet (lumpnum);
+	}
 	RP_FlatCacheEnter();   /* SATURN PERF Phase-0a: per-visplane flat allocator cost (c P) */
-	ds_source = W_CacheLumpNum(lumpnum, PU_STATIC);
+	if (fc_src)
+	    ds_source = fc_src;                                   /* pooled: nothing to release */
+	else if (!io_flat_plane)
+	{
+	    ds_source = W_CacheLumpNum(lumpnum, PU_STATIC);
+	    flat_locked = 1;                                      /* the lock the release sites undo */
+	}
 	RP_FlatCacheLeave();
+	/* PRIME the dominant colour on the frame the budget decides to PAY, now that the flat IS in
+	   memory (pool slot or zone block -- R_FlatPotatoColor peeks the pool, so this never costs a
+	   second read).  It is otherwise only called by the potato mode, which is off in normal play,
+	   so the cache stayed empty and every gated plane fell back to neutral grey: measured
+	   `nocol` == the plane count on the owner's captures. */
+	if (flat_paid) R_FlatPotatoColor (lumpnum);
 
 	planeheight = abs(pl->height-viewz);
 	light = (pl->lightlevel >> LIGHTSEGSHIFT)+extralight;
@@ -1824,7 +1881,8 @@ void R_DrawPlanes (void)
 	    }
 	    if (!partial && !swband)
 	    {
-		W_ReleaseLumpNum(lumpnum);   /* we cached it above but skip the draw -> release the lock */
+		if (flat_locked)             /* SATURN: 0 = gated (load budget) or POOLED -> no lock */
+		    W_ReleaseLumpNum(lumpnum);   /* we cached it above but skip the draw -> release the lock */
 		continue;
 	    }
 	    /* partial/swband: FALL THROUGH -- the regular span path below draws the software part
@@ -1853,7 +1911,13 @@ void R_DrawPlanes (void)
 	{
 	    planework_t *w = &plane_worklist[plane_worklist_n++];
 	    w->pl = pl; w->src = ds_source; w->plzlight = planezlight;
-	    w->plheight = planeheight; w->potato = eff_potato; w->ld = eff_ld; w->lumpnum = lumpnum;
+	    /* SATURN: lumpnum -1 = NO ZONE LOCK WAS TAKEN for this plane -- either the load budget
+	       gated it, or (2026-08-06) the flat came from the RESIDENT POOL, which is not a zone
+	       block at all.  The drain below must NOT release a lock we never took: W_ReleaseLumpNum
+	       would Z_ChangeTag a NULL cache pointer ("block without a ZONEID").  `w->src` still
+	       points at the pool slot, which the LRU cannot reuse while this view is being drawn. */
+	    w->plheight = planeheight; w->potato = eff_potato; w->ld = eff_ld;
+	    w->lumpnum = flat_locked ? lumpnum : -1;
 	    w->color = sat_floor_color;
 	    continue;
 	}
@@ -1871,7 +1935,7 @@ void R_DrawPlanes (void)
 	RP_MakeSpansLeave();
 
 	RP_FlatCacheEnter();
-        W_ReleaseLumpNum(lumpnum);
+        if (flat_locked) W_ReleaseLumpNum(lumpnum);   /* SATURN: 0 = gated or POOLED -> no lock taken */
 	RP_FlatCacheLeave();
         } /* SATURN: end sorted visplane loop */
     }
@@ -1914,7 +1978,8 @@ void R_DrawPlanes (void)
         else
             R_DrawPlaneWorklist(0, n);       /* MP / single plane / DoomJo: MASTER-ONLY */
         for (i = 0; i < n; i++)
-            W_ReleaseLumpNum(plane_worklist[i].lumpnum);
+            if (plane_worklist[i].lumpnum >= 0)      /* -1 = never cached (load budget) */
+                W_ReleaseLumpNum(plane_worklist[i].lumpnum);
     }
 #endif
 

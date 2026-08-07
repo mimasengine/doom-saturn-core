@@ -139,12 +139,17 @@ int sat_sprite_rotlod_dist = 0;
    NON-occlusion-clipped for now (viewport/system-clip only): a nearer wall does not yet hide a
    farther thing (that is the FUNC_UserClip follow-up).  NULL on DoomJo -> pure software. */
 int (*sat_thing_hook)(patch_t *patch, int lump, const unsigned char *cmap,
+                      const unsigned char *xlat,               /* SATURN: player-colour remap, NULL = none */
                       int x0, int y0, int x1, int y1,          /* sprite screen quad (full-res) */
                       int cx0, int cy0, int cx1, int cy1,      /* visible clip rect (occlusion)  */
                       int flip) = 0;
 int sat_things_emitted = 0;                 /* 1 = things went to VDP1 this view -> R_DrawMasked skips them */
 int sat_things_occ = 0;                     /* fully-occluded sprites skipped this frame (occlusion metric) */
 int sat_thing_cap = 4;                      /* platform sets = VDP1 thing slots/frame (VRAM cap); nearest win */
+/* SATURN per-frame texture LOAD BUDGET, sprite third (walls own the budget in r_segs.c). */
+extern int sat_tex_load_budget, sat_tex_load_spent;
+extern int W_LumpResident (int lump);
+int sat_spr_flat_io = 0;                    /* sprites skipped for want of residency (~1 s window) */
 int sat_things_hw = 1;                      /* platform (sat_apply_mode): 1 = world sprites on VDP1; 0 = software (M0/M6) */
 
 /* SATURN (2026-07-19): VDP1 sprite FILL budget -- the monster-BLINK fix.  The blink is a VDP1
@@ -591,6 +596,17 @@ R_DrawVisSprite
     extern void RP_SprFillEnter(void); extern void RP_SprFillLeave(void);
     RP_SprFillEnter();
 
+    /* SATURN LOAD BUDGET (sprite patches, 2026-08-06 -- the `M` third of the same defect as the
+       walls and flats).  In the streaming build a sprite patch that is not resident costs a
+       SYNCHRONOUS ~42 ms disc read here, charged to `M` (PK M109 in the owner's TNT captures).
+       Past the frame's budget the sprite is simply NOT DRAWN this frame: it appears one or two
+       frames later, which is invisible next to a 42 ms stall, and there is no half-state to
+       clean up (no clip arrays are written for a sprite). */
+    if (sat_tex_load_budget && !W_LumpResident (vis->patch + firstspritelump))
+    {
+	if (sat_tex_load_spent < sat_tex_load_budget) sat_tex_load_spent++;
+	else { sat_spr_flat_io++; RP_SprFillLeave(); return; }
+    }
     patch = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
 
     dc_colormap = vis->colormap;
@@ -1467,6 +1483,11 @@ static void R_SlaveDrawSpriteCol (column_t* column, int write_x, int clip_x, int
 static void R_SlaveDrawVisSprite (vissprite_t* vis)
 {
     column_t *column; int texturecolumn; fixed_t frac; patch_t *patch;
+    /* SATURN load budget -- see R_DrawVisSprite.  The SLAVE must never do disc I/O at all, so it
+       skips unconditionally on a miss rather than spending the budget (the master's own pass over
+       the other half will fault it in when the budget allows). */
+    if (sat_tex_load_budget && !W_LumpResident (vis->patch + firstspritelump))
+	{ sat_spr_flat_io++; return; }
     patch = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
     s_dc_colormap = vis->colormap;
     if (!s_dc_colormap)
@@ -1626,16 +1647,30 @@ void R_SlaveDrawMasked (int x0, int x1)
    (sat_walls_kick), clamped to [0, THING_EMIT_MAX] by PASS 1.  Shared with the platform. */
 int sat_thing_emit_cap = 4;
 
+/* SATURN: the other players' colour remap (MF_TRANSLATION -> indigo/brown/red marine), NULL for
+   everything else.  Same table the software R_DrawTranslatedColumn indexes; the platform applies it
+   ONCE at bake time (texel = cmap[xlat[src]], the software order) and keys its texture cache on it,
+   so two players sharing a sprite frame get two slots instead of one wrong colour.
+   Until 2026-08-05 a translated sprite was rejected outright, which made the OTHER PLAYERS the only
+   class of thing still filled by the CPU -- at FULL resolution (the half-res masked path skips
+   fuzz/translated too) and in EVERY view of the split.  They are also the sprites a co-op/DM player
+   looks at most.  Note the asymmetry that hid this: player 1 is UNtranslated, so P2's view already
+   offloaded P1 while P1's view could not offload P2. */
+static const unsigned char *R_ThingXlat (vissprite_t *spr)
+{
+    if (!(spr->mobjflags & MF_TRANSLATION)) return NULL;
+    return (const unsigned char *)(translationtables - 256
+            + ((spr->mobjflags & MF_TRANSLATION) >> (MF_TRANSSHIFT-8)));
+}
+
 /* On-screen area (wpx*hpx = the software fill this sprite would cost) or -1 if it must stay
-   software (fuzz/shadow, other-player translation, degenerate).  Shared by the two selection
-   passes; W_CacheLumpNum here is a cheap cache hit (the patch is (re)cached for the software draw
-   anyway). */
+   software (fuzz/shadow, degenerate).  Shared by the two selection passes; W_CacheLumpNum here is a
+   cheap cache hit (the patch is (re)cached for the software draw anyway). */
 static long R_ThingScreenArea (vissprite_t *spr)
 {
     int      patchw, wpx, hpx;
     patch_t *patch;
     if (!spr->colormap)                  return -1;   /* fuzz/shadow -> software */
-    if (spr->mobjflags & MF_TRANSLATION) return -1;   /* other-player colour -> software */
     patchw = spritewidth[spr->patch] >> FRACBITS;
     if (patchw < 1) return -1;
     patch = W_CacheLumpNum (spr->patch+firstspritelump, PU_CACHE);
@@ -1686,6 +1721,7 @@ void R_EmitWorldThingsVDP1 (void)
 	long          actor_floor = (long)viewwidth * viewheight * THING_ACTOR_SCREEN_PM / 1000;
 	int           tk_lump[THING_TEX_TRACK];
 	lighttable_t *tk_cmap[THING_TEX_TRACK];
+	const unsigned char *tk_xlat[THING_TEX_TRACK]; /* SATURN: player-colour remap = 3rd key axis */
 	long          tk_area[THING_TEX_TRACK];        /* largest sprite area seen per distinct texture */
 	char          tk_actor[THING_TEX_TRACK];       /* 1 = texture belongs to a shootable actor (monster/barrel) */
 	char          tk_grant[THING_TEX_TRACK];
@@ -1697,13 +1733,14 @@ void R_EmitWorldThingsVDP1 (void)
 	    long area     = R_ThingScreenArea (spr);
 	    int  is_actor = (spr->mobjflags & MF_SHOOTABLE) != 0;   /* monster/barrel -> lower floor + priority */
 	    long fl       = is_actor ? actor_floor : area_floor;
+	    const unsigned char *xl = R_ThingXlat (spr);
 	    int  j;
 	    if (area < fl) continue;                     /* ineligible (-1) or below the floor -> software */
 	    for (j = 0 ; j < ntk ; j++)
-		if (tk_lump[j] == spr->patch && tk_cmap[j] == spr->colormap) break;
+		if (tk_lump[j] == spr->patch && tk_cmap[j] == spr->colormap && tk_xlat[j] == xl) break;
 	    if (j < ntk) { if (area > tk_area[j]) tk_area[j] = area; }
 	    else if (ntk < THING_TEX_TRACK)
-	    { tk_lump[ntk] = spr->patch; tk_cmap[ntk] = spr->colormap; tk_area[ntk] = area;
+	    { tk_lump[ntk] = spr->patch; tk_cmap[ntk] = spr->colormap; tk_xlat[ntk] = xl; tk_area[ntk] = area;
 	      tk_actor[ntk] = (char)is_actor; tk_grant[ntk] = 0; ntk++; }
 	}
 	/* grant the cap slots: shootable ACTORS first (monsters get a VDP1 texture slot ahead of any
@@ -1739,10 +1776,11 @@ void R_EmitWorldThingsVDP1 (void)
 		long area = R_ThingScreenArea (spr);
 		int  is_actor = (spr->mobjflags & MF_SHOOTABLE) != 0;
 		long key, fl = is_actor ? actor_floor : area_floor;
+		const unsigned char *xl = R_ThingXlat (spr);
 		if (idx < 0 || idx >= MAXVISSPRITES) continue;
 		if (area < fl) continue;
 		for (j = 0 ; j < ntk ; j++)
-		    if (tk_lump[j] == spr->patch && tk_cmap[j] == spr->colormap) break;
+		    if (tk_lump[j] == spr->patch && tk_cmap[j] == spr->colormap && tk_xlat[j] == xl) break;
 		if (j >= ntk || !tk_grant[j]) continue;   /* texture not granted -> software */
 		/* rank key: shootable actors sit above ALL decorations (bit 20 >> max sprite area ~64000).
 		   SATURN: rank actors by DISTANCE (spr->scale), NOT on-screen area -- the area pulses with
@@ -1797,6 +1835,20 @@ void R_EmitWorldThingsVDP1 (void)
 	if (idx < 0 || idx >= MAXVISSPRITES)   continue;
 	if (!sat_thing_elig[idx])              continue;   /* outranked (decoration / over budget) -> software */
 
+	/* SATURN LOAD BUDGET, the VDP1-EMIT third -- the one sprite path that was never gated.
+	   MEASURED 2026-08-07, TNT MAP11: row 20 read e260 / c256 / n7, i.e. this single
+	   W_CacheLumpNum was faulting 2..7 sprite patches off the CD PER FRAME at ~37 ms each, and
+	   98% of R_EmitWorldThingsVDP1 -- which is essentially all of `P` -- was disc wait.  With
+	   the budget at 1 (`lb1` on the VRM row) the frame was still taking seven faults, because
+	   R_DrawVisSprite and R_SlaveDrawVisSprite honour sat_tex_load_budget and this one did not.
+	   Refuse instead: leave sat_thing_vdp1[idx] CLEAR so the sprite falls through to the
+	   software path, which applies the same budget and skips it too.  It appears one or two
+	   frames later -- invisible next to a 250 ms stall, and no half-state to clean up. */
+	if (sat_tex_load_budget && !W_LumpResident (spr->patch + firstspritelump))
+	{
+	    if (sat_tex_load_spent < sat_tex_load_budget) sat_tex_load_spent++;
+	    else { sat_spr_flat_io++; continue; }
+	}
 	patch  = W_CacheLumpNum (spr->patch+firstspritelump, PU_CACHE);
 	patchw = spritewidth[spr->patch] >> FRACBITS;
 	if (patchw < 1) continue;
@@ -1845,7 +1897,7 @@ void R_EmitWorldThingsVDP1 (void)
 	cy0 = vtop + viewwindowy;
 	cy1 = vbot + viewwindowy;
 
-	if (sat_thing_hook (patch, spr->patch, spr->colormap,
+	if (sat_thing_hook (patch, spr->patch, spr->colormap, R_ThingXlat (spr),
 			    x0s, y0s, x1s, y1s, cx0, cy0, cx1, cy1, (int)(spr->xiscale < 0)))
 	    sat_thing_vdp1[idx] = 1;
     }
@@ -1883,7 +1935,16 @@ void R_DrawMasked (void)
 	       finds them already cached -> no concurrent zone alloc (which would race the heap
 	       off-cart / CD-streaming).  Cheap: a cached lump is just a pointer return. */
 	    for (spr = vsprsortedhead.next ; spr != &vsprsortedhead ; spr=spr->next)
+	    {
+		/* SATURN LOAD BUDGET: with the budget on, do NOT fault a non-resident patch here --
+		   this loop is unbounded (it walks EVERY vissprite, n102 in one TNT capture), so it
+		   would simply move the disc cost the emit gate just refused from `P` to `M`.  Safe
+		   to skip: R_SlaveDrawVisSprite refuses non-resident lumps outright when the budget
+		   is on, so the slave still never allocates concurrently -- which is the only thing
+		   this pre-cache pass exists to guarantee. */
+		if (sat_tex_load_budget && !W_LumpResident (spr->patch + firstspritelump)) continue;
 		W_CacheLumpNum (spr->patch+firstspritelump, PU_CACHE);
+	    }
 	    masked_split = 1;
 	    RP_DispatchMasked (half, viewwidth);   /* slave: vissprites in [half, viewwidth) */
 	    g_mask_x1 = half;                       /* master: vissprites in [0, half)       */

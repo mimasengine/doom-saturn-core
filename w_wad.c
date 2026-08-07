@@ -67,6 +67,14 @@ unsigned int numlumps = 0;
 // read was sunk (see W_ReadLump below).
 int r_readlump_short = 0;
 
+/* SATURN 2026-08-07: cumulative W_ReadLump calls = LUMPS actually pulled off the medium.  The
+   platform's sat_cd_loads counts GFS *chunk commands* (several per big lump) and lives outside
+   core, so it cannot be read from here; this one is core, so p_setup.c can bracket the level-load
+   phases with it and DoomJo still compiles.  Answers "the load is 4704 CD commands -- issued BY
+   WHAT?" ([[streaming-load-budget-and-flat-treadmill]]).  Cart builds read every lump once at
+   W_AddFile and never again, so this stays flat there. */
+int w_lump_reads = 0;
+
 // SATURN R4.3c: the single WAD file backing every lump (was a per-lump lumpinfo.wad_file
 // pointer -- dropped to save 4B/lump off the zone).  Set once by W_AddFile; a second file
 // trips a loud guard there.  All read sites below use this instead of lump->wad_file.
@@ -378,6 +386,7 @@ void W_ReadLump(unsigned int lump, void *dest)
     }
 
     l = lumpinfo+lump;
+    w_lump_reads++;
 
     I_BeginRead ();
 
@@ -425,6 +434,52 @@ void W_ReadLump(unsigned int lump, void *dest)
 
 
 
+/* (W_ReadHeaderSweep removed 2026-08-07 -- the .DRP R3.1 sprite index supersedes it and the
+   TLSF pool could not carry both.  See r_data.c R_InitSpriteLumps.) */
+
+/* SATURN 2026-08-07 -- PINNED LUMPS.  For the handful of lumps read EVERY frame, where the
+   allocate/purge/re-read cycle costs more than the residency.  Today that is exactly one: the SKY
+   PATCH.  Doom's sky is a single-patch texture, so `R_GetColumn(skytexture, x)` takes the
+   `collump[x] >= 0` path and calls W_CacheLumpNum on the whole patch -- **34 KB loaded to read one
+   128-byte column**, tagged PU_CACHE, purged by the next allocation, re-read next frame.  That one
+   lump was simultaneously the biggest recurring CD read AND the biggest contiguous request in the
+   zone: `Zmalloc fail 35104 t8 (fr205K lg32K)` is RSKY1 (35080 B + 24 B header, a 256x128 patch).
+   A 34 KB block making that round trip every frame is the worst fragmenter the zone can have, so
+   pinning it does not COST contiguity -- it BUYS it.
+   Kept deliberately tiny and fixed: this is not a cache, it is a short list of exceptions. */
+#define W_PIN_MAX 2
+static int w_pin[W_PIN_MAX] = { -1, -1 };
+
+int W_LumpPinned (int lumpnum)
+{
+    int i;
+    for (i = 0; i < W_PIN_MAX; i++)
+        if (w_pin[i] == lumpnum) return 1;
+    return 0;
+}
+
+void W_UnpinAll (void)
+{
+    int i;
+    for (i = 0; i < W_PIN_MAX; i++) w_pin[i] = -1;
+}
+
+/* Cache `lumpnum` with `tag` and mark it no-demote.  Pin AFTER the cache call so a re-pin of an
+   already-resident lump still gets its tag refreshed (a level boundary re-pins the same sky). */
+void W_PinLump (int lumpnum, int tag)
+{
+    int i;
+    if ((unsigned)lumpnum >= numlumps) return;
+    for (i = 0; i < W_PIN_MAX; i++)
+        if (w_pin[i] < 0)
+        {
+            W_CacheLumpNum (lumpnum, tag);
+            w_pin[i] = lumpnum;
+            return;
+        }
+}
+
+
 //
 // W_CacheLumpNum
 //
@@ -436,6 +491,18 @@ void W_ReadLump(unsigned int lump, void *dest)
 // PU_STATIC, it should be released back using W_ReleaseLumpNum
 // when no longer needed (do not use Z_ChangeTag).
 //
+
+/* SATURN: "would W_CacheLumpNum(lumpnum) do I/O?", answered WITHOUT doing any.  In the
+   CD-streaming build a miss is a synchronous ~42 ms disc read charged to whatever render phase
+   asked for it (`Bp` for a wall patch, `P` for a flat) -- this is the predicate the per-frame
+   load budget uses to decide "draw it flat this frame instead".  A memory-mapped WAD (cart) is
+   always resident. */
+int W_LumpResident (int lumpnum)
+{
+    if ((unsigned)lumpnum >= numlumps) return 1;    /* bogus -> caller will I_Error anyway */
+    if (w_wadfile && w_wadfile->mapped != NULL) return 1;
+    return lumpinfo[lumpnum].cache != NULL;
+}
 
 void *W_CacheLumpNum(int lumpnum, int tag)
 {
@@ -450,6 +517,8 @@ void *W_CacheLumpNum(int lumpnum, int tag)
     lump = &lumpinfo[lumpnum];
 
     // Get the pointer to return.  If the lump is in a memory-mapped
+    // (SATURN: W_LumpResident below answers "would this call do I/O?" -- see r_data.c
+    //  R_TextureIOFree and the wall load budget in r_segs.c)
     // file, we can just return a pointer to within the memory-mapped
     // region.  If the lump is in an ordinary file, we may already
     // have it cached; otherwise, load it into memory.
@@ -465,7 +534,11 @@ void *W_CacheLumpNum(int lumpnum, int tag)
         // Already cached, so just switch the zone tag.
 
         result = lump->cache;
-        Z_ChangeTag(lump->cache, tag);
+        /* SATURN: ...unless the lump is PINNED.  This retag is what defeats every attempt to keep
+           a hot lump resident: the first R_GetColumn asking for PU_CACHE demotes it and the
+           treadmill restarts.  Same defect the resident flat pool exists to fix. */
+        if (!W_LumpPinned (lumpnum))
+            Z_ChangeTag(lump->cache, tag);
     }
     else
     {

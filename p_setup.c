@@ -40,6 +40,7 @@
 
 #include "doomstat.h"
 #include "r_cache.h"
+#include "r_flatcache.h"
 
 
 void	P_SpawnMapThing (mapthing_t*	mthing);
@@ -49,6 +50,13 @@ void	P_SpawnMapThing (mapthing_t*	mthing);
 // MAP related Lookup tables.
 // Store VERTEXES, LINEDEFS, SIDEDEFS, etc.
 //
+/* SATURN 2026-08-07: the level-load lump probe (`S<lumps><tag><n>` on overlay row 12) lived here
+   and is REMOVED, having answered its question in one capture: **P_SetupLevel reads 73 lumps**
+   against a boot+load costing **4704 CD commands / 270 s** -- so the level load is NOT the load,
+   the BOOT is (R_InitSpriteLumps above all).  Its worst phase was `A`, the sfx precache, at 63 of
+   the 73.  Do not rebuild this probe to re-ask that question; see
+   [[streaming-load-budget-and-flat-treadmill]].  The core counter it used, `w_lump_reads`
+   (w_wad.c), stays -- it is two lines to bracket anything again. */
 int		numvertexes;
 vertex_t*	vertexes;
 
@@ -965,6 +973,11 @@ P_SetupLevel
     // slab that survives Z_FreeTags) and drop its composite back-pointers BEFORE
     // this level's geometry loads, so geometry gets the full free zone.
     R_ClearTextureCaches ();
+    /* SATURN: same contract for the resident flat pool -- its slab is PU_STATIC and would
+       otherwise survive Z_FreeTags as a MID-ZONE WALL while P_LoadSegs is asking for its one
+       big contiguous SEGS array (see [[zone-contiguity-wall-loadsegs]]).  Release it here,
+       re-carve after the geometry has landed. */
+    R_ClearFlatCache ();
 
     // UNUSED W_Profile ();
     P_InitThinkers ();
@@ -999,16 +1012,21 @@ P_SetupLevel
     }
 #endif
 
+    /* SATURN 2026-08-07: the level load costs 4704 CD commands / 270 s of disc on TNT MAP11
+       (overlay row 12 `L`).  Which CALL issues them?  Bracket each phase on w_lump_reads (core,
+       so DoomJo still compiles) and keep the TOTAL plus the single worst phase.  If the total is
+       small next to `L`, P_SetupLevel is NOT the load and the boot path (W_Init / R_Init / the
+       sprite index) owns it -- which is the first thing to know, and it is one capture away. */
     // note: most of this ordering is important
     P_LoadBlockMap (lumpnum+ML_BLOCKMAP);
     P_LoadVertexes (lumpnum+ML_VERTEXES);
-    P_LoadSectors (lumpnum+ML_SECTORS);
+    P_LoadSectors  (lumpnum+ML_SECTORS);
     P_LoadSideDefs (lumpnum+ML_SIDEDEFS);
 
     P_LoadLineDefs (lumpnum+ML_LINEDEFS);
-    P_LoadSubsectors (lumpnum+ML_SSECTORS);
-    P_LoadNodes (lumpnum+ML_NODES);
-    P_LoadSegs (lumpnum+ML_SEGS);
+    P_LoadSubsectors(lumpnum+ML_SSECTORS);
+    P_LoadNodes    (lumpnum+ML_NODES);
+    P_LoadSegs     (lumpnum+ML_SEGS);
 
     P_GroupLines ();
     P_LoadReject (lumpnum+ML_REJECT);
@@ -1052,6 +1070,22 @@ P_SetupLevel
     // SATURN: carve the bounded streaming texture-cache pool from whatever
     // contiguous zone RAM is left after this level's geometry (no-op unless
     // sat_streaming_mode).  Done last so geometry never competes with the pool.
+    /* SATURN: carve the resident flat pool BEFORE the composite pool.  Flats are the measured
+       binding CD sink in play (80..221 non-resident fetches/s on TNT MAP11 vs 0..4 composite
+       rebuilds), and unlike composites they are re-read on EVERY frame they are visible, so
+       when only one slab fits, flats are the one that must get it. */
+    /* SATURN 2026-08-07: GROUP the long-lived slabs LOW.  Both carves below are PU_STATIC and
+       outlive the frame, so wherever they land they are a permanent cut through the free space --
+       and left to the rover they land HIGH, right after the geometry that was just loaded, i.e. in
+       the middle of the run gameplay needs.  Rewinding the rover first drops them into the lowest
+       hole that fits, packed against the boot statics (lumpinfo / visplane pool / .DRP table).
+       The problem these halts kept showing is the NUMBER OF CUTS, not any one block's size:
+       `fr190K lg32K` = 190 KB free and never 34 KB in one piece.  Fewer, lower cuts = longer runs.
+       Order is unchanged (flats before composites, both AFTER the geometry) -- carving before
+       P_LoadSegs is what [[zone-contiguity-wall-loadsegs]] proved fatal on TNT MAP19. */
+    Z_RoverToStart ();
+    R_SetupFlatCache ();
+    Z_RoverToStart ();
     R_SetupTextureCaches ();
 
 #ifdef SAT_SND_PRECACHE
@@ -1060,7 +1094,8 @@ P_SetupLevel
     // so there is no OOM risk; the win is largest in streaming mode (it also moves the
     // blocking CD read to the load screen).  Skipped for demos (precache == false).
     if (precache)
-        SAT_PrecacheLevelSounds ();
+        SAT_PrecacheLevelSounds ();   /* 63 of P_SetupLevel's 73 lumps -- its biggest phase, and
+                                         still negligible next to the 4704-command boot */
 #endif
 
 #ifdef SAT_REPACK

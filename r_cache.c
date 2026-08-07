@@ -126,10 +126,11 @@ void R_SetupTextureCaches (void)
     // contiguous patch (smallest margin = 64K) so the play tail never re-fragments
     // below it.  Rungs derive from TEXCACHE_FIXED/MARGIN so the Makefile override
     // still tunes the top rung.  DoomJo (sat_streaming_mode==0) never reaches here.
-    static const int rungs[3][2] = {
+    static const int rungs[4][2] = {
         { TEXCACHE_FIXED,       TEXCACHE_MARGIN       },   // 96K + 128K (best)
         { TEXCACHE_FIXED*2/3,   TEXCACHE_MARGIN*3/4   },   // 64K + 96K
-        { TEXCACHE_FIXED/2,     TEXCACHE_MARGIN/2     },   // 48K + 64K (floor)
+        { TEXCACHE_FIXED/2,     TEXCACHE_MARGIN/2     },   // 48K + 64K
+        { TEXCACHE_FIXED/3,     TEXCACHE_MARGIN/2     },   // 32K + 64K (floor, added 2026-08-06)
     };
     int largest, sz, i;
 
@@ -147,6 +148,23 @@ void R_SetupTextureCaches (void)
     // composite seen by EITHER player is re-touched); 3-4p would want once-per-frame
     // aging.  The alloc path still gates on sat_xsplit.  DoomJo (sat_streaming_mode
     // == 0) is unaffected.
+    /* SATURN 2026-08-06/07: the 1p exclusion was LIFTED and then RESTORED THE SAME DAY -- the old
+       verdict was right and I overrode a MEASURED result with an argument.  The reasoning was: half
+       the PU_CACHE traffic this exclusion protects was the flat treadmill, and flats have now left
+       the zone for the resident pool (core/r_flatcache.c), so 1p composites should be affordable.
+       What that ignored is that the flat pool is ALSO a PU_STATIC slab: on TNT MAP11 it takes its
+       32 KB rung out of a zone with only ~194 KB free and ~26 KB CONTIGUOUS, so adding a second slab
+       on top STARVES what is left instead of freeing it.  MEASURED on the owner's captures, same map,
+       same spot:
+           flat pool alone        fps  9.7 .. 21     (lg 22..37 KB)
+           + 1p composite cache   fps  0.9 .. 6.8    (lg 21..26 KB)   <- 3-4x SLOWER
+       and the boot itself crawled (a long wait to reach M_Init, then FRAME1 OK).  Mechanism: in a
+       starved, fragmented zone every Z_Malloc walks and purges the WHOLE block list, then the
+       z_emergency path RESCANS it -- O(blocks) twice, per allocation.  That is also the likeliest
+       reading of the bimodal kick tail (row 20 `T` = 86/118/232 ms with NO disc: `t`=0, `b`=0),
+       because R_EmitWorldThingsVDP1 allocates inside it.
+       ⚠ DO NOT re-lift this without first freeing REAL contiguous zone -- and judge it on FPS, which
+       is what moved 3-4x, not only on the cumulative CD counters. */
     if (!sat_streaming_mode || sat_local_players <= 1)
         return;
 
@@ -158,8 +176,14 @@ void R_SetupTextureCaches (void)
     // cacheless (the proven-playable baseline).
     largest = Z_LargestAllocatable ();
     sat_texcache_carve_lf = largest >> 10;   // diag: the run the carve saw (overlay TXC lf)
+    /* A 4th, SMALLER rung (32K slab, same 64K margin floor -- the margin is what serves the ~35 KB
+       sky/face contiguous patches, so it must NOT shrink further).  Needed because the resident flat
+       pool now carves FIRST and takes up to 64 KB: on TNT MAP11 the ladder took its 8-slot rung,
+       which means Z_LargestAllocatable was 96..129 KB at load, so after the flat slab the old 48+64
+       floor could never fit and the 1p composite cache would have measured "off" while looking
+       enabled.  32 KB still holds a good handful of the visible composites. */
     sz = 0;
-    for (i = 0; i < 3; i++)
+    for (i = 0; i < 4; i++)
         if (largest >= rungs[i][0] + rungs[i][1]) { sz = rungs[i][0]; break; }
     if (!sz)
         return;                       // even the 48K rung won't fit -> cacheless

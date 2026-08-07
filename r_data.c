@@ -35,6 +35,7 @@
 #include "doomstat.h"
 #include "r_sky.h"
 #include "r_cache.h"
+#include "r_flatcache.h"
 
 
 #include "r_data.h"
@@ -162,6 +163,15 @@ byte**			texturecomposite;
 // placeholder, never a crash/OOB).  256 bytes covers any standard Doom column height; zero-init.
 byte			r_column_stub[256];
 int			r_composite_ovf = 0;   // # textures stubbed (extern, overlay 'tc')
+/* SATURN garde-PATCH: columns served from the placeholder because the zone had no run big enough
+   for the whole patch (see R_GetColumn).  Cumulative.  >0 means walls are drawing flat somewhere
+   AND that this build would have HALTED before 2026-08-07 -- it is the crash, made measurable. */
+int			r_patch_ovf = 0;
+/* SATURN: composites BUILT this ~1 s window.  R_GenerateComposite is a 8..32 KB column copy with
+   NO disc read when the patches are still cached -- so the load budget's W_LumpResident predicate
+   answers "free" and lets it through.  If `Bp` spikes track this counter, the cost is the REBUILD,
+   not the CD, and the fix is to stop the composite being purged (or to key the budget on it too). */
+int			r_composite_builds = 0;
 
 // for global animation
 int*		flattranslation;
@@ -242,6 +252,7 @@ static void R_EnsureLookup (int tex);
 void R_GenerateComposite (int texnum)
 {
     byte*		block;
+    extern int		r_composite_builds;
     int			cached = 0;
     texture_t*		texture;
     texpatch_t*		patch;	
@@ -259,6 +270,7 @@ void R_GenerateComposite (int texnum)
     // SATURN R4: build the column directory + compositesize if never built or purged, then
     // PIN it PU_STATIC across the composite alloc below (which can purge PU_CACHE) -- we read
     // collump/colofs from it after the alloc.  Unpinned at the end.
+    r_composite_builds++;
     R_EnsureLookup (texnum);
     Z_ChangeTag (texturecolumnlump[texnum], PU_STATIC);
     Z_ChangeTag (texturecolumnofs[texnum],  PU_STATIC);
@@ -322,6 +334,13 @@ void R_GenerateComposite (int texnum)
 	 i<texture->patchcount;
 	 i++, patch++)
     {
+	/* SATURN garde-PATCH, third and last site (see R_GenerateLookup).  Skip a patch the zone
+	   cannot hold rather than I_Error: the composite is already allocated, so the missing patch
+	   just leaves its columns as they are -- a partial texture, which is what the neighbouring
+	   garde-COMPOSITE already accepts. */
+	if (!W_LumpResident (patch->patch)
+	    && Z_LargestAllocatable () < W_LumpLength (patch->patch) + 64)
+	{ r_patch_ovf++; continue; }
 	realpatch = W_CacheLumpNum (patch->patch, PU_CACHE);
 	x1 = patch->originx;
 	x2 = x1 + SHORT(realpatch->width);
@@ -394,12 +413,35 @@ void R_GenerateLookup (int texnum)
     //  with only a single patch are all done.
     patchcount = (byte *) Z_Malloc(texture->width, PU_STATIC, &patchcount);
     memset (patchcount, 0, texture->width);
+    /* SATURN 2026-08-07: pre-seed the directory to "use the composite" (-1) BEFORE anything can
+       return early.  R_EnsureLookup allocates these two arrays UNINITIALISED and trusts this
+       function to fill them, so ANY early exit used to leave garbage that R_GetColumn then fed to
+       W_CacheLumpNum -- the `W_CacheLumpNum: 32122 >= numlumps` halt.  That was latent in the
+       vanilla "column without a patch" return too; the garde-PATCH bail-out below just made it
+       reachable.  Seeded, every early exit degrades to the composite path, which has its own OOM
+       sentinel (r_column_stub) -- a flat wall, never a crash. */
+    for (x = 0 ; x < texture->width ; x++) { collump[x] = -1; colofs[x] = 0; }
     patch = texture->patches;
 
     for (i=0 , patch = texture->patches;
 	 i<texture->patchcount;
 	 i++, patch++)
     {
+	/* SATURN garde-PATCH (2026-08-07), the site that actually fires.  R4 builds this directory
+	   LAZILY, on the first frame that touches the texture -- which is why the halt happens "au
+	   chargement" (the owner's own observation; it is what located this after I had guarded
+	   R_GetColumn first and the halt came back unchanged).  A 256x128 TNT patch is 35080 B and
+	   the zone's longest run is 32 KB, so Z_Malloc I_Errors here and the game is dead.
+	   Bail exactly the way the existing "column without a patch" early-return below already
+	   does: free the temp, leave the texture without a directory.  R_EnsureLookup retries on a
+	   later frame, so the texture builds itself the moment a 35 KB run exists. */
+	if (!W_LumpResident (patch->patch)
+	    && Z_LargestAllocatable () < W_LumpLength (patch->patch) + 64)
+	{
+	    r_patch_ovf++;
+	    Z_Free (patchcount);
+	    return;
+	}
 	realpatch = W_CacheLumpNum (patch->patch, PU_CACHE);
 	x1 = patch->originx;
 	x2 = x1 + SHORT(realpatch->width);
@@ -502,7 +544,30 @@ R_GetColumn
     ofs = texturecolumnofs[tex][col];
     
     if (lump > 0)
+    {
+	/* SATURN garde-PATCH (2026-08-07) -- the LAST fatal I_Error left on the render hot path.
+	   A single-patch texture is served straight out of its patch, so this caches the WHOLE
+	   lump to read one column.  In TNT that is routinely **35080 bytes** (26 lumps are exactly
+	   that: every 256x128 patch -- RSKY1/2/3, RWDMON1..10, DO[ENWS][DAY|NITE|HELL], ASPHALT,
+	   BIGMURAL, LONGWALL), and the zone cannot always find 35 KB in one run: the owner's halts
+	   read `fr225K lg32K` -- 225 KB free, longest run 32 KB, the same layout every boot,
+	   because ~366 KB of SMALL unpurgeable blocks (R_InitTextures allocates one PU_STATIC per
+	   texture, ~1500 of them in TNT) chop the middle of the zone.  Z_Malloc then I_Errors and
+	   the game is DEAD at the loading screen.
+	   Sink it like every neighbour already does (garde-COMPOSITE / garde-OPENINGS /
+	   garde-VISPLANE / garde-W_ReadLump): serve the shared placeholder column instead.  The
+	   wall renders flat for as long as the zone stays that tight and heals by itself the moment
+	   a run opens up -- survivable, and above all MEASURABLE, which a halt is not.
+	   The test is Z_LargestAllocatable, i.e. free + purgeable after coalescing -- exactly what
+	   Z_Malloc's own scan can reach -- so this only fires when the allocation really would
+	   fail.  Resident lumps never reach the test. */
+	if (!W_LumpResident (lump) && Z_LargestAllocatable () < W_LumpLength (lump) + 64)
+	{
+	    r_patch_ovf++;
+	    return r_column_stub;
+	}
 	return (byte *)W_CacheLumpNum(lump,PU_CACHE)+ofs;
+    }
 
     if (!texturecomposite[tex])
 	R_GenerateComposite (tex);
@@ -562,23 +627,45 @@ static int R_PotatoRepColor (const int *hist)
    the dominant/average via R_PotatoRepColor -- far truer to the surface than the old arbitrary
    centre texel (2080).  Master-only (R_DrawPlanes) -> the slave reads the cached short, no
    cross-CPU compute.  Pure C, DoomJo-safe. */
+static short *flatpot_cache = NULL;   /* SATURN: per-flat dominant colour, -1 = not computed */
+static int    flatpot_base = 0, flatpot_count = 0;
+
+/* SATURN: the flat's dominant colour PEEKED -- -1 when never computed, and NEVER loads.  Same
+   contract as R_WallPotatoColorPeek: R_FlatPotatoColor below reads the 4 KB flat lump, which in the
+   streaming build is the ~42 ms disc read the load budget exists to avoid. */
+int R_FlatPotatoColorPeek (int lumpnum)
+{
+    int fi;
+    if (!flatpot_cache) return -1;
+    fi = lumpnum - flatpot_base;
+    if (fi < 0 || fi >= flatpot_count) return -1;
+    return flatpot_cache[fi];
+}
+
 int R_FlatPotatoColor (int lumpnum)
 {
-    static short *cache = NULL;
-    static int    base = 0, count = 0;
+    short *cache;
+    int    base, count;
     int   hist[256];
     byte *src;
     int   i, fi;
-    if (!cache)
+    if (!flatpot_cache)
     {
-	base = firstflat; count = numflats;
-	cache = Z_Malloc (count * (int)sizeof(short), PU_STATIC, 0);
-	for (i = 0; i < count; i++) cache[i] = -1;
+	flatpot_base = firstflat; flatpot_count = numflats;
+	flatpot_cache = Z_Malloc (flatpot_count * (int)sizeof(short), PU_STATIC, 0);
+	for (i = 0; i < flatpot_count; i++) flatpot_cache[i] = -1;
     }
+    cache = flatpot_cache; base = flatpot_base; count = flatpot_count;
     fi = lumpnum - base;
     if (fi < 0 || fi >= count) return 0;
     if (cache[fi] >= 0) return cache[fi];
-    src = W_CacheLumpNum (lumpnum, PU_STATIC);
+    /* SATURN: prefer the RESIDENT FLAT POOL slot.  The caller that primes this colour (the load
+       budget in r_plane.c) has just pulled the flat into a pool slot, and a pooled flat is NOT in
+       lumpinfo[].cache -- so going straight to W_CacheLumpNum here would fire a SECOND ~42 ms disc
+       read for a flat already sitting in RAM.  NULL (no pool / not pooled) keeps the classic path. */
+    src = R_FlatCachePeek (lumpnum);
+    if (!src)
+	src = W_CacheLumpNum (lumpnum, PU_STATIC);
     memset (hist, 0, sizeof hist);
     for (i = 0; i < 4096; i += 2) hist[src[i]]++;
     cache[fi] = (short) R_PotatoRepColor (hist);
@@ -607,20 +694,21 @@ int sat_wall_paint = 0;
    even in Potato so they stay readable (a flat-grey door in a flat-grey corridor
    is unfindable). */
 int sat_wall_textured = 0;
+static short *wallpot_cache = NULL;   /* SATURN: per-texture dominant colour, -1 = not computed */
+
 int R_WallPotatoColor (int tex)
 {
-    static short *cache = NULL;
     int   w, h, col, y, i;
     int   hist[256];
     byte *p;
 
     if (tex < 0 || tex >= numtextures) return 0;
-    if (!cache)
+    if (!wallpot_cache)
     {
-	cache = Z_Malloc(numtextures * (int)sizeof(short), PU_STATIC, 0);
-	for (i = 0; i < numtextures; i++) cache[i] = -1;
+	wallpot_cache = Z_Malloc(numtextures * (int)sizeof(short), PU_STATIC, 0);
+	for (i = 0; i < numtextures; i++) wallpot_cache[i] = -1;
     }
-    if (cache[tex] >= 0) return cache[tex];
+    if (wallpot_cache[tex] >= 0) return wallpot_cache[tex];
 
     memset (hist, 0, sizeof hist);
     w = texturewidthmask[tex] + 1;
@@ -630,8 +718,40 @@ int R_WallPotatoColor (int tex)
 	p = R_GetColumn(tex, col);
 	for (y = 0; y < h; y += 2) hist[p[y]]++;
     }
-    cache[tex] = (short) R_PotatoRepColor (hist);
-    return cache[tex];
+    wallpot_cache[tex] = (short) R_PotatoRepColor (hist);
+    return wallpot_cache[tex];
+}
+
+/* SATURN: the dominant colour PEEKED -- returns it if already computed, -1 otherwise, and NEVER
+   loads anything.  R_WallPotatoColor above walks every other COLUMN through R_GetColumn, i.e. it
+   faults the WHOLE texture in: calling it on a non-resident texture would perform exactly the disc
+   read the flat fallback exists to avoid.  So there is no way to know the right colour for a
+   texture that has never been seen -- the caller must supply a neutral one and count the case
+   (r_segs.c `sat_wall_flat_nocol`).  It self-heals: the first time the texture IS drawn textured
+   the colour lands in the cache and every later flat fallback for it is exact.  Baking a 1-byte
+   per-texture table offline into the repack would remove even the first-sighting case. */
+int R_WallPotatoColorPeek (int tex)
+{
+    if (tex < 0 || tex >= numtextures || !wallpot_cache) return -1;
+    return wallpot_cache[tex];
+}
+
+/* SATURN: 1 = drawing this texture costs NO disc I/O this frame.  Conservative -- any doubt
+   (directory purged, composite gone, a patch not cached) answers 0, so the budget errs toward
+   drawing flat rather than toward a surprise 42 ms read inside the wall loop. */
+int R_TextureIOFree (int tex)
+{
+    texture_t *t;
+    int        i;
+
+    if (tex <= 0 || tex >= numtextures) return 1;    /* 0 = "no texture" -> nothing to load */
+    if (!texturecolumnlump[tex]) return 0;           /* R4 directory purged -> R_EnsureLookup works */
+    if (texturecomposite[tex])   return 1;           /* composite resident (or the OOM stub) */
+    t = textures[tex];
+    for (i = 0; i < t->patchcount; i++)              /* single-patch columns come straight from these,
+						        and a composite build would read them ALL */
+	if (!W_LumpResident (t->patches[i].patch)) return 0;
+    return 1;
 }
 
 
@@ -951,6 +1071,18 @@ void R_InitSpriteLumps (void)
     }
 #endif
 
+    /* SATURN 2026-08-07: CHUNKED header sweep -- the same three arrays, but one 32 KB read covers
+       10-30 consecutive sprite lumps instead of one CD command per lump.  MEASURED: the boot+load
+       costs 4704 CD commands / 270 s at ~40-57 ms each (overlay row 12 `L`), and only 73 lumps of
+       that are inside P_SetupLevel (`S73`) -- the boot owns it, and THIS loop is its biggest single
+       contributor (~1381 commands on TNT, for 6 useful bytes each; the comment above the R3.1 block
+       already said so).  Unlike R3.1 this needs NO .DRP, so it works on any WAD.  Fails closed:
+       W_ReadHeaderSweep returns 0 (zone too tight, short read, lumps out of file order) and the
+       classic per-lump loop below runs unchanged. */
+    /* (The WAD-independent chunked sweep that used to sit here is REMOVED, 2026-08-07: the R3.1
+       .DRP index above covers the same ~1381 reads, `-Repack` is now a standing build rule
+       ([[drp-repack-must-be-rebuilt]]), and the HWRAM TLSF pool could not carry both.  Re-add
+       W_ReadHeaderSweep (w_wad.c history) if a WAD ever ships without a .DRP.) */
     for (i=0 ; i< numspritelumps ; i++)
     {
 	if (!(i&63))
@@ -963,6 +1095,20 @@ void R_InitSpriteLumps (void)
     }
 }
 
+
+
+/* SATURN 2026-08-07: R_PinSkyPatch is REMOVED -- it worked, and it was the wrong idea.
+   MEASURED on the HW halt dump: the sky patch WAS pinned (`34K t5 @968K`, PU_LEVEL, resident) and
+   the Zmalloc still failed on another 35104-byte request.  Cause: **26 lumps in TNT are exactly
+   35080 bytes** -- every 256x128 patch (RSKY1/2/3, RWDMON1..10, DO[ENWS][DAY|NITE|HELL], ASPHALT,
+   BIGMURAL, LONGWALL) -- so an outdoor TNT map cycles SEVERAL of them and the sky is just the one
+   I happened to identify first.  Pinning them all is 800 KB.
+   And the accounting got WORSE: the pin converts 34 KB of PURGEABLE into 34 KB of permanent
+   PU_LEVEL (`lv` 377K -> 410K) while `lg` did not move at all (32K both sides).  In a zone with
+   190 KB free but never 34 KB contiguous, that is a pure loss.
+   LESSON: this class of failure is about the NUMBER OF CUTS, not the size of any one block.  Do
+   not pin another lump to fix it.  (The W_PinLump machinery in w_wad.c stays -- the no-demote
+   guard it adds to W_CacheLumpNum is the correct fix for a real trap -- but it has no user.) */
 
 
 //

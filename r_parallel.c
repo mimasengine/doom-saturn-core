@@ -186,6 +186,15 @@ static unsigned short rp_frt(void);   /* fwd: slave self-timing in rp_slave_body
    are all gated on rp_active and go blank.  Phase marks sampled unconditionally; the slave
    plane-draw time is the slave's own FRT delta; p3_wait = master idle in RP_WaitPlanes. */
 static unsigned short p3_t_begin, p3_t_bsp, p3_t_planes;
+/* SATURN 2026-08-06: sub-brackets INSIDE `P` (see RP_MarkP in r_parallel.h).  p3_t_p[0..2] =
+   after the VDP1 wall kick / before R_DrawPlanes / after R_DrawPlanes.  Published as tenths-ms
+   for the row-20 `PSP` readout so a `P` spike can be attributed instead of assumed. */
+static unsigned short p3_t_p[1];
+unsigned int sat_p_kick10 = 0;   /* VDP1 wall kick + R_DrawPlayerSprites (weapon)               */
+/* (n / d / j RETIRED 2026-08-06 -- all three measured ~0 and are SETTLED NEGATIVE: NetUpdate and
+   the canaries are free, RP_LeadJoin never waits, and R_DrawPlanes itself is 1 ms, i.e. THE PLANES
+   ARE INNOCENT.  They were still computed and window-folded for a row that no longer prints them,
+   which costs HWRAM -- and this config's MEASURED boot floor is 4.8..5.0 KB of TLSF pool. */
 static unsigned short p3_wait_ticks;   /* master idle in RP_WaitPlanes (master FRT, reliable) */
 /* NOTE: the slave's OWN FRT can't be used for a duration -- it's 16-bit and runs fast enough to
    wrap several times per frame, so any slave busy/period read is garbage (>100%).  Slave slack
@@ -1837,10 +1846,23 @@ void RP_MarkBSPDone(void)
 #endif
 }
 
+void RP_MarkP(int slot)
+{
+#if RP_PROF
+    if ((unsigned)slot < 1u) p3_t_p[slot] = rp_frt();
+#else
+    (void)slot;
+#endif
+}
+
 void RP_BeginMasked(void)
 {
 #if RP_PROF
     if (rp_disabled) p3_t_planes = rp_frt();   /* P3: R_DrawPlanes done (parity path is off) */
+    /* Attribute `P`.  Note the LAST slice (p3_t_planes - p3_t_p[2]) is the lead-fill JOIN plus the
+       trailing NetUpdate/canary -- the join dominates it whenever the slave is late, which is
+       exactly the failure mode a bounded spin produces: a huge outlier on an otherwise idle frame. */
+    sat_p_kick10 = (unsigned short)(p3_t_p[0]   - p3_t_bsp)  * 10u / 224u;
 #endif
     if (!rp_active||rp_disabled) return;
 #if RP_PROF

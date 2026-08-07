@@ -44,8 +44,25 @@ extern boolean W_PtrIsMapped(const void *p);
 // SATURN diag (SAT_ZONE_RA): tag every block with its Z_Malloc caller so the top-8 resident
 // dump can NAME the big blocks (resolve ra vs build/Mimas.map) -> attribute the RAM-diet targets.
 // +4 bytes/block header (a few KB) -- keep ON while dieting the zone, flip to 0 to ship.
+/* SATURN 2026-08-06: flipped to 0.  The `ra` alloc-site tag did its job -- it named P_LoadSegs as
+   the TNT MAP19 boot failure ([[zone-contiguity-wall-loadsegs]]) -- and the current hunt is entirely
+   inside the VDP1 wall kick, with no zone component.  Off it costs nothing to re-enable, and it buys
+   back HWRAM .text (the top-8 forensics dump + its printf format strings) for the TLSF pool, which
+   the pre-flight had pushed below its 4 KB floor.  The halt still prints fr/lg/st/lv AND the top-8
+   block sizes/tags/offsets -- only the caller address is gone. */
+/* SATURN 2026-08-07: ON for one build, then OFF again -- it answered completely.  The eight walls
+   of TNT MAP11, resolved from `ra` against build/Mimas-Tnt.map, so nobody re-measures them:
+     101K PU_LEVEL  P_LoadLineDefs      85K PU_LEVEL  P_LoadSegs
+      40K PU_LEVEL  P_LoadNodes         23K PU_LEVEL  P_LoadSectors      (= 249K of map geometry)
+      72K PU_STATIC W_AddFile (lumpinfo, bottom of zone -- structural)
+      60K PU_STATIC R_InitPlanes  <- the visplane span pool, the one big STATIC sitting MID-ZONE
+      36K PU_STATIC the lead-fill ring (r_segs, bottom of zone)
+      26K PU_STATIC the .DRP entry table (moved to the bottom the same day)
+   VERDICT: none of it is junk.  st438K + lv377K = 815 KB of an ~864 KB zone -- the zone is FULL,
+   not merely fragmented.  Flip this back to 1 only for a NEW unexplained Zmalloc fail; it costs
+   HWRAM .text = TLSF pool, and the pool lives at its floor. */
 #ifndef SAT_ZONE_RA
-#define SAT_ZONE_RA 1
+#define SAT_ZONE_RA 0
 #endif
 
 typedef struct memblock_s
@@ -77,6 +94,12 @@ typedef struct
 
 
 memzone_t*	mainzone;
+
+/* (SATURN diag `z_scan_steps` REMOVED 2026-08-07: it read 0 -- fewer than 1000 rover steps per
+   frame on TNT MAP11 at 4 fps.  That REFUTES "a starved, fragmented zone makes every Z_Malloc walk
+   and purge the whole block list", which was the leading explanation for the 32..232 ms swing in
+   R_EmitWorldThingsVDP1.  The allocator is innocent; do not revive the theory without a fresh
+   reading.  Re-adding it is two lines: this one and an increment in the Z_Malloc scan below. */
 
 
 
@@ -241,6 +264,12 @@ Z_Malloc
         I_Error ("Z_Malloc bad size=%i ra=%p", size, __builtin_return_address(0));
 
     int z_emergency = 0;   // SATURN: allow ONE re-anchored retry before declaring OOM
+    /* SATURN 2026-08-07: ROVER STEP COUNTER.  Z_Malloc's scan walks the block list purging every
+       PU_CACHE block it passes, and on a straddle the z_emergency path RESCANS THE WHOLE LIST.  In a
+       starved, fragmented zone that is O(blocks) -- twice -- PER ALLOCATION, and it is invisible in
+       every existing counter: no disc, no bake, no draw.  It is the leading suspect for the kick's
+       44..227 ms world-things emit (which does one W_CacheLumpNum per sprite) AND it is what made the
+       1p composite cache 3-4x SLOWER.  Row 20 `z` = thousands of steps per frame. */
  z_retry_scan:
     // if there is a free block behind the rover,
     //  back up over them
@@ -616,6 +645,21 @@ unsigned int Z_ZoneSize(void)
 // from true EXHAUSTION (Z_FreeMemory itself < N).  O(blocks); call sparingly
 // (overlay rate), not on the hot path.
 //
+/* SATURN 2026-08-07: rewind the allocation rover to the bottom of the zone.
+   Z_Malloc resumes scanning from wherever the LAST allocation left the rover, so a PU_STATIC slab
+   carved after a level's geometry lands high -- a fresh CUT through the free space instead of
+   packing against the boot statics (lumpinfo, the visplane pool, the .DRP table) that already sit
+   at the bottom.  That is what the halt dumps kept showing: `fr190K lg32K` -- 190 KB free, never
+   34 KB in one run, because six or more unpurgeable blocks are spread across the zone.
+   Call this immediately before carving a long-lived slab: the scan then starts at block 0 and the
+   slab drops into the LOWEST hole that fits, next to its own kind.  It costs one extra walk of the
+   block list, once per level -- nothing next to a ~57 ms CD command.
+   (Same one-line mechanism the z_emergency retry already uses, promoted to a named intent.) */
+void Z_RoverToStart (void)
+{
+    if (mainzone) mainzone->rover = mainzone->blocklist.next;
+}
+
 int Z_LargestAllocatable (void)
 {
     memblock_t*	block;
