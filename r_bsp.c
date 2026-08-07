@@ -99,8 +99,8 @@ void R_ClearDrawSegs (void)
        passes through exactly once (split included -- the 4 views share one frame's disc budget,
        which is what we want: the budget bounds the FRAME's stall, not the view's). */
     {
-	extern int sat_tex_load_spent;
-	sat_tex_load_spent = 0;
+	extern void R_LoadBudgetFrame (void);
+	R_LoadBudgetFrame ();
     }
 }
 

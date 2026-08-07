@@ -75,6 +75,15 @@ int r_readlump_short = 0;
    W_AddFile and never again, so this stays flat there. */
 int w_lump_reads = 0;
 
+/* SATURN 2026-08-07: cumulative wall-clock spent INSIDE medium commands, in tenths of a ms.
+   Owned by core (not by the platform) for one reason: the per-frame texture LOAD BUDGET
+   (r_segs.c R_LoadBudgetLeft) is a TIME budget, and a time budget cannot live in core while
+   its clock lives in src/.  The platform feeds it -- Mimas from sat_cd_clock_add
+   (w_file_saturn.cxx), which FRT-times every GFS command.  A port that never feeds it (DoomJo,
+   any cart build) leaves it at 0, the budget then never trips, and every texture faults in on
+   sight exactly as before: the budget is inert, not broken, on a medium with no latency. */
+unsigned int w_cd_ms10 = 0;
+
 // SATURN R4.3c: the single WAD file backing every lump (was a per-lump lumpinfo.wad_file
 // pointer -- dropped to save 4B/lump off the zone).  Set once by W_AddFile; a second file
 // trips a loud guard there.  All read sites below use this instead of lump->wad_file.

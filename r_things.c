@@ -148,6 +148,7 @@ int sat_things_occ = 0;                     /* fully-occluded sprites skipped th
 int sat_thing_cap = 4;                      /* platform sets = VDP1 thing slots/frame (VRAM cap); nearest win */
 /* SATURN per-frame texture LOAD BUDGET, sprite third (walls own the budget in r_segs.c). */
 extern int sat_tex_load_budget, sat_tex_load_spent;
+extern int R_LoadBudgetLeft (void);   /* SATURN: r_segs.c -- 1 = the frame can still afford a fault */
 extern int W_LumpResident (int lump);
 int sat_spr_flat_io = 0;                    /* sprites skipped for want of residency (~1 s window) */
 int sat_things_hw = 1;                      /* platform (sat_apply_mode): 1 = world sprites on VDP1; 0 = software (M0/M6) */
@@ -602,11 +603,9 @@ R_DrawVisSprite
        Past the frame's budget the sprite is simply NOT DRAWN this frame: it appears one or two
        frames later, which is invisible next to a 42 ms stall, and there is no half-state to
        clean up (no clip arrays are written for a sprite). */
-    if (sat_tex_load_budget && !W_LumpResident (vis->patch + firstspritelump))
-    {
-	if (sat_tex_load_spent < sat_tex_load_budget) sat_tex_load_spent++;
-	else { sat_spr_flat_io++; RP_SprFillLeave(); return; }
-    }
+    if (sat_tex_load_budget && !W_LumpResident (vis->patch + firstspritelump)
+	&& !R_LoadBudgetLeft ())
+    { sat_spr_flat_io++; RP_SprFillLeave(); return; }
     patch = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
 
     dc_colormap = vis->colormap;
@@ -1844,11 +1843,9 @@ void R_EmitWorldThingsVDP1 (void)
 	   Refuse instead: leave sat_thing_vdp1[idx] CLEAR so the sprite falls through to the
 	   software path, which applies the same budget and skips it too.  It appears one or two
 	   frames later -- invisible next to a 250 ms stall, and no half-state to clean up. */
-	if (sat_tex_load_budget && !W_LumpResident (spr->patch + firstspritelump))
-	{
-	    if (sat_tex_load_spent < sat_tex_load_budget) sat_tex_load_spent++;
-	    else { sat_spr_flat_io++; continue; }
-	}
+	if (sat_tex_load_budget && !W_LumpResident (spr->patch + firstspritelump)
+	    && !R_LoadBudgetLeft ())
+	{ sat_spr_flat_io++; continue; }
 	patch  = W_CacheLumpNum (spr->patch+firstspritelump, PU_CACHE);
 	patchw = spritewidth[spr->patch] >> FRACBITS;
 	if (patchw < 1) continue;

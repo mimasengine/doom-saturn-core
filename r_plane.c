@@ -1165,6 +1165,7 @@ unsigned char *sat_vdp2_floor_data(void)
 int sat_potato_floors = 0;
 /* SATURN per-frame texture LOAD BUDGET, plane half (walls own the budget in r_segs.c). */
 extern int sat_tex_load_budget, sat_tex_load_spent;
+extern int R_LoadBudgetLeft (void);   /* SATURN: r_segs.c -- 1 = the frame can still afford a fault */
 extern int W_LumpResident (int lump);
 extern int R_FlatPotatoColorPeek (int lumpnum);
 int sat_plane_flat_io    = 0;   /* visplanes drawn potato for want of residency (~1 s window)  */
@@ -1521,11 +1522,8 @@ void R_DrawPlanes (void)
 	   reads w->color and never touches w->src) and skip the load entirely. */
 	if (!fc_src && sat_tex_load_budget && !W_LumpResident (lumpnum))
 	{
-	    if (sat_tex_load_spent < sat_tex_load_budget)
-	    {
-		sat_tex_load_spent++;
+	    if (R_LoadBudgetLeft ())
 		flat_paid = 1;
-	    }
 	    else
 	    {
 		int c = R_FlatPotatoColorPeek (lumpnum);   /* MUST peek: R_FlatPotatoColor reads the lump */

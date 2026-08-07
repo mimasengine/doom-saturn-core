@@ -70,6 +70,7 @@ int	W_GetNumForName (char* name);
 int	W_LumpLength (unsigned int lump);
 int	W_LumpResident (int lump);   /* SATURN: 1 = W_CacheLumpNum would NOT hit the disc */
 extern int w_lump_reads;             /* SATURN: cumulative W_ReadLump calls (lumps off the medium) */
+extern unsigned int w_cd_ms10;       /* SATURN: cumulative ms*10 spent in medium commands (see w_wad.c) */
 int	W_LumpPinned (int lumpnum);          /* SATURN: 1 = W_CacheLumpNum must not retag it       */
 void	W_UnpinAll (void);                   /* SATURN: drop every pin (call before re-pinning)    */
 void	W_PinLump (int lumpnum, int tag);    /* SATURN: cache + pin (see w_wad.c: the sky patch)   */

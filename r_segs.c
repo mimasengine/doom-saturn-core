@@ -209,9 +209,44 @@ extern int  sat_potato_walls;
 extern int  sat_wall_nocpu;     /* SATURN: banded/flat VDP1 modes skip the close-wall CPU fallback */
 extern int  sat_wall_color;
 /* SATURN per-frame texture LOAD BUDGET -- see the block above the column loop in R_StoreWallRange.
-   budget 0 = OFF = every texture faults in on sight (the pre-2026-08-06 behaviour). */
-int sat_tex_load_budget = 0;    /* textures allowed to fault in per frame (pad chord)          */
-int sat_tex_load_spent  = 0;    /* spent this frame (reset in R_ClearDrawSegs)                 */
+   budget 0 = OFF = every texture faults in on sight (the pre-2026-08-06 behaviour).
+
+   2026-08-07 -- the budget counts MILLISECONDS OF DISC, not reads, and it is ON by default.
+   Two defects, both found by asking what the Ymir numbers are worth on a console:
+     * it counted READS.  A read is not a unit of cost: it is ~35 ms under Ymir's CD model and a
+       seek plus a 150 KB/s transfer on a console, so the same `4` bounded the frame's stall at
+       two very different places.  The thing we actually want bounded is the STALL, so spend the
+       clock (core w_cd_ms10, fed by the platform's per-command FRT timing) and let each medium
+       price its own reads.  A medium with no latency never advances it, so the budget goes inert
+       instead of throttling a port that has nothing to throttle.
+     * it defaulted to 0 = OFF, and its ONLY writer was the R+X chord.  Every gate added on
+       2026-08-06/07 -- walls, flats, sprites, and the VDP1 emit that took `P` from 163 ms to
+       7 -- was therefore DEAD in a default boot; the owner's captures only showed them working
+       because he had pressed R+X three times.  A protection nobody arms is not a protection.
+
+   Overshoot is by construction: a read's price is known only after paying it, so the frame can
+   exceed the budget by one read (~35 ms here).  That residue is exactly what an ASYNC read would
+   remove, and it is the reason R2.3 stays on the roadmap rather than being closed by this. */
+int sat_tex_load_budget = 20;   /* ms of medium wall-clock allowed per frame, 0 = off (pad R+X) */
+int sat_tex_load_spent  = 0;    /* tenths of a ms spent this frame (read off the clock, not counted) */
+static unsigned int sat_tex_load_mark = 0;   /* w_cd_ms10 at the start of this frame */
+extern unsigned int w_cd_ms10;               /* core w_wad.c */
+
+/* Refill: called once per rendered frame from R_ClearDrawSegs (r_bsp.c). */
+void R_LoadBudgetFrame (void)
+{
+    sat_tex_load_mark  = w_cd_ms10;
+    sat_tex_load_spent = 0;
+}
+
+/* 1 = this frame can still afford to fault something in off the medium.
+   Budget off -> always 1, so every call site degrades to the pre-budget behaviour. */
+int R_LoadBudgetLeft (void)
+{
+    if (!sat_tex_load_budget) return 1;
+    sat_tex_load_spent = (int)(w_cd_ms10 - sat_tex_load_mark);
+    return sat_tex_load_spent < sat_tex_load_budget * 10;
+}
 int sat_wall_flat_io    = 0;    /* tiers drawn flat for want of residency  (~1 s window)       */
 int sat_wall_flat_nocol = 0;    /* ...of which we had no cached colour either (~1 s window)    */
 /* Neutral index used when a texture has never been resident, so its dominant colour was never
@@ -228,15 +263,15 @@ static int sat_wall_io_flat (int tex)
 {
     if (!sat_tex_load_budget)      return 0;   /* feature off */
     if (R_TextureIOFree (tex))     return 0;   /* free -> draw it properly, budget untouched */
-    if (sat_tex_load_spent < sat_tex_load_budget)
+    if (R_LoadBudgetLeft ())
     {
 	/* Pay for it (BSP order => nearest walls win).  We are faulting the texture in anyway, so
 	   compute its DOMINANT COLOUR in the same breath: R_WallPotatoColor is only ever called by
 	   the potato mode, which is off in normal play, so without this the colour cache stays EMPTY
 	   and every flattened wall falls back to neutral grey -- measured `nocol` = 100% of `flat`
 	   on the owner's TNT MAP11 captures.  Priming here makes every later fallback for this
-	   texture exact, at the cost of one extra pass over a texture we are already loading. */
-	sat_tex_load_spent++;
+	   texture exact, at the cost of one extra pass over a texture we are already loading.
+	   No `spent++`: the clock does the counting, and R_WallPotatoColor's own read is on it. */
 	R_WallPotatoColor (tex);
 	return 0;
     }
