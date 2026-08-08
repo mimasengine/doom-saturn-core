@@ -1329,7 +1329,7 @@ static unsigned int   prof_segloop;     /* R_RenderSegLoop's PER-COLUMN loop onl
 static unsigned int   prof_segrout;     /* R_RenderSegLoop's per-seg routing preamble, c Bp                  */
 static unsigned short prof_sl_t0;
 /* Bp sub-split as PERCENTAGES, latched on the frame that set the window's Bp peak (row 20 `BP`). */
-static unsigned int   prof_bp_r_pct, prof_bp_c_pct, prof_bp_g_pct, prof_bp_g_n;
+static unsigned int   prof_bp_r_pct, prof_bp_c_pct, prof_bp_g_pct, prof_bp_g_n, prof_bp_e_pct;
 static int            prof_bp_bad;   /* 1 = a ratio came out impossible -> row prints `B!` */
 /* SATURN 2026-08-08: R_GetColumn's own share of Bp -- the PER-COLUMN half of the ~60% that the
    pad L+X mode-2 A/B attributed to texturing (that A/B removed the per-column fetch AND the
@@ -1853,6 +1853,7 @@ void RP_BeginFrame(void)
     prof_wallprep = 0;                                                   /* Bp accumulator */
     prof_segloop = prof_segrout = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
     prof_getcol = prof_getcol_n = 0;                                     /* R_GetColumn share of Bp */
+    { extern int r_lookup_rebuilds; r_lookup_rebuilds = 0; }             /* R4 directory rebuilds   */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
     prof_pp_cur_sum = prof_pp_cur_vq = 0;
     prof_pp_cur_pic = -2147483647;   /* sentinel: no flat group open yet */
@@ -2072,6 +2073,13 @@ static void rp_p3_prof_show(void)
                 prof_bp_r_pct = pr > 99u ? 99u : pr;
                 prof_bp_g_pct = pg > 99u ? 99u : pg;
                 prof_bp_g_n   = prof_getcol_n > 99999u ? 99999u : prof_getcol_n;
+                {   /* `e` = share of those calls that REBUILT an R4 directory (the 14 000-cycle
+                       path).  e near 100 => the lazy directories are thrashing and THAT is Bp. */
+                    extern int r_lookup_rebuilds;
+                    unsigned int pe = prof_getcol_n
+                        ? (unsigned int)r_lookup_rebuilds * 100u / prof_getcol_n : 0u;
+                    prof_bp_e_pct = pe > 99u ? 99u : pe;
+                }
             }
         }
         if (p10  > (unsigned)sat_prof_pk_p)  sat_prof_pk_p  = (int)p10;
@@ -2131,8 +2139,10 @@ static void rp_p3_prof_show(void)
                38-48K on the light frames to 22-29K on the heavy ones),
              n explodes with g            => it is simply call volume, and the fix is d32xr's:
                resolve the texture pointer ONCE PER WALL instead of once per column. */
-        snprintf(p, sizeof p, "%s g%02u n%u    ",
-                 prof_bp_bad ? "B!" : "BP", prof_bp_g_pct, prof_bp_g_n);
+        /* `g` (82-89% in every capture) gave up its column to `e`, the decisive new number.
+           `e` = % of R_GetColumn calls that REBUILT an R4 column directory. */
+        snprintf(p, sizeof p, "%s e%02u n%u    ",
+                 prof_bp_bad ? "B!" : "BP", prof_bp_e_pct, prof_bp_g_n);
         dbg_print(0, 20, p);
     }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one

@@ -149,6 +149,10 @@ int sat_thing_cap = 4;                      /* platform sets = VDP1 thing slots/
 /* SATURN per-frame texture LOAD BUDGET, sprite third (walls own the budget in r_segs.c). */
 extern int sat_tex_load_budget, sat_tex_load_spent;
 extern int R_LoadBudgetLeft (void);   /* SATURN: r_segs.c -- 1 = the frame can still afford a fault */
+/* SATURN 2026-08-08: 1 between RP_DispatchMasked and RP_WaitMasked -- the window during which the
+   SLAVE is dereferencing zone-owned sprite patches, so the MASTER must not allocate (a Z_Malloc
+   purges, and a purged patch under the slave is a wild pointer it then reads AND writes from). */
+int sat_masked_inflight = 0;
 extern int W_LumpResident (int lump);
 int sat_spr_flat_io = 0;                    /* sprites skipped for want of residency (~1 s window) */
 int sat_things_hw = 1;                      /* platform (sat_apply_mode): 1 = world sprites on VDP1; 0 = software (M0/M6) */
@@ -603,8 +607,13 @@ R_DrawVisSprite
        Past the frame's budget the sprite is simply NOT DRAWN this frame: it appears one or two
        frames later, which is invisible next to a 42 ms stall, and there is no half-state to
        clean up (no clip arrays are written for a sprite). */
-    if (sat_tex_load_budget && !W_LumpResident (vis->patch + firstspritelump)
-	&& !R_LoadBudgetLeft ())
+    /* SATURN 2026-08-08: `sat_masked_inflight` makes the refusal UNCONDITIONAL while the slave is
+       drawing its half.  A fault here is a Z_Malloc, hence a purge, concurrent with the slave
+       dereferencing zone-owned patch pointers -- and the owner's evidence for the wedge is exactly
+       that shape: only the LEFT half of the sprites drawn (the slave owns [half, viewwidth),
+       r_things.c ~1952) with `SLV id100%` frozen instead of oscillating at 98%. */
+    if (!W_LumpResident (vis->patch + firstspritelump)
+	&& (sat_masked_inflight || (sat_tex_load_budget && !R_LoadBudgetLeft ())))
     { sat_spr_flat_io++; RP_SprFillLeave(); return; }
     patch = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
 
@@ -1484,10 +1493,16 @@ static void R_SlaveDrawVisSprite (vissprite_t* vis)
     column_t *column; int texturecolumn; fixed_t frac; patch_t *patch;
     /* SATURN load budget -- see R_DrawVisSprite.  The SLAVE must never do disc I/O at all, so it
        skips unconditionally on a miss rather than spending the budget (the master's own pass over
-       the other half will fault it in when the budget allows). */
-    if (sat_tex_load_budget && !W_LumpResident (vis->patch + firstspritelump))
-	{ sat_spr_flat_io++; return; }
-    patch = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
+       the other half will fault it in when the budget allows).
+       2026-08-08 -- and it must never touch the ZONE either.  This used to call W_CacheLumpNum,
+       whose already-cached branch still runs Z_ChangeTag: a zone-header WRITE, plus a ZONEID read
+       that I_Errors on a value it does not like, executed on the slave while the master may be
+       splitting that very block inside Z_Malloc.  W_LumpCached is the same lookup with neither.
+       The guard is now unconditional too: it was gated on sat_tex_load_budget, so with the budget
+       off the slave went straight into W_CacheLumpNum on a possibly NON-RESIDENT lump -- i.e. a
+       CD read issued from the second CPU.  Nothing here should ever depend on a perf toggle. */
+    patch = (patch_t *) W_LumpCached (vis->patch + firstspritelump);
+    if (!patch) { sat_spr_flat_io++; return; }
     s_dc_colormap = vis->colormap;
     if (!s_dc_colormap)
         s_coltype = 1;                        /* NULL colormap = fuzz/shadow */
@@ -1943,6 +1958,12 @@ void R_DrawMasked (void)
 		W_CacheLumpNum (spr->patch+firstspritelump, PU_CACHE);
 	    }
 	    masked_split = 1;
+	    /* SATURN 2026-08-08: the loop above SKIPS non-resident patches when the budget is armed
+	       (and it has been armed BY DEFAULT since 2026-08-07).  The master's own draw pass below
+	       would then fault those very patches in -- a Z_Malloc, hence a PURGE, running WHILE the
+	       slave dereferences zone pointers.  That is the concurrent alloc this pre-cache exists to
+	       prevent, reopened by the default change.  Close it for the duration of the phase. */
+	    sat_masked_inflight = 1;
 	    RP_DispatchMasked (half, viewwidth);   /* slave: vissprites in [half, viewwidth) */
 	    g_mask_x1 = half;                       /* master: vissprites in [0, half)       */
 	}
@@ -1964,6 +1985,7 @@ void R_DrawMasked (void)
 	{
 	    g_mask_x1 = 32767;       /* reset to full width for the walls + psprites */
 	    RP_WaitMasked ();        /* the slave's right half is done */
+	    sat_masked_inflight = 0; /* the master may allocate again */
 	}
     }
     

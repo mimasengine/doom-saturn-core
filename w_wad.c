@@ -506,6 +506,27 @@ void W_PinLump (int lumpnum, int tag)
    asked for it (`Bp` for a wall patch, `P` for a flat) -- this is the predicate the per-frame
    load budget uses to decide "draw it flat this frame instead".  A memory-mapped WAD (cart) is
    always resident. */
+/* SATURN 2026-08-08: a PURE READ of a lump's cached pointer -- no allocation, no disc, and above
+   all NO Z_ChangeTag.  It exists for the SLAVE SH-2.
+   R_SlaveDrawVisSprite called W_CacheLumpNum, whose already-cached branch still runs
+   Z_ChangeTag(lump->cache, tag) -- i.e. the slave WRITES a zone block header, and reads
+   `block->id != ZONEID` to validate it, while the master may be mid-Z_Malloc splitting that very
+   block.  Two consequences, both bad and both worse the busier the scene (more sprites -> more
+   slave draws -> more exposure): a torn tag, and an I_Error raised ON THE SLAVE, which has no way
+   to report it and simply stops -- which is what `SLV b0% id100%` with `to9:9490` looks like.
+   The retag is not needed here anyway: the master's own pass over the same sprite sets it.
+   Returns NULL when the lump is not cached; the slave must then skip, which it already does. */
+void* W_LumpCached (int lumpnum)
+{
+    if ((unsigned)lumpnum >= numlumps) return NULL;
+    /* CART/mapped WAD: W_CacheLumpNum returns a pointer INTO the mapped region and never fills
+       lumpinfo[].cache, so a bare `.cache` read would be NULL for every lump and the slave would
+       silently draw NO sprites at all.  Mirror what W_CacheLumpNum does (w_wad.c ~551). */
+    if (w_wadfile && w_wadfile->mapped != NULL)
+	return w_wadfile->mapped + lumpinfo[lumpnum].position;
+    return lumpinfo[lumpnum].cache;
+}
+
 int W_LumpResident (int lumpnum)
 {
     if ((unsigned)lumpnum >= numlumps) return 1;    /* bogus -> caller will I_Error anyway */

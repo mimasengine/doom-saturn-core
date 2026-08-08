@@ -167,6 +167,11 @@ int			r_composite_ovf = 0;   // # textures stubbed (extern, overlay 'tc')
    for the whole patch (see R_GetColumn).  Cumulative.  >0 means walls are drawing flat somewhere
    AND that this build would have HALTED before 2026-08-07 -- it is the crash, made measurable. */
 int			r_patch_ovf = 0;
+/* SATURN 2026-08-08: columns whose composite offset lay OUTSIDE texturecompositesize -- the
+   wrong-texture-for-one-frame bug (see the long note in R_GetColumn).  Cumulative; overlay `ob`
+   on row 12.  **It must read 0.**  Non-zero means R_GenerateLookup left a directory that does not
+   match the composite it sized, and every such column would have read another texture's pixels. */
+int			r_composite_oob = 0;
 /* SATURN: composites BUILT this ~1 s window.  R_GenerateComposite is a 8..32 KB column copy with
    NO disc read when the patches are still cached -- so the load budget's W_LumpResident predicate
    answers "free" and lets it through.  If `Bp` spikes track this counter, the cost is the REBUILD,
@@ -499,11 +504,21 @@ void R_GenerateLookup (int texnum)
 // directory is built on first R_GetColumn/R_GenerateComposite and left PU_CACHE (purgeable),
 // so Z_Malloc reclaims it under pressure.  Kept PU_STATIC only while R_GenerateLookup fills it
 // (its patchcount alloc must not purge the half-built directory), then demoted to PU_CACHE.
+/* SATURN 2026-08-08: how many times the SLOW path below actually ran.  R_GetColumn measured
+   500 us -- 14 000 SH-2 cycles -- per call on the owner's TNT MAP11 captures, and a directory
+   REBUILD (two Z_Mallocs plus R_GenerateLookup's patches x columns walk) is the only thing in
+   that function anywhere near that price.  If this tracks the call count, the R4 lazy directories
+   are a purge treadmill: they are PU_CACHE, R_GenerateLookup ALLOCATES, and Doom's Z_Malloc
+   purges whatever it scans over -- so rebuilding texture A's directory evicts B's and back.
+   Reset per frame in RP_BeginFrame; read as `e` (percent of calls) on overlay row 20. */
+int r_lookup_rebuilds = 0;
+
 static void R_EnsureLookup (int tex)
 {
     texture_t* t;
     if (texturecolumnlump[tex] && texturecolumnofs[tex])
 	return;					  // already resident
+    r_lookup_rebuilds++;
     t = textures[tex];
     // Pin BOTH dirs PU_STATIC across R_GenerateLookup.  lump[] and ofs[] are SEPARATE blocks:
     // a purge can free one while the other stays resident (PU_CACHE), so we can arrive here with
@@ -599,12 +614,41 @@ R_GetColumn_impl
     }
 
     if (!texturecomposite[tex])
+    {
 	R_GenerateComposite (tex);
+	/* SATURN 2026-08-08 (a): `ofs` was read ABOVE, and R_GenerateComposite re-runs
+	   R_EnsureLookup, which can REBUILD the directory -- so the offset in hand may now be
+	   stale and point at another column of the freshly-sized composite.  Re-read it. */
+	ofs = texturecolumnofs[tex][col];
+    }
     else if (sat_texcache_active && texturecomposite[tex] != r_column_stub)
 	R_TexCacheTouch (texturecomposite[tex]);   // keep visible composites resident
 
     if (texturecomposite[tex] == r_column_stub)   // SATURN garde-COMPOSITE: OOM sentinel -> placeholder, no crash/OOB
 	return r_column_stub;
+
+    /* SATURN 2026-08-08 (b) -- THE WRONG-TEXTURE-FOR-ONE-FRAME BUG, owner-reported: *"je vois
+       parfois les mauvaises textures apparaitre a certains endroits, sur une frame"*, and
+       crucially *"c'est une autre VRAIE texture"*.  A real, coherent texture is not a
+       use-after-free (that reads whatever took the block: noise); it is an IN-RANGE read of a
+       block that is not ours.  Mechanism, all of it in R_GenerateLookup above: it sets
+       `texturecompositesize[texnum] = 0`, pre-seeds every column to (-1, 0) = "use the composite
+       at offset 0", and then BOTH early returns -- the garde-PATCH one and vanilla's own "column
+       without a patch" -- leave that state in place.  R_GetColumn then takes the composite path,
+       R_GenerateComposite allocates a ZERO-sized block, and R_DrawColumn reads `height` bytes off
+       the end of it, straight into the neighbouring zone block -- which in a zone full of
+       composites is very often ANOTHER TEXTURE'S COMPOSITE.  The pre-seed did not create the
+       hole (vanilla's early return has the same shape) but it made it reachable and coherent:
+       before, those arrays were UNINITIALISED, so the same path gave noise or a crash.
+       Cheapest correct answer: refuse the out-of-range read.  The wall draws the placeholder for
+       as long as the directory stays inconsistent and heals the moment it is rebuilt properly --
+       exactly the contract the neighbouring gardes already have.  Counted as `ob` on row 12. */
+    if ((unsigned)ofs + (unsigned)textures[tex]->height
+	> (unsigned)texturecompositesize[tex])
+    {
+	r_composite_oob++;
+	return r_column_stub;
+    }
 
     return texturecomposite[tex] + ofs;
 }

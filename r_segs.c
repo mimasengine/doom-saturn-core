@@ -294,14 +294,29 @@ static int sat_wall_io_flat (int tex)
     return 1;
 }
 
-/* Flat colour for an IO-flattened tier, resolved ONCE PER TIER (the draw sites below live INSIDE
-   the column loop -- calling this there counted `nocol` per COLUMN, which is why it read larger
-   than `flat`, and paid a peek per column for nothing).  MUST NOT call R_WallPotatoColor: that
-   walks the texture through R_GetColumn and would perform the very read we are avoiding. */
+/* Flat colour for a flattened tier, resolved ONCE PER TIER (the draw sites below live INSIDE the
+   column loop -- calling this there counted `nocol` per COLUMN, which is why it read larger than
+   `flat`, and paid a peek per column for nothing).
+   SATURN 2026-08-08 -- THE GREY WALLS.  Owner: *"je vois parfois les mauvaises textures... des
+   textures grises au lieu des vertes"*, then the decisive clarification: *"ça arrive quand l'écran
+   est surchargé de murs"*.  Grey IS `SAT_WALL_FLAT_UNKNOWN`: the tier drew flat with the neutral
+   index because nothing had primed its dominant colour.  The peek-only rule dates from when the
+   budget counted READS and computing a colour meant a possible ~42 ms disc fault -- the owner's
+   own 2026-08-06 catch, *"on a pas la couleur si on ne lit pas le cd"*.  But on HIS trigger there
+   is no disc at all: a wall-dense view exhausts the VDP1 wtex slots, `wall_tex_resolve` returns
+   -1, the tier degrades to a flat quad -- and the texture is RESIDENT.  Walking it is pure CPU and
+   memoised for the level.  So compute it whenever we can look without paying disc, and keep grey
+   for the one case it was written for: a texture that really is not there yet. */
 static int sat_wall_flat_color (int tex)
 {
     int c = R_WallPotatoColorPeek (tex);
-    if (c < 0) { c = SAT_WALL_FLAT_UNKNOWN; sat_wall_flat_nocol++; }
+    if (c < 0)
+    {
+	if (R_TextureIOFree (tex) || R_LoadBudgetLeft ())
+	    c = R_WallPotatoColor (tex);
+	else
+	    { c = SAT_WALL_FLAT_UNKNOWN; sat_wall_flat_nocol++; }
+    }
     return c;
 }
 extern int  sat_wall_paint;   /* SATURN debug paint (r_data.c): bit1 = CPU walls flat red */
