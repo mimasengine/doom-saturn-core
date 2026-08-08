@@ -1166,6 +1166,7 @@ int sat_potato_floors = 0;
 /* SATURN per-frame texture LOAD BUDGET, plane half (walls own the budget in r_segs.c). */
 extern int sat_tex_load_budget, sat_tex_load_spent;
 extern int R_LoadBudgetLeft (void);   /* SATURN: r_segs.c -- 1 = the frame can still afford a fault */
+extern int sat_budget_refused;        /* SATURN: r_segs.c -- 1 once the budget has refused something */
 extern int W_LumpResident (int lump);
 extern int R_FlatPotatoColorPeek (int lumpnum);
 int sat_plane_flat_io    = 0;   /* visplanes drawn potato for want of residency (~1 s window)  */
@@ -1551,7 +1552,9 @@ void R_DrawPlanes (void)
 	   second read).  It is otherwise only called by the potato mode, which is off in normal play,
 	   so the cache stayed empty and every gated plane fell back to neutral grey: measured
 	   `nocol` == the plane count on the owner's captures. */
-	if (flat_paid) R_FlatPotatoColor (lumpnum);
+	/* LAZY since 2026-08-08, same subject as the wall side: until the budget has actually
+	   refused something (sat_budget_refused, r_segs.c) this dominant colour is never read. */
+	if (flat_paid && sat_budget_refused) R_FlatPotatoColor (lumpnum);
 
 	planeheight = abs(pl->height-viewz);
 	light = (pl->lightlevel >> LIGHTSEGSHIFT)+extralight;

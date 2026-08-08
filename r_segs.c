@@ -231,6 +231,16 @@ int sat_tex_load_budget = 20;   /* ms of medium wall-clock allowed per frame, 0 
 int sat_tex_load_spent  = 0;    /* tenths of a ms spent this frame (read off the clock, not counted) */
 static unsigned int sat_tex_load_mark = 0;   /* w_cd_ms10 at the start of this frame */
 extern unsigned int w_cd_ms10;               /* core w_wad.c */
+/* SATURN 2026-08-08: 1 once the budget has ACTUALLY refused something on this run.  It gates the
+   dominant-colour PRIMING (R_WallPotatoColor / R_FlatPotatoColor), which exists solely so a
+   budget-flattened surface has a colour instead of neutral grey.  Measured cost of priming
+   eagerly: R_WallPotatoColor walks every other column of the WHOLE texture through R_GetColumn,
+   and the overlay caught it at up to ~34% of a peak Bp frame -- on a disc where `lb20:0/0/0` says
+   the budget never flattened anything, so every one of those walks produced a value nobody read.
+   It only became reachable when the budget was armed by default on 2026-08-07 (before that,
+   sat_wall_io_flat returned on its first line).  Sticky, never cleared: once the medium has proved
+   slow, keep priming -- the eager behaviour is the safe one, it is only the FREE case we owe. */
+int sat_budget_refused = 0;
 
 /* Refill: called once per rendered frame from R_ClearDrawSegs (r_bsp.c). */
 void R_LoadBudgetFrame (void)
@@ -245,7 +255,9 @@ int R_LoadBudgetLeft (void)
 {
     if (!sat_tex_load_budget) return 1;
     sat_tex_load_spent = (int)(w_cd_ms10 - sat_tex_load_mark);
-    return sat_tex_load_spent < sat_tex_load_budget * 10;
+    if (sat_tex_load_spent < sat_tex_load_budget * 10) return 1;
+    sat_budget_refused = 1;   /* the ONE funnel every refusal passes through -- see below */
+    return 0;
 }
 int sat_wall_flat_io    = 0;    /* tiers drawn flat for want of residency  (~1 s window)       */
 int sat_wall_flat_nocol = 0;    /* ...of which we had no cached colour either (~1 s window)    */
@@ -271,8 +283,11 @@ static int sat_wall_io_flat (int tex)
 	   and every flattened wall falls back to neutral grey -- measured `nocol` = 100% of `flat`
 	   on the owner's TNT MAP11 captures.  Priming here makes every later fallback for this
 	   texture exact, at the cost of one extra pass over a texture we are already loading.
-	   No `spent++`: the clock does the counting, and R_WallPotatoColor's own read is on it. */
-	R_WallPotatoColor (tex);
+	   No `spent++`: the clock does the counting, and R_WallPotatoColor's own read is on it.
+	   LAZY since 2026-08-08 (see sat_budget_refused): that "one extra pass" is a walk of every
+	   other column of the whole texture through R_GetColumn, and until the budget has refused
+	   something its product is never read.  Costs one neutral-grey frame at the first refusal. */
+	if (sat_budget_refused) R_WallPotatoColor (tex);
 	return 0;
     }
     sat_wall_flat_io++;
@@ -1692,6 +1707,11 @@ void R_RenderSegLoop (void)
     int io_col_mid  = io_flat_mid ? sat_wall_flat_color (midtexture)    : 0;
     int io_col_up   = io_flat_up  ? sat_wall_flat_color (toptexture)    : 0;
     int io_col_lo   = io_flat_lo  ? sat_wall_flat_color (bottomtexture) : 0;
+    /* SATURN PERF 2026-08-08: THE Bp SPLIT POINT.  Everything above is per-SEG (the VDP1/CPU
+       tier routing, hysteresis, clamp, subdivision, lead-fill arming, the load-budget gates);
+       everything below is per-COLUMN.  They scale with different quantities, so `BP` on row 20
+       reports them apart.  Single call, no early return above it -- audited 2026-08-08. */
+    RP_SegRoutMark ();
     for ( ; rw_x < rw_stopx ; rw_x++)
     {
 	/* SATURN L5: the CPU border columns of an edge-split wall (sat_we_on, armed in the claim

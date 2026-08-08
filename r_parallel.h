@@ -51,6 +51,7 @@ void RP_WallPrepLeave(void);
      P   = alloc (W_CacheLumpNum/Release per visplane) + makespans (the R_MakeSpans
            walk + R_MapPlane span math) + other (sort/sky/control). */
 void RP_SegLoopEnter(void);
+void RP_SegRoutMark(void);   /* SATURN: splits SegLoop into routing preamble | per-column loop */
 void RP_SegLoopLeave(void);
 void RP_FlatCacheEnter(void);
 void RP_FlatCacheLeave(void);

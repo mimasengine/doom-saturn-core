@@ -1325,8 +1325,21 @@ static unsigned short prof_bsp_end, prof_planes_end;
 static unsigned int   prof_wallprep;
 static unsigned short prof_wp_t0;
 /* SATURN PERF Phase-0a: finer Bp/P sub-splits (each a subset of Bp or P). */
-static unsigned int   prof_segloop;     /* R_RenderSegLoop (per-column loop) c Bp */
+static unsigned int   prof_segloop;     /* R_RenderSegLoop's PER-COLUMN loop only, c Bp (see RP_SegRoutMark) */
+static unsigned int   prof_segrout;     /* R_RenderSegLoop's per-seg routing preamble, c Bp                  */
 static unsigned short prof_sl_t0;
+/* Bp sub-split as PERCENTAGES, latched on the frame that set the window's Bp peak (row 20 `BP`). */
+static unsigned int   prof_bp_r_pct, prof_bp_c_pct, prof_bp_g_pct, prof_bp_g_n;
+static int            prof_bp_bad;   /* 1 = a ratio came out impossible -> row prints `B!` */
+/* SATURN 2026-08-08: R_GetColumn's own share of Bp -- the PER-COLUMN half of the ~60% that the
+   pad L+X mode-2 A/B attributed to texturing (that A/B removed the per-column fetch AND the
+   per-pixel texel read together).  prof_in_wp gates the accumulation to calls made from inside
+   R_StoreWallRange: R_GetColumn is also called for the sky column (r_plane.c, billed to P) and
+   the masked mid-texture (r_segs.c:181, billed to M), and counting those against a prof_wallprep
+   denominator would be a percentage of the wrong thing. */
+static unsigned int   prof_getcol, prof_getcol_n;
+static unsigned short prof_gc_t0;
+static int            prof_in_wp;
 static unsigned int   prof_flatalloc;   /* W_CacheLumpNum/Release per visplane c P  */
 static unsigned short prof_fc_t0;
 static unsigned int   prof_makespans;   /* R_MakeSpans walk + R_MapPlane span math c P */
@@ -1379,13 +1392,34 @@ void RP_WallPrepEnter(void)
     if (sat_wallprep_slave) return;   /* runs on the SLAVE -> its FRT is a different clock; don't
                                          time it here (the flush cost comes from prof_wpwait). */
     prof_wp_t0 = rp_frt();
+    prof_in_wp = 1;             /* gate R_GetColumn accounting to the wall-prep calls only */
 #endif
 }
 void RP_WallPrepLeave(void)
 {
 #if RP_PROF
     if (sat_wallprep_slave) return;
+    prof_in_wp = 0;
     prof_wallprep += (unsigned short)(rp_frt() - prof_wp_t0);
+#endif
+}
+
+/* SATURN 2026-08-08: bracket R_GetColumn (core r_data.c wraps its body for this).  Costs two FRT
+   reads per column, ~2% of a heavy frame, and that cost lands INSIDE the measurement -- so `g` is
+   an UPPER BOUND, and `n` is printed beside it so the inflation stays auditable. */
+void RP_GetColEnter(void)
+{
+#if RP_PROF
+    if (!prof_in_wp) return;
+    prof_gc_t0 = rp_frt();
+#endif
+}
+void RP_GetColLeave(void)
+{
+#if RP_PROF
+    if (!prof_in_wp) return;
+    prof_getcol += (unsigned short)(rp_frt() - prof_gc_t0);
+    prof_getcol_n++;
 #endif
 }
 
@@ -1394,6 +1428,19 @@ void RP_WallPrepLeave(void)
 void RP_SegLoopEnter(void)   {
 #if RP_PROF
     prof_sl_t0 = rp_frt();
+#endif
+}
+/* SATURN 2026-08-08: split R_RenderSegLoop in TWO.  Called once, immediately before the
+   per-column `for (; rw_x < rw_stopx; rw_x++)` loop: everything before it is the PER-SEG
+   ROUTING PREAMBLE (the Saturn-added CPU/VDP1 tier decisions, hysteresis, clamp, perspective
+   subdivision, lead-fill arming), everything after is vanilla's PER-COLUMN fill.  The two
+   scale with completely different things -- segs vs screen columns -- so a single `segloop`
+   number could not rank them, and Bp is now the whole frame (ld flat, disc silent). */
+void RP_SegRoutMark(void)    {
+#if RP_PROF
+    unsigned short now = rp_frt();
+    prof_segrout += (unsigned short)(now - prof_sl_t0);
+    prof_sl_t0 = now;
 #endif
 }
 void RP_SegLoopLeave(void)   {
@@ -1794,19 +1841,28 @@ void RP_BeginFrame(void)
        path too (rp_exec dispatches to the *_low executors).  Previously this
        bailed to fully-serial master rendering, so low-detail had no working
        parallel mode at all. */
+#if RP_PROF
+    /* SATURN 2026-08-08: EVERY per-frame profiler accumulator resets HERE, ABOVE the rp_disabled
+       branch.  It used to be duplicated in both branches, and that duplication rotted silently:
+       the Phase-0a split (segloop/segrout) and the R_GetColumn counters were added to the LOWER
+       copy only, while SHIPPING TAKES THE UPPER ONE (rp_disabled is true in the shipping config --
+       [[rp-disabled-kills-flat-wall-modes]]).  They accumulated across the whole level against a
+       per-frame prof_wallprep denominator, so every ratio pegged at 100% and read as a clean,
+       confident finding.  It cost a capture round and a wrong entry in the overlay legend.
+       ONE reset site, both paths.  Anything per-frame added below MUST go here. */
+    prof_wallprep = 0;                                                   /* Bp accumulator */
+    prof_segloop = prof_segrout = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
+    prof_getcol = prof_getcol_n = 0;                                     /* R_GetColumn share of Bp */
+    prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
+    prof_pp_cur_sum = prof_pp_cur_vq = 0;
+    prof_pp_cur_pic = -2147483647;   /* sentinel: no flat group open yet */
+    prof_pp_cur_h   = 0;
+    prof_floor_vq = prof_floor_vq_dom = prof_floor_vq_int = 0;           /* VDP1 floor estimate */
+    prof_ss_n = prof_ss_surf = prof_ss_q = prof_ss_q4 = 0;               /* pari A sizing */
+#endif
     if (rp_disabled) { rp_active=0;
 #if RP_PROF
         p3_t_begin = rp_frt();   /* P3 profiler: frame start (parity rows are off here) */
-        prof_wallprep = 0;       /* Bp accumulator (R_StoreWallRange); the parity reset is skipped here */
-        /* RBG0/VDP1-floor sizing: the P3 path skips the main reset below, so reset here too
-           (else the prof_plane and prof_floor counters accumulate across frames -> Vs/Vp
-           would never be per-frame). */
-        prof_plane_pix = prof_plane_dom = prof_plane_n = 0;
-        prof_pp_cur_sum = prof_pp_cur_vq = 0;
-        prof_pp_cur_pic = -2147483647;
-        prof_pp_cur_h   = 0;
-        prof_floor_vq = prof_floor_vq_dom = prof_floor_vq_int = 0;
-        prof_ss_n = prof_ss_surf = prof_ss_q = prof_ss_q4 = 0;
 #endif
         return; }
 #if RP_DEBUG
@@ -1821,16 +1877,8 @@ void RP_BeginFrame(void)
     spanfunc=RP_RecordSpan;
     rp_restart();
 #if RP_PROF
-    prof_begin = rp_frt();      /* recording starts now (slave runs in bg) */
-    prof_wallprep = 0;          /* reset the per-frame wall-prep accumulator */
-    prof_segloop = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
-    prof_plane_pix = prof_plane_dom = prof_plane_n = 0;   /* RBG0 candidate sizing */
-    prof_pp_cur_sum = 0;
-    prof_pp_cur_pic = -2147483647;   /* sentinel: no flat group open yet */
-    prof_pp_cur_h   = 0;
-    prof_floor_vq = prof_floor_vq_dom = prof_pp_cur_vq = 0;   /* VDP1 floor estimate (peak persists) */
-    prof_floor_vq_int = 0;
-    prof_ss_n = prof_ss_surf = prof_ss_q = prof_ss_q4 = 0;    /* pari A sizing (peak persists) */
+    prof_begin = rp_frt();      /* recording starts now (slave runs in bg) -- the accumulators
+                                   themselves were reset above the rp_disabled branch. */
 #endif
 }
 
@@ -1997,7 +2045,35 @@ static void rp_p3_prof_show(void)
        stalls -- they survive into resident mode -> a profiler artifact, now excluded). */
     if (rend <= RP_REC_SANE) {
         if (bw10 > (unsigned)sat_prof_pk_bw) sat_prof_pk_bw = (int)bw10;
-        if (bp10 > (unsigned)sat_prof_pk_bp) sat_prof_pk_bp = (int)bp10;
+        if (bp10 > (unsigned)sat_prof_pk_bp) {
+            sat_prof_pk_bp = (int)bp10;
+            /* SATURN 2026-08-08: latch the Bp SUB-SPLIT of THIS SAME FRAME.  Three independent
+               maxima would describe three different frames and prove nothing -- the lesson row 20
+               already taught with `c`/`n` against `e`.  So the split always describes the frame
+               that set `PK Bp` on row 4, which is the frame worth explaining.
+               Skipped under sat_wallprep_slave: bp10 is then the master's WAIT (prof_wpwait) and
+               the sub-terms were measured on the slave's own clock -- percentages of the wrong
+               denominator.  Row 20 then holds the last inline-mode value; read wp on row 7. */
+            if (!sat_wallprep_slave && prof_wallprep) {
+                unsigned int pc = prof_segloop * 100u / prof_wallprep;   /* per-column loop      */
+                unsigned int pr = prof_segrout * 100u / prof_wallprep;   /* per-seg routing      */
+                unsigned int pg = prof_getcol  * 100u / prof_wallprep;   /* R_GetColumn (c pc)   */
+                /* NO SILENT CLAMP.  A ratio over 100, or g > c when g is a SUBSET of c, means an
+                   accumulator outlived its frame -- exactly the defect that made `s00 r00 c100`
+                   read as a confident finding on 2026-08-08 (the resets sat in the branch of
+                   RP_BeginFrame that shipping never takes).  A truncated number that still looks
+                   plausible is worse than no number, so say it on the row: `B!` instead of `BP`.
+                   ⚠ The invariant is `g <= r + c`, NOT `g <= c`: R_GetColumn is called from the
+                   ROUTING PREAMBLE too, via R_WallPotatoColor in sat_wall_io_flat, which walks
+                   every other column of a whole texture.  `g <= c` was my first guess and the row
+                   correctly cried `B!` at it -- the model was wrong, not the measurement. */
+                prof_bp_bad   = (pc > 100u || pr > 100u || pg > 100u || pg > pc + pr);
+                prof_bp_c_pct = pc > 99u ? 99u : pc;
+                prof_bp_r_pct = pr > 99u ? 99u : pr;
+                prof_bp_g_pct = pg > 99u ? 99u : pg;
+                prof_bp_g_n   = prof_getcol_n > 99999u ? 99999u : prof_getcol_n;
+            }
+        }
         if (p10  > (unsigned)sat_prof_pk_p)  sat_prof_pk_p  = (int)p10;
         if (m10  > (unsigned)sat_prof_pk_m)  sat_prof_pk_m  = (int)m10;
         if (rend > prof_w_recmax) {
@@ -2031,6 +2107,33 @@ static void rp_p3_prof_show(void)
     if (sat_dbg_overlay_mode == 0) {
         snprintf(p, sizeof p, "SLV b%u%% id%u%% Pb%u%% w%u.%u ", busy_pct, idle_pct, pb_pct, w10/10, w10%10);
         dbg_print(0, 5, p);
+        /* row 20 -- the Bp DECOMPOSITION, all of it describing the frame that set `PK Bp` on row 4.
+           `r` = the per-SEG routing preamble (CPU/VDP1 tier choice, hysteresis, clamp, perspective
+           subdivision, lead-fill arming, the load-budget gates).  `c` = the per-COLUMN loop.  `g` =
+           R_GetColumn alone, a SUBSET of c, counting only calls made from inside R_StoreWallRange
+           (the sky column and the masked mid-texture are billed to P and M).  The remainder,
+           100-r-c, is R_StoreWallRange's own setup plus the sprite clip save.
+             g high  => the texture cost is PER-COLUMN: three calls per column on the single-patch
+                        path (R_EnsureLookup, W_LumpResident, W_CacheLumpNum + its Z_ChangeTag),
+                        so hoist the per-texture invariants -- minding that the R4 directory is
+                        purgeable.
+             g low   => it is PER-PIXEL, i.e. the R_DrawColumn inner loop.  Different chantier.
+           ⚠ `g` is an UPPER BOUND: two FRT reads per column (~2% of a heavy frame) land inside it.
+           ⚠ FIELDS MUST STAY IN COLUMNS 0-13 -- the VDP1 weapon sprite covers columns 14-27 of rows
+           19-21.  `BP r99 c99 g99` is exactly 14 chars; do not widen it. */
+        /* `r` and `c` are still COMPUTED (the B! invariant needs them) but no longer PRINTED: eight
+           captures settled them as near-CONSTANTS in absolute terms -- routing ~8 ms and per-pixel
+           fill ~14 ms whether the frame costs 40 ms or 312.  All of Bp's variance is `g`, which
+           went 10 -> 191 ms across the same captures.  So the row now carries `g` and, back in its
+           place, `n`: the COLUMN COUNT is what separates the two remaining hypotheses --
+             n roughly flat while g explodes => the cost PER CALL exploded (a purged R4 directory or
+               composite being REBUILT inside the column loop; watch `lg` on row 11, which fell
+               38-48K on the light frames to 22-29K on the heavy ones),
+             n explodes with g            => it is simply call volume, and the fix is d32xr's:
+               resolve the texture pointer ONCE PER WALL instead of once per column. */
+        snprintf(p, sizeof p, "%s g%02u n%u    ",
+                 prof_bp_bad ? "B!" : "BP", prof_bp_g_pct, prof_bp_g_n);
+        dbg_print(0, 20, p);
     }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one
        that actually runs (parity disabled), so the setter MUST live here too -- not only in

@@ -530,8 +530,37 @@ static void R_EnsureLookup (int tex)
 //
 // R_GetColumn
 //
+// SATURN PERF 2026-08-08: the public entry is a thin wrapper that brackets the real body, the
+// same shape R_StoreWallRange already uses.  The A/B on pad L+X mode 2 (sat_dc_solid: no
+// R_GetColumn, no per-pixel texel read) cut the worst Bp from 220.2 to 80.4 ms -- so texturing
+// is ~60% of the wall column loop -- but it removed a PER-COLUMN cost and a PER-PIXEL cost in
+// one gesture, and those two want completely different fixes.  This separates them: RP_GetCol*
+// accumulates ONLY the calls made from inside R_StoreWallRange (the sky column in r_plane.c and
+// the masked mid-texture in r_segs.c are billed to P and M, not Bp, and are gated out in
+// r_parallel.c).  Read `BP g<%%> n<calls>` on overlay row 20.
+//
+// The body is NOT trivial and that is the point: on the single-patch path it makes THREE calls
+// per column -- R_EnsureLookup (our R4 lazy directory), W_LumpResident (the 2026-08-07 garde),
+// and W_CacheLumpNum, whose already-cached branch still rewrites the tag through Z_ChangeTag.
+//
+void RP_GetColEnter (void);
+void RP_GetColLeave (void);
+static byte* R_GetColumn_impl (int tex, int col);
+
 byte*
 R_GetColumn
+( int		tex,
+  int		col )
+{
+    byte *r;
+    RP_GetColEnter ();
+    r = R_GetColumn_impl (tex, col);
+    RP_GetColLeave ();
+    return r;
+}
+
+static byte*
+R_GetColumn_impl
 ( int		tex,
   int		col )
 {
