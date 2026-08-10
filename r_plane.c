@@ -74,6 +74,14 @@ int r_visplane_pool_peak = 0;
    fallback slice (harmless span glitch, NOT a crash).  If this is ever non-zero
    on a scene you care about, raise VP_POOL_PLANES.  (On the overlay.) */
 int r_visplane_pool_ovf = 0;
+/* SATURN 2026-08-09: WINDOW HIGH-WATER of the above.  r_visplane_pool_ovf is zeroed every
+   R_ClearPlanes, i.e. once per VIEW, while the overlay prints once per ~1 s -- so the printed value
+   was almost always 0 even on a frame that overflowed, which is worse than not printing it.  Same
+   pattern as r_visplane_peak: core accumulates the max, the overlay prints and zeroes it.
+   ⚠ WHY THIS MATTERS: VP_POOL_PLANES is 64 while the overlay shows `vp` against MAXVISPLANES 256,
+   so at vp120 the screen actively reassures you while every plane past the 64th shares ONE fallback
+   slice pair and each new overflower's memset wipes the previous one's spans. */
+int r_visplane_pool_ovf_pk = 0;
 visplane_t*		lastvisplane;
 visplane_t*		floorplane;
 visplane_t*		ceilingplane;
@@ -481,6 +489,8 @@ void R_ClearPlanes (void)
     r_opening_ovf = 0;   /* SATURN garde-OPENINGS: per-frame reset of the overflow-redirect count */
 #if SAT_VISPLANE_POOL
     plane_pool_ptr = plane_pool;   /* bump-reset the span pool for the new frame */
+    if (r_visplane_pool_ovf > r_visplane_pool_ovf_pk)
+	r_visplane_pool_ovf_pk = r_visplane_pool_ovf;   /* survive the per-view reset -> overlay `vp<peak>.<ovf>` */
     r_visplane_pool_ovf = 0;
 #endif
 

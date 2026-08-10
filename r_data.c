@@ -504,21 +504,23 @@ void R_GenerateLookup (int texnum)
 // directory is built on first R_GetColumn/R_GenerateComposite and left PU_CACHE (purgeable),
 // so Z_Malloc reclaims it under pressure.  Kept PU_STATIC only while R_GenerateLookup fills it
 // (its patchcount alloc must not purge the half-built directory), then demoted to PU_CACHE.
-/* SATURN 2026-08-08: how many times the SLOW path below actually ran.  R_GetColumn measured
-   500 us -- 14 000 SH-2 cycles -- per call on the owner's TNT MAP11 captures, and a directory
-   REBUILD (two Z_Mallocs plus R_GenerateLookup's patches x columns walk) is the only thing in
-   that function anywhere near that price.  If this tracks the call count, the R4 lazy directories
-   are a purge treadmill: they are PU_CACHE, R_GenerateLookup ALLOCATES, and Doom's Z_Malloc
-   purges whatever it scans over -- so rebuilding texture A's directory evicts B's and back.
-   Reset per frame in RP_BeginFrame; read as `e` (percent of calls) on overlay row 20. */
-int r_lookup_rebuilds = 0;
+/* SATURN 2026-08-10: `r_lookup_rebuilds` (added 08-08, printed as row-20 `e` on 08-09) is GONE, and
+   the theory it was built to prove is DEAD.  It was meant to show a directory purge treadmill paying
+   for R_GetColumn's measured 500 us/call.  It was then MEASURED on TNT MAP11: e04 with n388 means
+   ~17 rebuilds on a 164.7 ms Bp frame, and ONE rebuild is 3 zone allocs + ~384 loop iterations +
+   ~1.4 KB written = ~0.18 ms.  17 x 0.18 = ~3 ms of a 130 ms hole -- you would need ~720.
+   The cost half of the treadmill story is separately refuted: z_zone.c's z_scan_steps read 0 on this
+   same map, so Z_Malloc is NOT walking the whole block list.  The PREMISE (blocks are being purged
+   under the render) survives and already has a better witness on screen: row 12 `st`, counted on the
+   SLAVE through R_GetColumnCached, which went 0.5% -> 5% of lead spans over the same 8 seconds.
+   Row 20 now carries `g` = R_GetColumn's own milliseconds, which is the number that actually sizes
+   this.  Do not re-add a rebuild COUNT; if g comes back high, add a per-rebuild ms TIMER instead. */
 
 static void R_EnsureLookup (int tex)
 {
     texture_t* t;
     if (texturecolumnlump[tex] && texturecolumnofs[tex])
 	return;					  // already resident
-    r_lookup_rebuilds++;
     t = textures[tex];
     // Pin BOTH dirs PU_STATIC across R_GenerateLookup.  lump[] and ofs[] are SEPARATE blocks:
     // a purge can free one while the other stays resident (PU_CACHE), so we can arrive here with
@@ -807,6 +809,50 @@ int R_WallPotatoColorPeek (int tex)
 {
     if (tex < 0 || tex >= numtextures || !wallpot_cache) return -1;
     return wallpot_cache[tex];
+}
+
+/* SATURN 2026-08-09 -- ALLOCATION-FREE, SLAVE-SAFE column fetch.  R_GetColumn cannot be used off
+   the master or across a frame: it calls R_EnsureLookup / R_GenerateComposite / W_CacheLumpNum,
+   all of which Z_Malloc, and Z_Malloc purges PU_CACHE blindly.
+   THE BUG THIS EXISTS FOR (owner-confirmed by A/B on pad R+Right, row 13 `L1s` <-> `L1-`):
+   the LEAD-FILL recorded a RAW `dc_source` pointer during the BSP walk (r_segs.c) and the SLAVE
+   dereferenced it a whole frame later, concurrently with the master's R_DrawPlanes.  Every
+   allocation in between -- the rest of the wall loop, then every flat R_DrawPlanes loads -- could
+   purge the very block it pointed into, and the freed run was immediately handed to the next
+   texture.  `sp->src` is not a registered zone user pointer, so nothing NULLed it: the span drew
+   an IN-RANGE read of a fully-built NEIGHBOUR = "une autre VRAIE texture", changing every frame,
+   only under zone pressure, and tripping NO counter (every existing garde validates at
+   R_GetColumn time, none at drain time).  It was 1p-only because the drain is.
+   Contract: read-only, never allocates, never touches the texture cache, and answers NULL for any
+   doubt -- purged directory, purged/stubbed composite, non-resident lump, out-of-range offset.
+   NULL means "draw this span flat", never "read it anyway". */
+const byte* R_GetColumnCached (int tex, int col)
+{
+    int   lump, ofs;
+    byte *p;
+
+    if ((unsigned)tex >= (unsigned)numtextures) return NULL;
+    col &= texturewidthmask[tex];
+    /* Both directories are PU_CACHE with REGISTERED user pointers (R_EnsureLookup), so a purge
+       NULLs the slot we are about to read -- that is what makes this test sound.  They are also
+       two SEPARATE blocks: one can be gone while the other lives, hence both tests. */
+    if (!texturecolumnlump[tex] || !texturecolumnofs[tex])
+	return NULL;
+    lump = texturecolumnlump[tex][col];
+    ofs  = texturecolumnofs[tex][col];
+
+    if (lump > 0)				  /* single-patch column: served from the patch */
+    {
+	p = (byte *)W_LumpCached (lump);	  /* resident-or-NULL; never reads the disc */
+	return p ? p + ofs : NULL;
+    }
+
+    if (!texturecomposite[tex] || texturecomposite[tex] == r_column_stub)
+	return NULL;				  /* purged, or the OOM sentinel */
+    if ((unsigned)ofs + (unsigned)textures[tex]->height
+	> (unsigned)texturecompositesize[tex])
+	return NULL;				  /* same garde as R_GetColumn's `ob` */
+    return texturecomposite[tex] + ofs;
 }
 
 /* SATURN: 1 = drawing this texture costs NO disc I/O this frame.  Conservative -- any doubt

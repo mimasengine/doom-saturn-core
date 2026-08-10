@@ -269,6 +269,9 @@ int sat_wall_flat_nocol = 0;    /* ...of which we had no cached colour either (~
 extern int  R_TextureIOFree (int tex);
 extern int  R_WallPotatoColorPeek (int tex);
 extern int  R_WallPotatoColor (int tex);
+/* Read-only, never allocates, NULL for any doubt -- the ONLY column fetch legal off the master or
+   across a phase boundary.  See the long note at its definition in r_data.c. */
+extern const byte* R_GetColumnCached (int tex, int col);
 
 /* 1 = draw this tier FLAT because texturing it would hit the disc and the frame's budget is spent. */
 static int sat_wall_io_flat (int tex)
@@ -614,13 +617,31 @@ int sat_lead_mode   = 1;
 #define sat_lead_flat (sat_lead_mode == 2)
 
 /* Recorded difference spans, drained by the slave.  Z_Malloc'd with the quad history (Doom heap,
-   LWRAM) so the HWRAM pool pays nothing.  src == 0 means SOLID, colour in `col`. */
-typedef struct { short x, yl, yh, col; const byte *src; const byte *cmap;
+   LWRAM) so the HWRAM pool pays nothing.  `tex < 0` means SOLID, colour in `col`.
+   ⚠ 2026-08-09 -- THIS RECORD USED TO HOLD A RAW `dc_source` POINTER, AND THAT WAS THE
+   WRONG-TEXTURE BUG.  The span is recorded during the BSP walk and drawn by the SLAVE a whole
+   phase later, concurrently with the master's R_DrawPlanes; every allocation in between (the rest
+   of the wall loop, then every flat the planes load) can purge the PU_CACHE block the pointer
+   aimed at, and Z_Free NULLs only REGISTERED user pointers -- `src` was not one.  The freed run is
+   reused immediately by the next texture, so the span drew an IN-RANGE read of a fully-built
+   neighbour: a different REAL texture, changing every frame, only under zone pressure, counted by
+   nothing.  Owner-confirmed by A/B on pad R+Right (row 13 `L1s` shows it, `L1-` does not).
+   The fix is to store the KEY, not the address, and re-resolve at drain time through the
+   allocation-free R_GetColumnCached -- which answers NULL for anything doubtful, so a purged
+   column draws FLAT for one frame instead of drawing somebody else's pixels.
+   `col` is therefore filled on BOTH paths now: it is the solid colour, and it is also the fallback
+   when the re-resolve fails.  Same 24-byte record as before (two shorts replace one pointer). */
+typedef struct { short x, yl, yh, col; short tex, tcol; const byte *cmap;
 		 fixed_t iscale, texmid; } sat_leadspan_t;
 #define SAT_LEADSPAN_MAX 1536
 static sat_leadspan_t *sat_lead_spans;
 static int sat_lead_span_n;
 int sat_lead_span_drop;      /* spans the cap refused this frame -- silence would read as "nothing to do" */
+int sat_lead_stale;          /* spans whose source was GONE by drain time -> drawn flat instead of
+			        drawing a neighbour's pixels.  Overlay row 12 `st`, with the other
+			        gardes that must read 0.  Every one of these was a wrong texture
+			        before 2026-08-09; a persistent non-zero means the purge pressure is
+			        real and the lead-fill is fighting the zone, not that it is broken. */
 
 /* Drain the recorded spans.  Runs on the SLAVE, CONCURRENTLY with the master's R_DrawPlanes, so it
    must not touch a single dc_* global (the master's sky columns use them).  Everything it needs is
@@ -643,16 +664,24 @@ void R_LeadSlaveDraw (void)
     {
 	const sat_leadspan_t *sp = &sat_lead_spans[i];
 	int count = sp->yh - sp->yl;
+	const byte *src;
 	byte *dest;
 	if (count < 0) continue;
 	if ((unsigned)sp->x >= (unsigned)SCREENWIDTH || sp->yl < 0 || sp->yh >= viewheight) continue;
+	/* RE-RESOLVE HERE, not at record time.  R_GetColumnCached only reads -- it never allocates,
+	   so it is safe on the slave, and it answers NULL the moment the source stopped being
+	   reachable (directory purged, composite purged/stubbed, lump evicted).  NULL => this span
+	   draws FLAT in the texture's own dominant colour for one frame, which is the whole point:
+	   the old code held the stale ADDRESS and drew a neighbour's pixels instead. */
+	src = (sp->tex < 0) ? NULL : R_GetColumnCached (sp->tex, sp->tcol);
+	if (!src && sp->tex >= 0) sat_lead_stale++;   /* overlay row 12 `st` -- MUST tend to 0 */
 	if (lowdraw)
 	{
 	    int x = sp->x << 1;
 	    byte *d2;
 	    dest = ylookup[sp->yl] + columnofs[x];
 	    d2   = ylookup[sp->yl] + columnofs[x + 1];
-	    if (!sp->src)
+	    if (!src)
 	    {
 		byte c = sp->cmap[(unsigned char)sp->col];
 		do { *d2 = *dest = c; dest += SCREENWIDTH; d2 += SCREENWIDTH; } while (count--);
@@ -660,7 +689,7 @@ void R_LeadSlaveDraw (void)
 	    else
 	    {
 		fixed_t frac = sp->texmid + (sp->yl - centery) * sp->iscale;
-		do { byte px = sp->cmap[sp->src[(frac >> FRACBITS) & 127]];
+		do { byte px = sp->cmap[src[(frac >> FRACBITS) & 127]];
 		     *d2 = *dest = px; dest += SCREENWIDTH; d2 += SCREENWIDTH; frac += sp->iscale; }
 		while (count--);
 	    }
@@ -668,7 +697,7 @@ void R_LeadSlaveDraw (void)
 	else
 	{
 	    dest = ylookup[sp->yl] + columnofs[sp->x];
-	    if (!sp->src)
+	    if (!src)
 	    {
 		byte c = sp->cmap[(unsigned char)sp->col];
 		do { *dest = c; dest += SCREENWIDTH; } while (count--);
@@ -676,7 +705,7 @@ void R_LeadSlaveDraw (void)
 	    else
 	    {
 		fixed_t frac = sp->texmid + (sp->yl - centery) * sp->iscale;
-		do { *dest = sp->cmap[sp->src[(frac >> FRACBITS) & 127]];
+		do { *dest = sp->cmap[src[(frac >> FRACBITS) & 127]];
 		     dest += SCREENWIDTH; frac += sp->iscale; }
 		while (count--);
 	    }
@@ -687,6 +716,17 @@ void R_LeadSlaveDraw (void)
 int  R_LeadSpanCount (void) { return sat_lead_span_n; }
 void R_LeadSpanReset (void) { sat_lead_span_n = 0; }
 
+/* The COLUMN KEY of whatever dc_source was last set from, stamped by SAT_LEAD_KEY at each of the
+   three R_GetColumn sites in the seg loop.  This is what the record stores instead of the address
+   -- see the sat_leadspan_t comment.  `fb` is the flat fallback colour, peeked (never loaded) once
+   per column rather than per span. */
+static short sat_lead_tex = -1, sat_lead_tcol = 0, sat_lead_fb = SAT_WALL_FLAT_UNKNOWN;
+#define SAT_LEAD_KEY(t,c) do {						\
+	sat_lead_tex = (short)(t); sat_lead_tcol = (short)(c);		\
+	{ int _fb = R_WallPotatoColorPeek (t);				\
+	  sat_lead_fb = (short)(_fb < 0 ? SAT_WALL_FLAT_UNKNOWN : _fb); }	\
+    } while (0)
+
 static void sat_lead_span_add (int yl, int yh)
 {
     sat_leadspan_t *sp;
@@ -694,8 +734,9 @@ static void sat_lead_span_add (int yl, int yh)
     sp = &sat_lead_spans[sat_lead_span_n++];
     sp->x = (short)dc_x; sp->yl = (short)yl; sp->yh = (short)yh;
     sp->cmap = dc_colormap;
-    if (sat_dc_solid) { sp->src = 0; sp->col = (short)sat_wall_color; sp->iscale = 0; sp->texmid = 0; }
-    else              { sp->src = dc_source; sp->col = 0;
+    if (sat_dc_solid) { sp->tex = -1; sp->tcol = 0; sp->col = (short)sat_wall_color;
+			sp->iscale = 0; sp->texmid = 0; }
+    else              { sp->tex = sat_lead_tex; sp->tcol = sat_lead_tcol; sp->col = sat_lead_fb;
 			sp->iscale = dc_iscale; sp->texmid = dc_texturemid; }
 }
 
@@ -1845,7 +1886,8 @@ void R_RenderSegLoop (void)
 		int lflat = wall_solid || sat_lead_flat;   /* see sat_lead_flat */
 		if (lflat)            sat_wall_color = R_WallPotatoColor(midtexture);
 		else if (io_flat_mid) { sat_wall_color = io_col_mid; lflat = 1; }
-		else                  dc_source = R_GetColumn(midtexture, texturecolumn);
+		else                { dc_source = R_GetColumn(midtexture, texturecolumn);
+				      SAT_LEAD_KEY (midtexture, texturecolumn); }
 		sat_dc_solid = lflat;
 		sat_lead_draw (&sat_lead_mid, rw_x, yl, yh);
 		sat_dc_solid = 0;
@@ -1893,7 +1935,8 @@ void R_RenderSegLoop (void)
 			int lflat = wall_solid || sat_lead_flat;   /* see sat_lead_flat */
 			if (lflat)           sat_wall_color = R_WallPotatoColor(toptexture);
 			else if (io_flat_up) { sat_wall_color = io_col_up; lflat = 1; }
-			else                 dc_source = R_GetColumn(toptexture, texturecolumn);
+			else               { dc_source = R_GetColumn(toptexture, texturecolumn);
+					     SAT_LEAD_KEY (toptexture, texturecolumn); }
 			sat_dc_solid = lflat;
 			sat_lead_draw (&sat_lead_up, rw_x, yl, mid);
 			sat_dc_solid = 0;
@@ -1949,7 +1992,8 @@ void R_RenderSegLoop (void)
 			int lflat = wall_solid || sat_lead_flat;   /* see sat_lead_flat */
 			if (lflat)           sat_wall_color = R_WallPotatoColor(bottomtexture);
 			else if (io_flat_lo) { sat_wall_color = io_col_lo; lflat = 1; }
-			else                 dc_source = R_GetColumn(bottomtexture, texturecolumn);
+			else               { dc_source = R_GetColumn(bottomtexture, texturecolumn);
+					     SAT_LEAD_KEY (bottomtexture, texturecolumn); }
 			sat_dc_solid = lflat;
 			sat_lead_draw (&sat_lead_lo, rw_x, mid, yh);
 			sat_dc_solid = 0;

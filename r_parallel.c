@@ -1329,7 +1329,7 @@ static unsigned int   prof_segloop;     /* R_RenderSegLoop's PER-COLUMN loop onl
 static unsigned int   prof_segrout;     /* R_RenderSegLoop's per-seg routing preamble, c Bp                  */
 static unsigned short prof_sl_t0;
 /* Bp sub-split as PERCENTAGES, latched on the frame that set the window's Bp peak (row 20 `BP`). */
-static unsigned int   prof_bp_r_pct, prof_bp_c_pct, prof_bp_g_pct, prof_bp_g_n, prof_bp_e_pct;
+static unsigned int   prof_bp_r_pct, prof_bp_c_pct, prof_bp_g_pct, prof_bp_g_n, prof_bp_g_ms;
 static int            prof_bp_bad;   /* 1 = a ratio came out impossible -> row prints `B!` */
 /* SATURN 2026-08-08: R_GetColumn's own share of Bp -- the PER-COLUMN half of the ~60% that the
    pad L+X mode-2 A/B attributed to texturing (that A/B removed the per-column fetch AND the
@@ -1853,7 +1853,7 @@ void RP_BeginFrame(void)
     prof_wallprep = 0;                                                   /* Bp accumulator */
     prof_segloop = prof_segrout = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
     prof_getcol = prof_getcol_n = 0;                                     /* R_GetColumn share of Bp */
-    { extern int r_lookup_rebuilds; r_lookup_rebuilds = 0; }             /* R4 directory rebuilds   */
+    /* (r_lookup_rebuilds reset REMOVED 2026-08-10 with row-20 `e` -- see core/r_data.c:507) */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
     prof_pp_cur_sum = prof_pp_cur_vq = 0;
     prof_pp_cur_pic = -2147483647;   /* sentinel: no flat group open yet */
@@ -2073,13 +2073,16 @@ static void rp_p3_prof_show(void)
                 prof_bp_r_pct = pr > 99u ? 99u : pr;
                 prof_bp_g_pct = pg > 99u ? 99u : pg;
                 prof_bp_g_n   = prof_getcol_n > 99999u ? 99999u : prof_getcol_n;
-                {   /* `e` = share of those calls that REBUILT an R4 directory (the 14 000-cycle
-                       path).  e near 100 => the lazy directories are thrashing and THAT is Bp. */
-                    extern int r_lookup_rebuilds;
-                    unsigned int pe = prof_getcol_n
-                        ? (unsigned int)r_lookup_rebuilds * 100u / prof_getcol_n : 0u;
-                    prof_bp_e_pct = pe > 99u ? 99u : pe;
-                }
+                /* SATURN 2026-08-10: `g` restored, in absolute MILLISECONDS this time (it was a
+                   PERCENTAGE until 2026-08-09, then cut for `e`).  `e` is gone: it was rebuilds
+                   measured ANYWHERE over calls counted only INSIDE Bp -- two different populations,
+                   so it could legitimately exceed 100 and was silently clamped to 99, and the
+                   rebuilds it counts are worth ~0.18 ms each (3 zone allocs, ~384 iterations), i.e.
+                   ~3 ms for the 17 the 165 ms frame did.  It cannot be the hole and it cost the one
+                   number that can size it.  ms, not %, because a percentage of Bp cannot separate
+                   "Bp grew and g kept its share" from "g IS the growth". */
+                prof_bp_g_ms  = prof_getcol / 224u;   /* FRT ticks -> ms, same divisor as bp10 */
+                if (prof_bp_g_ms > 999u) prof_bp_g_ms = 999u;
             }
         }
         if (p10  > (unsigned)sat_prof_pk_p)  sat_prof_pk_p  = (int)p10;
@@ -2139,10 +2142,22 @@ static void rp_p3_prof_show(void)
                38-48K on the light frames to 22-29K on the heavy ones),
              n explodes with g            => it is simply call volume, and the fix is d32xr's:
                resolve the texture pointer ONCE PER WALL instead of once per column. */
-        /* `g` (82-89% in every capture) gave up its column to `e`, the decisive new number.
-           `e` = % of R_GetColumn calls that REBUILT an R4 column directory. */
-        snprintf(p, sizeof p, "%s e%02u n%u    ",
-                 prof_bp_bad ? "B!" : "BP", prof_bp_e_pct, prof_bp_g_n);
+        /* 🔴 2026-08-10 -- `g` IS BACK, and in ms.  It was cut for `e` on 08-09; the very next
+           capture (TNT MAP11, Bp = 164.7 ms on ONE frame with n = 388) needed exactly it and could
+           not be read.  The arithmetic forks and BOTH horns are refuted without g:
+             164.7 ms / 388 calls = 424 us/call = ~12 150 cycles -- nothing on R_GetColumn's
+             resident fast path costs that, AND 17 directory rebuilds at ~0.18 ms are ~3 ms, not
+             130.  So one of the two INPUTS is wrong, and g is the only unmeasured one.
+           Owner measured the free A/B first (pad R+Right -> `L0-`): Bp did NOT collapse, so the
+           calls are real wall columns, not lead-fill.  Read it as:
+             g ~= Bp - 25 ms  => the cost is PER CALL (texture management; hoist per-texture
+                                 invariants out of the column loop, minding the purgeable R4 dir),
+             g < 30 ms        => it is PER PIXEL (R_DrawColumn) and R_GetColumn is exonerated.
+           ⚠ `g` is an UPPER BOUND: two FRT reads per column (~2% of a heavy frame) land inside it.
+           ⚠ FIELDS MUST STAY IN COLUMNS 0-13 (the VDP1 weapon covers 14-27 of rows 19-21):
+           `B! g999 n99999` is exactly 14 chars, the worst case.  Do not widen it. */
+        snprintf(p, sizeof p, "%s g%u n%u    ",
+                 prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_g_n);
         dbg_print(0, 20, p);
     }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one
