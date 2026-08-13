@@ -1330,6 +1330,7 @@ static unsigned int   prof_segrout;     /* R_RenderSegLoop's per-seg routing pre
 static unsigned short prof_sl_t0;
 /* Bp sub-split as PERCENTAGES, latched on the frame that set the window's Bp peak (row 20 `BP`). */
 static unsigned int   prof_bp_r_pct, prof_bp_c_pct, prof_bp_g_pct, prof_bp_g_n, prof_bp_g_ms;
+static unsigned int   prof_bp_b;      /* composites built on the PK-Bp frame (row 20 `b`) */
 static int            prof_bp_bad;   /* 1 = a ratio came out impossible -> row prints `B!` */
 /* SATURN 2026-08-08: R_GetColumn's own share of Bp -- the PER-COLUMN half of the ~60% that the
    pad L+X mode-2 A/B attributed to texturing (that A/B removed the per-column fetch AND the
@@ -1853,6 +1854,7 @@ void RP_BeginFrame(void)
     prof_wallprep = 0;                                                   /* Bp accumulator */
     prof_segloop = prof_segrout = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
     prof_getcol = prof_getcol_n = 0;                                     /* R_GetColumn share of Bp */
+    { extern int r_composite_n; r_composite_n = 0; }                     /* composites built THIS frame */
     /* (r_lookup_rebuilds reset REMOVED 2026-08-10 with row-20 `e` -- see core/r_data.c:507) */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
     prof_pp_cur_sum = prof_pp_cur_vq = 0;
@@ -1937,9 +1939,27 @@ void RP_BeginMasked(void)
    defined unconditionally so the platform links them with RP_PROF off (then 0). */
 #define RP_HBUCKETS  64
 #define RP_HBWIDTH   20            /* tenths-ms per bucket = 2.0 ms; histogram covers 0..128 ms */
-#define RP_REC_SANE  3000          /* tenths-ms (300 ms): frames above this = transition/glitch
-                                      (a stale FRT phase mark -> wrapped delta -> bogus 400-650ms
-                                      REC with an impossible M + out-of-bounds MX); dropped. */
+#define RP_REC_SANE  6000          /* tenths-ms.  🔴 2026-08-12: 3000 -> 6000, because at 300 ms this
+                                      guard had started CENSORING THE SIGNAL and could never catch the
+                                      artefact it was written for.
+                                        THE ARITHMETIC: b10/p10/m10 are each ONE 16-bit FRT delta
+                                      (`(unsigned short)(a - b) * 10u / 224u`, :1995-1997), so a wrapped
+                                      delta cannot exceed 65535/224 = 292.6 ms -- it aliases DOWN, into
+                                      the range the bound calls sane.  A 300 ms cut therefore rejects
+                                      approximately zero glitches and an increasing number of REAL
+                                      frames: the owner's TNT MAP11 capture read mx295.4, i.e. 1.5%
+                                      under the clip, with d5 = five frames thrown away.  A maximum
+                                      pinned just below its own censor is the signature of censoring,
+                                      not of a physical ceiling -- and everything downstream (PK, MXd,
+                                      the g/b latch, the histogram, the MX locator) lives inside the
+                                      gate, so the whole profiler was reporting maxima over the
+                                      SURVIVING population only.
+                                        6000 keeps a net (the sum of three phases maxes at ~878 ms by
+                                      the same wrap arithmetic, so 600 ms is still well inside the
+                                      representable range) while clearing the 40-300 ms band the port
+                                      actually operates in.  If a glitch class needs catching again,
+                                      discriminate on the SIGNATURE the comment already named --
+                                      impossible M, out-of-bounds MX -- not on a total-ms bound. */
 int sat_prof_rec_max=0;            /* window max (= p100), tenths-ms */
 int sat_prof_dropped=0;            /* glitch/transition frames excluded from the window */
 int sat_prof_pk_bw=0, sat_prof_pk_bp=0, sat_prof_pk_p=0, sat_prof_pk_m=0;  /* per-phase peaks */
@@ -2083,6 +2103,16 @@ static void rp_p3_prof_show(void)
                    "Bp grew and g kept its share" from "g IS the growth". */
                 prof_bp_g_ms  = prof_getcol / 224u;   /* FRT ticks -> ms, same divisor as bp10 */
                 if (prof_bp_g_ms > 999u) prof_bp_g_ms = 999u;
+                {   /* `b` = R_GenerateComposite entries ON THIS FRAME.  This is the number that
+                       closes the 214 ms hole, because it is on the SAME clock and the SAME frame as
+                       `g`.  DECISION RULE: b >= 5 with g/b in 10-40 ms => the hole IS the composite
+                       rebuild (ship the Z_LargestAllocatable early exit and the rebuild damper);
+                       b <= 1 with g > 150 ms => composites are exonerated and the cost is inside
+                       R_EnsureLookup, at which point the follow-up is a per-rebuild ms TIMER, not
+                       another count. */
+                    extern int r_composite_n;
+                    prof_bp_b = (unsigned int)(r_composite_n > 99 ? 99 : r_composite_n);
+                }
             }
         }
         if (p10  > (unsigned)sat_prof_pk_p)  sat_prof_pk_p  = (int)p10;
@@ -2156,8 +2186,13 @@ static void rp_p3_prof_show(void)
            ⚠ `g` is an UPPER BOUND: two FRT reads per column (~2% of a heavy frame) land inside it.
            ⚠ FIELDS MUST STAY IN COLUMNS 0-13 (the VDP1 weapon covers 14-27 of rows 19-21):
            `B! g999 n99999` is exactly 14 chars, the worst case.  Do not widen it. */
-        snprintf(p, sizeof p, "%s g%u n%u    ",
-                 prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_g_n);
+        /* `n` RETIRED 2026-08-12: it answered its question -- the call count is FLAT (169..421) across
+           both regimes while us/call went 81 -> 590, so the explosion is per-CALL, not volume.  Its
+           column goes to `b`, the only number that can size the surviving candidate.  Worst case
+           `B! g999 b99` = 11 chars, columns 0-10, against the 0-13 limit (the VDP1 weapon covers
+           14-27 of rows 19-21) -- 3 columns of margin where `n%u` had zero. */
+        snprintf(p, sizeof p, "%s g%u b%u     ",
+                 prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_b);
         dbg_print(0, 20, p);
     }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one

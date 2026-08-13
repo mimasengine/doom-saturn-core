@@ -660,16 +660,27 @@ void Z_RoverToStart (void)
     if (mainzone) mainzone->rover = mainzone->blocklist.next;
 }
 
+/* SATURN 2026-08-12 (macro plan P1): the zone's BLOCK COUNT, a free by-product of the walk below.
+   It is the missing factor in the only surviving explanation of the 214 ms R_GetColumn hole:
+   R_GenerateComposite calls Z_LargestAllocatable TWICE per build on the 1p path (r_data.c:294 and
+   :321, because R_TexCacheAlloc returns NULL with the pool dead in 1p), this function is O(blocks)
+   with two cache-missing header reads per block, and estimates of the block count ranged 600..1500 --
+   i.e. 0.4 ms vs 1.6 ms PER WALK, which decides whether the allocator is the subject or a detail.
+   Measure it instead of arguing about it.  Overlay row 22 `zb`. */
+int	z_block_count = 0;
+
 int Z_LargestAllocatable (void)
 {
     memblock_t*	block;
     int		run = 0;
     int		largest = 0;
+    int		nblk = 0;
 
     for (block = mainzone->blocklist.next ;
          block != &mainzone->blocklist ;
          block = block->next)
     {
+	nblk++;
         if (block->tag == PU_FREE || block->tag >= PU_PURGELEVEL)
         {
             run += block->size;
@@ -680,6 +691,7 @@ int Z_LargestAllocatable (void)
             run = 0;   // unpurgeable block breaks the contiguous run
     }
 
+    z_block_count = nblk;
     return largest;
 }
 

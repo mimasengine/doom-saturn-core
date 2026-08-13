@@ -177,6 +177,13 @@ int			r_composite_oob = 0;
    answers "free" and lets it through.  If `Bp` spikes track this counter, the cost is the REBUILD,
    not the CD, and the fix is to stop the composite being purged (or to key the budget on it too). */
 int			r_composite_builds = 0;
+/* SATURN 2026-08-12 (macro plan P1): the SAME event on a PER-FRAME clock.  r_composite_builds is
+   summed over the platform's ~1 s overlay window and zeroed there, while row 20's `g`/`b` describe ONE
+   frame -- the frame that set PK Bp.  Dividing a window total by a one-frame time was the exact thing
+   that blocked closure on the 214 ms R_GetColumn hole: cb19 admits both "19 builds on that frame at
+   11.1 ms" and "5 builds/frame at 41 ms", the same equation with a different k, and the instrument
+   could not tell them apart.  Reset in RP_BeginFrame, latched next to prof_bp_g_ms. */
+int			r_composite_n = 0;
 
 // for global animation
 int*		flattranslation;
@@ -276,6 +283,7 @@ void R_GenerateComposite (int texnum)
     // PIN it PU_STATIC across the composite alloc below (which can purge PU_CACHE) -- we read
     // collump/colofs from it after the alloc.  Unpinned at the end.
     r_composite_builds++;
+    r_composite_n++;
     R_EnsureLookup (texnum);
     Z_ChangeTag (texturecolumnlump[texnum], PU_STATIC);
     Z_ChangeTag (texturecolumnofs[texnum],  PU_STATIC);
