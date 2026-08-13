@@ -1330,7 +1330,6 @@ static unsigned int   prof_segrout;     /* R_RenderSegLoop's per-seg routing pre
 static unsigned short prof_sl_t0;
 /* Bp sub-split as PERCENTAGES, latched on the frame that set the window's Bp peak (row 20 `BP`). */
 static unsigned int   prof_bp_r_pct, prof_bp_c_pct, prof_bp_g_pct, prof_bp_g_n, prof_bp_g_ms;
-static unsigned int   prof_bp_b;      /* composites built on the PK-Bp frame (row 20 `b`) */
 static int            prof_bp_bad;   /* 1 = a ratio came out impossible -> row prints `B!` */
 /* SATURN 2026-08-08: R_GetColumn's own share of Bp -- the PER-COLUMN half of the ~60% that the
    pad L+X mode-2 A/B attributed to texturing (that A/B removed the per-column fetch AND the
@@ -1854,7 +1853,6 @@ void RP_BeginFrame(void)
     prof_wallprep = 0;                                                   /* Bp accumulator */
     prof_segloop = prof_segrout = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
     prof_getcol = prof_getcol_n = 0;                                     /* R_GetColumn share of Bp */
-    { extern int r_composite_n; r_composite_n = 0; }                     /* composites built THIS frame */
     /* (r_lookup_rebuilds reset REMOVED 2026-08-10 with row-20 `e` -- see core/r_data.c:507) */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
     prof_pp_cur_sum = prof_pp_cur_vq = 0;
@@ -2103,16 +2101,11 @@ static void rp_p3_prof_show(void)
                    "Bp grew and g kept its share" from "g IS the growth". */
                 prof_bp_g_ms  = prof_getcol / 224u;   /* FRT ticks -> ms, same divisor as bp10 */
                 if (prof_bp_g_ms > 999u) prof_bp_g_ms = 999u;
-                {   /* `b` = R_GenerateComposite entries ON THIS FRAME.  This is the number that
-                       closes the 214 ms hole, because it is on the SAME clock and the SAME frame as
-                       `g`.  DECISION RULE: b >= 5 with g/b in 10-40 ms => the hole IS the composite
-                       rebuild (ship the Z_LargestAllocatable early exit and the rebuild damper);
-                       b <= 1 with g > 150 ms => composites are exonerated and the cost is inside
-                       R_EnsureLookup, at which point the follow-up is a per-rebuild ms TIMER, not
-                       another count. */
-                    extern int r_composite_n;
-                    prof_bp_b = (unsigned int)(r_composite_n > 99 ? 99 : r_composite_n);
-                }
+                /* (`b` = per-frame composite count RETIRED 2026-08-12, one capture after it was
+                   added.  It did its job: g30/b0 and g197/b4 killed R_GenerateComposite as the
+                   explanation of the R_GetColumn hole, so keeping the latch would be a value
+                   computed for nobody.  r_composite_builds still prints as row-18 `cb` if the
+                   question ever reopens.) */
             }
         }
         if (p10  > (unsigned)sat_prof_pk_p)  sat_prof_pk_p  = (int)p10;
@@ -2191,8 +2184,19 @@ static void rp_p3_prof_show(void)
            column goes to `b`, the only number that can size the surviving candidate.  Worst case
            `B! g999 b99` = 11 chars, columns 0-10, against the 0-13 limit (the VDP1 weapon covers
            14-27 of rows 19-21) -- 3 columns of margin where `n%u` had zero. */
-        snprintf(p, sizeof p, "%s g%u b%u     ",
-                 prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_b);
+        /* 🔴 2026-08-12, ONE CAPTURE LATER: `b` answered its question and `n` comes back.
+           Measured on TNT MAP11: `g30 b0` on a 57 ms Bp frame and `g197 b4` on a 225 ms one.  The
+           delta is +167 ms of g for +4 composites = 42 ms each, against a cost model of 2.8 ms
+           (median) to 7.7 ms (worst texture + both zone walks) -- off by 5-15x.  And `b0` with
+           `g30` settles it from the other side: 30 ms of R_GetColumn with ZERO composites built.
+           COMPOSITES ARE NOT THE HOLE.
+           Retiring `n` on 2026-08-10 was a mistake made one turn after writing down the rule that
+           forbids it: `g` alone cannot separate "350 calls at 560 us" from "2000 calls at 100 us",
+           and those two worlds have opposite fixes.  Never delete the only unmeasured input to an
+           open question -- that is exactly how `g` itself was lost the day before it was needed.
+           `BP g197 n363` = 12 chars, inside the columns 0-13 the VDP1 weapon leaves. */
+        snprintf(p, sizeof p, "%s g%u n%u    ",
+                 prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_g_n);
         dbg_print(0, 20, p);
     }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one
