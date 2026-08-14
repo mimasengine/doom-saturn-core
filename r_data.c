@@ -493,7 +493,6 @@ void R_GenerateLookup (int texnum)
 	}
 	if (!realpatch)
 	    realpatch = W_CacheLumpNum (patch->patch, PU_CACHE);
-	RP_StampEnd (2);
 	x1 = patch->originx;
 	x2 = x1 + SHORT(realpatch->width);
 	
@@ -693,7 +692,13 @@ R_GetColumn_impl
 
     if (!texturecomposite[tex])
     {
+	/* SATURN 2026-08-14 (round 5): `k` retired from the patch fetch, which now reads 0 on every
+	   capture -- its question is answered.  Re-pointed at the whole composite build, which is
+	   the only unmeasured term left in the body now that `e` is down to 0-6 ms while `x` still
+	   reaches 15,7 ms on the residual slow frames.  x - e - k ~ 0 would close the body entirely. */
+	RP_StampBegin (2);
 	R_GenerateComposite (tex);
+	RP_StampEnd (2);
 	/* SATURN 2026-08-08 (a): `ofs` was read ABOVE, and R_GenerateComposite re-runs
 	   R_EnsureLookup, which can REBUILD the directory -- so the offset in hand may now be
 	   stale and point at another column of the freshly-sized composite.  Re-read it. */
