@@ -256,6 +256,9 @@ R_DrawColumnInCache
 // SATURN R4: build a texture's per-column directory lazily + purgeable (defined below,
 // after R_GenerateLookup, which it drives).  Replaces the ~157K PU_STATIC upfront directory.
 static void R_EnsureLookup (int tex);
+/* SATURN 2026-08-14: the three max-timers that split a composite build (row 20 e/a/k). */
+void RP_StampBegin (int slot);
+void RP_StampEnd (int slot);
 
 // R_GenerateComposite
 // Using the texture definition,
@@ -284,9 +287,12 @@ void R_GenerateComposite (int texnum)
     // PIN it PU_STATIC across the composite alloc below (which can purge PU_CACHE) -- we read
     // collump/colofs from it after the alloc.  Unpinned at the end.
     r_composite_builds++;
+    RP_StampBegin (0);                            /* SATURN 2026-08-14: row-20 `e` */
     R_EnsureLookup (texnum);
+    RP_StampEnd (0);
     Z_ChangeTag (texturecolumnlump[texnum], PU_STATIC);
     Z_ChangeTag (texturecolumnofs[texnum],  PU_STATIC);
+    RP_StampBegin (1);                            /* SATURN 2026-08-14: row-20 `a` (allocation) */
 
     // SATURN: in CD-streaming mode build the composite into the bounded LRU
     // texture cache (recency-evicted, capped) instead of the main zone, so the
@@ -308,6 +314,8 @@ void R_GenerateComposite (int texnum)
 	r_composite_ovf++;
 	Z_ChangeTag (texturecolumnlump[texnum], PU_CACHE);   // unpin (mirrors the tail below)
 	Z_ChangeTag (texturecolumnofs[texnum],  PU_CACHE);
+	RP_StampEnd (1);        /* close `a` on the bail-out too: a dangling Begin would leave a stale
+				   t0 and the NEXT StampEnd would latch a garbage maximum */
 	return;
     }
     else
@@ -333,14 +341,17 @@ void R_GenerateComposite (int texnum)
 	    r_composite_ovf++;
 	    Z_ChangeTag (texturecolumnlump[texnum], PU_CACHE);
 	    Z_ChangeTag (texturecolumnofs[texnum],  PU_CACHE);
+	    RP_StampEnd (1);    /* same reason as the bail-out above */
 	    return;
 	}
     }
 
+    RP_StampEnd (1);
     collump = texturecolumnlump[texnum];
     colofs = texturecolumnofs[texnum];
 
     // Composite the columns together.
+    RP_StampBegin (2);                            /* SATURN 2026-08-14: row-20 `k` (the copy) */
     patch = texture->patches;
 		
     for (i=0 , patch = texture->patches;
@@ -381,6 +392,7 @@ void R_GenerateComposite (int texnum)
 	}
 						
     }
+    RP_StampEnd (2);
 
     // Classic path: now that the texture is built it is purgable from the zone.
     // Cache-pool blocks are managed by the LRU (R_PostTexCacheFrame), not the

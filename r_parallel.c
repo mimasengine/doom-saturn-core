@@ -1331,7 +1331,7 @@ static unsigned short prof_sl_t0;
 /* Bp sub-split as PERCENTAGES, latched on the frame that set the window's Bp peak (row 20 `BP`). */
 static unsigned int   prof_bp_r_pct, prof_bp_c_pct, prof_bp_g_pct, prof_bp_g_n, prof_bp_g_ms;
 static unsigned int   prof_bp_g_x;    /* worst SINGLE R_GetColumn call on the PK-Bp frame, in US */
-static unsigned int   prof_bp_g_d;    /* calls that found the patch lump non-resident (-> disc I/O) */
+static unsigned int   prof_bp_g_e, prof_bp_g_a, prof_bp_g_k;  /* its three thirds, in MS */
 unsigned int          sat_bp_zw;     /* zone blocks walked on the PK-Bp frame (overlay row 22 `zw`) */
 static int            prof_bp_bad;   /* 1 = a ratio came out impossible -> row prints `B!` */
 /* SATURN 2026-08-08: R_GetColumn's own share of Bp -- the PER-COLUMN half of the ~60% that the
@@ -1352,6 +1352,17 @@ static unsigned short prof_gc_t0;
    (r_data.c:615).  Measured average CD load = 6-7 s / ~184 loads = ~33 ms, so gd x 33 ms is the
    disc budget of the frame, comparable to `g` directly. */
 static unsigned short prof_gc_mx;       /* max single-call FRT delta this frame */
+/* SATURN 2026-08-14 (round 2): `x46680 d0` answered it -- ~4 calls of 46,7 ms make the whole 182 ms
+   `g`, and NONE of them touch the disc (`d0`, and `ld` moved +6 over the run).  46,7 ms also
+   matches the 42 ms/composite that the 08-12 `b4` latch measured and that I threw away because a
+   MODEL said 2,8-7,7 ms.  Two independent instruments, one number: R_GenerateComposite.
+   46,7 ms for a 8-32 KB composite is ~82 cycles/BYTE, which no copy loop costs, so split the build
+   in three and let the row say which third it is:
+     e = R_EnsureLookup (the R4 lazy directory)     a = the composite allocation
+     k = the patch loop + R_DrawColumnInCache
+   Each is the WORST single invocation on the frame, latched with `g`, so e+a+k <= x by construction
+   and the missing remainder is the part nobody bracketed. */
+static unsigned short prof_st_t0[3], prof_st_mx[3];
 static int            prof_in_wp;
 static unsigned int   prof_flatalloc;   /* W_CacheLumpNum/Release per visplane c P  */
 static unsigned short prof_fc_t0;
@@ -1436,6 +1447,26 @@ void RP_GetColLeave(void)
     prof_getcol += d;
     prof_getcol_n++;
     if (d > prof_gc_mx) prof_gc_mx = d;   /* SATURN 2026-08-14: few-fat-calls vs uniformly-slow */
+#endif
+}
+
+/* SATURN 2026-08-14: three shared max-timers for the R_GenerateComposite split (row 20 e/a/k).
+   Max, not sum: the question is "which third is the 46,7 ms call", and a sum over a frame that
+   builds 4-7 composites cannot answer it. */
+void RP_StampBegin(int slot)
+{
+#if RP_PROF
+    if (!prof_in_wp || (unsigned)slot >= 3u) return;
+    prof_st_t0[slot] = rp_frt();
+#endif
+}
+void RP_StampEnd(int slot)
+{
+#if RP_PROF
+    unsigned short d;
+    if (!prof_in_wp || (unsigned)slot >= 3u) return;
+    d = (unsigned short)(rp_frt() - prof_st_t0[slot]);
+    if (d > prof_st_mx[slot]) prof_st_mx[slot] = d;
 #endif
 }
 
@@ -1870,7 +1901,7 @@ void RP_BeginFrame(void)
     prof_segloop = prof_segrout = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
     prof_getcol = prof_getcol_n = 0;                                     /* R_GetColumn share of Bp */
     prof_gc_mx  = 0;                                                     /* worst single call (row 20 `x`) */
-    { extern int r_getcol_disc; r_getcol_disc = 0; }                     /* non-resident hits (row 20 `d`) */
+    prof_st_mx[0] = prof_st_mx[1] = prof_st_mx[2] = 0;                   /* composite split (row 20 e/a/k) */
     { extern int z_walk_blocks; z_walk_blocks = 0; }                     /* zone blocks walked / frame */
     /* (r_lookup_rebuilds reset REMOVED 2026-08-10 with row-20 `e` -- see core/r_data.c:507) */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
@@ -2130,8 +2161,11 @@ static void rp_p3_prof_show(void)
                    `g` are one clock and subtract directly -- the mistake `zc` made and `zw` fixed. */
                 prof_bp_g_x   = (unsigned int)prof_gc_mx * 447u / 100u;   /* FRT tick = 4.47 us */
                 if (prof_bp_g_x > 99999u) prof_bp_g_x = 99999u;
-                { extern int r_getcol_disc;
-                  prof_bp_g_d = r_getcol_disc > 999 ? 999u : (unsigned int)r_getcol_disc; }
+                /* e/a/k in MILLISECONDS: the question is which third carries ~46, and a sub-ms
+                   third reading 0 is the answer, not a loss of resolution. */
+                prof_bp_g_e = prof_st_mx[0] / 224u;
+                prof_bp_g_a = prof_st_mx[1] / 224u;
+                prof_bp_g_k = prof_st_mx[2] / 224u;
                 /* (`b` = per-frame composite count RETIRED 2026-08-12, one capture after it was
                    added.  It did its job: g30/b0 and g197/b4 killed R_GenerateComposite as the
                    explanation of the R_GetColumn hole, so keeping the latch would be a value
@@ -2226,9 +2260,12 @@ static void rp_p3_prof_show(void)
            and those two worlds have opposite fixes.  Never delete the only unmeasured input to an
            open question -- that is exactly how `g` itself was lost the day before it was needed.
            `BP g197 n363` = 12 chars, inside the columns 0-13 the VDP1 weapon leaves. */
-        snprintf(p, sizeof p, "%s g%u n%u x%u d%u    ",
+        /* `d` RETIRED after ONE capture, and that is the correct lifetime for it: `d0` on every
+           photo, with `ld` moving +6 over the whole run as the independent witness.  The disc is
+           not in R_GetColumn's hot path.  (r_getcol_disc still exists and still counts.) */
+        snprintf(p, sizeof p, "%s g%u n%u x%u e%u a%u k%u    ",
                  prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_g_n,
-                 prof_bp_g_x, prof_bp_g_d);
+                 prof_bp_g_x, prof_bp_g_e, prof_bp_g_a, prof_bp_g_k);
         dbg_print(0, 20, p);
     }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one
