@@ -1330,6 +1330,8 @@ static unsigned int   prof_segrout;     /* R_RenderSegLoop's per-seg routing pre
 static unsigned short prof_sl_t0;
 /* Bp sub-split as PERCENTAGES, latched on the frame that set the window's Bp peak (row 20 `BP`). */
 static unsigned int   prof_bp_r_pct, prof_bp_c_pct, prof_bp_g_pct, prof_bp_g_n, prof_bp_g_ms;
+static unsigned int   prof_bp_g_x;    /* worst SINGLE R_GetColumn call on the PK-Bp frame, in US */
+static unsigned int   prof_bp_g_d;    /* calls that found the patch lump non-resident (-> disc I/O) */
 unsigned int          sat_bp_zw;     /* zone blocks walked on the PK-Bp frame (overlay row 22 `zw`) */
 static int            prof_bp_bad;   /* 1 = a ratio came out impossible -> row prints `B!` */
 /* SATURN 2026-08-08: R_GetColumn's own share of Bp -- the PER-COLUMN half of the ~60% that the
@@ -1340,6 +1342,16 @@ static int            prof_bp_bad;   /* 1 = a ratio came out impossible -> row p
    denominator would be a percentage of the wrong thing. */
 static unsigned int   prof_getcol, prof_getcol_n;
 static unsigned short prof_gc_t0;
+/* SATURN 2026-08-14: `g`/`n` alone cannot separate "a few fat calls" from "every call slow", and
+   both fit the hole because it is ONE equation.  `gx` = the LARGEST single R_GetColumn delta on
+   the frame settles it with no model at all:
+     gx ~ tens of ms  -> a handful of calls do real work (disc I/O is the only candidate left)
+     gx ~ g/n         -> the cost is UNIFORM, which no 157-instruction body can produce, so `g`
+                         is billing time that is not R_GetColumn's (ISRs inside the bracket).
+   `gd` = calls that found the single-patch lump NON-RESIDENT, i.e. calls that WILL hit the disc
+   (r_data.c:615).  Measured average CD load = 6-7 s / ~184 loads = ~33 ms, so gd x 33 ms is the
+   disc budget of the frame, comparable to `g` directly. */
+static unsigned short prof_gc_mx;       /* max single-call FRT delta this frame */
 static int            prof_in_wp;
 static unsigned int   prof_flatalloc;   /* W_CacheLumpNum/Release per visplane c P  */
 static unsigned short prof_fc_t0;
@@ -1418,9 +1430,12 @@ void RP_GetColEnter(void)
 void RP_GetColLeave(void)
 {
 #if RP_PROF
+    unsigned short d;
     if (!prof_in_wp) return;
-    prof_getcol += (unsigned short)(rp_frt() - prof_gc_t0);
+    d = (unsigned short)(rp_frt() - prof_gc_t0);
+    prof_getcol += d;
     prof_getcol_n++;
+    if (d > prof_gc_mx) prof_gc_mx = d;   /* SATURN 2026-08-14: few-fat-calls vs uniformly-slow */
 #endif
 }
 
@@ -1854,6 +1869,8 @@ void RP_BeginFrame(void)
     prof_wallprep = 0;                                                   /* Bp accumulator */
     prof_segloop = prof_segrout = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
     prof_getcol = prof_getcol_n = 0;                                     /* R_GetColumn share of Bp */
+    prof_gc_mx  = 0;                                                     /* worst single call (row 20 `x`) */
+    { extern int r_getcol_disc; r_getcol_disc = 0; }                     /* non-resident hits (row 20 `d`) */
     { extern int z_walk_blocks; z_walk_blocks = 0; }                     /* zone blocks walked / frame */
     /* (r_lookup_rebuilds reset REMOVED 2026-08-10 with row-20 `e` -- see core/r_data.c:507) */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
@@ -2108,6 +2125,13 @@ static void rp_p3_prof_show(void)
                 }
                 prof_bp_g_ms  = prof_getcol / 224u;   /* FRT ticks -> ms, same divisor as bp10 */
                 if (prof_bp_g_ms > 999u) prof_bp_g_ms = 999u;
+                /* SATURN 2026-08-14: `x` = worst SINGLE call, in the same ms as `g` (FRT/224), and
+                   `d` = calls that will hit the disc.  Both latched to THIS frame, so `x`, `d` and
+                   `g` are one clock and subtract directly -- the mistake `zc` made and `zw` fixed. */
+                prof_bp_g_x   = (unsigned int)prof_gc_mx * 447u / 100u;   /* FRT tick = 4.47 us */
+                if (prof_bp_g_x > 99999u) prof_bp_g_x = 99999u;
+                { extern int r_getcol_disc;
+                  prof_bp_g_d = r_getcol_disc > 999 ? 999u : (unsigned int)r_getcol_disc; }
                 /* (`b` = per-frame composite count RETIRED 2026-08-12, one capture after it was
                    added.  It did its job: g30/b0 and g197/b4 killed R_GenerateComposite as the
                    explanation of the R_GetColumn hole, so keeping the latch would be a value
@@ -2202,8 +2226,9 @@ static void rp_p3_prof_show(void)
            and those two worlds have opposite fixes.  Never delete the only unmeasured input to an
            open question -- that is exactly how `g` itself was lost the day before it was needed.
            `BP g197 n363` = 12 chars, inside the columns 0-13 the VDP1 weapon leaves. */
-        snprintf(p, sizeof p, "%s g%u n%u    ",
-                 prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_g_n);
+        snprintf(p, sizeof p, "%s g%u n%u x%u d%u    ",
+                 prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_g_n,
+                 prof_bp_g_x, prof_bp_g_d);
         dbg_print(0, 20, p);
     }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one

@@ -167,6 +167,9 @@ int			r_composite_ovf = 0;   // # textures stubbed (extern, overlay 'tc')
    for the whole patch (see R_GetColumn).  Cumulative.  >0 means walls are drawing flat somewhere
    AND that this build would have HALTED before 2026-08-07 -- it is the crash, made measurable. */
 int			r_patch_ovf = 0;
+/* SATURN 2026-08-14: R_GetColumn calls THIS FRAME that found the single-patch lump non-resident,
+   i.e. calls that go to the disc.  Reset in RP_BeginFrame, latched with `g` as row-20 `d`. */
+int			r_getcol_disc = 0;
 /* SATURN 2026-08-08: columns whose composite offset lay OUTSIDE texturecompositesize -- the
    wrong-texture-for-one-frame bug (see the long note in R_GetColumn).  Cumulative; overlay `ob`
    on row 12.  **It must read 0.**  Non-zero means R_GenerateLookup left a directory that does not
@@ -612,10 +615,20 @@ R_GetColumn_impl
 	   The test is Z_LargestAllocatable, i.e. free + purgeable after coalescing -- exactly what
 	   Z_Malloc's own scan can reach -- so this only fires when the allocation really would
 	   fail.  Resident lumps never reach the test. */
-	if (!W_LumpResident (lump) && !Z_CanAllocate (W_LumpLength (lump) + 64))
+	if (!W_LumpResident (lump))
 	{
-	    r_patch_ovf++;
-	    return r_column_stub;
+	    /* SATURN 2026-08-14: this is the ONLY branch of R_GetColumn that can reach the disc --
+	       W_CacheLumpNum below will W_ReadLump a patch that is routinely 35080 B in TNT.  Counted
+	       per FRAME and latched beside `g` as row-20 `d`, because the measured average CD load is
+	       ~33 ms (row-12 `t`s / row-0 `ld`): d x 33 ms IS the frame's disc budget, in `g`'s own
+	       milliseconds, with no model in between.  `px` (r_patch_ovf) has read 0 on every capture,
+	       so the garde below never fires and every one of these calls really does go to the disc. */
+	    r_getcol_disc++;
+	    if (!Z_CanAllocate (W_LumpLength (lump) + 64))
+	    {
+		r_patch_ovf++;
+		return r_column_stub;
+	    }
 	}
 	return (byte *)W_CacheLumpNum(lump,PU_CACHE)+ofs;
     }
