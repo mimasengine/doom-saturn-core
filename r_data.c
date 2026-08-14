@@ -287,12 +287,9 @@ void R_GenerateComposite (int texnum)
     // PIN it PU_STATIC across the composite alloc below (which can purge PU_CACHE) -- we read
     // collump/colofs from it after the alloc.  Unpinned at the end.
     r_composite_builds++;
-    RP_StampBegin (0);                            /* SATURN 2026-08-14: row-20 `e` */
     R_EnsureLookup (texnum);
-    RP_StampEnd (0);
     Z_ChangeTag (texturecolumnlump[texnum], PU_STATIC);
     Z_ChangeTag (texturecolumnofs[texnum],  PU_STATIC);
-    RP_StampBegin (1);                            /* SATURN 2026-08-14: row-20 `a` (allocation) */
 
     // SATURN: in CD-streaming mode build the composite into the bounded LRU
     // texture cache (recency-evicted, capped) instead of the main zone, so the
@@ -314,8 +311,6 @@ void R_GenerateComposite (int texnum)
 	r_composite_ovf++;
 	Z_ChangeTag (texturecolumnlump[texnum], PU_CACHE);   // unpin (mirrors the tail below)
 	Z_ChangeTag (texturecolumnofs[texnum],  PU_CACHE);
-	RP_StampEnd (1);        /* close `a` on the bail-out too: a dangling Begin would leave a stale
-				   t0 and the NEXT StampEnd would latch a garbage maximum */
 	return;
     }
     else
@@ -341,12 +336,10 @@ void R_GenerateComposite (int texnum)
 	    r_composite_ovf++;
 	    Z_ChangeTag (texturecolumnlump[texnum], PU_CACHE);
 	    Z_ChangeTag (texturecolumnofs[texnum],  PU_CACHE);
-	    RP_StampEnd (1);    /* same reason as the bail-out above */
 	    return;
 	}
     }
 
-    RP_StampEnd (1);
     collump = texturecolumnlump[texnum];
     colofs = texturecolumnofs[texnum];
 
@@ -605,7 +598,14 @@ R_GetColumn_impl
     int		ofs;
 	
     col &= texturewidthmask[tex];
+    /* SATURN 2026-08-14 (round 3): THIS call site is the one that was never bracketed.  Round 2 put
+       `e` on the R_EnsureLookup INSIDE R_GenerateComposite -- which by then always finds the
+       directory resident, because THIS line already rebuilt it.  It duly read 0.  `e0 a0 k2`
+       against `x46769` says the whole composite build is 2 ms, so the 46,8 ms is here or at the
+       W_CacheLumpNum below, and nowhere else in the body. */
+    RP_StampBegin (0);                            /* row-20 `e`: the R4 lazy directory rebuild */
     R_EnsureLookup (tex);   // SATURN R4: build the directory on first use (or after a purge)
+    RP_StampEnd (0);
     lump = texturecolumnlump[tex][col];
     ofs = texturecolumnofs[tex][col];
     
@@ -642,7 +642,15 @@ R_GetColumn_impl
 		return r_column_stub;
 	    }
 	}
-	return (byte *)W_CacheLumpNum(lump,PU_CACHE)+ofs;
+	{   /* row-20 `a`: the single-patch fetch.  `d0` proved it never reaches the disc, so this
+	       measures W_CacheLumpNum's ALREADY-CACHED branch -- which still rewrites the tag through
+	       Z_ChangeTag on every column. */
+	    byte *rp;
+	    RP_StampBegin (1);
+	    rp = (byte *)W_CacheLumpNum(lump,PU_CACHE);
+	    RP_StampEnd (1);
+	    return rp+ofs;
+	}
     }
 
     if (!texturecomposite[tex])

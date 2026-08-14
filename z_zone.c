@@ -21,6 +21,11 @@
 #include "i_system.h"
 #include "doomtype.h"
 
+/* SATURN 2026-08-14: profiler max-timers (r_parallel.c).  No-ops unless RP_PROF and unless the
+   caller is inside the wall-prep bracket, so this costs two FRT reads on the render path only. */
+void RP_StampBegin (int slot);
+void RP_StampEnd (int slot);
+
 // SATURN: in cart mode W_CacheLumpNum returns memory-mapped (cart) lump pointers,
 // which are NOT zone blocks.  Z_Free/Z_Free2 use this to no-op a stray free of such
 // a lump instead of crashing ("Z_Free without ZONEID").  Inert when nothing mapped.
@@ -247,6 +252,14 @@ Z_Malloc
     memblock_t*	base;
     void *result;
 
+    /* SATURN 2026-08-14: Z_Malloc's own rover scan is the ONE thing under R_GetColumn that has never
+       been timed.  It sits beneath BOTH surviving candidates (R_EnsureLookup does 3 allocs;
+       W_CacheLumpNum does one when it misses), it purges and coalesces as it walks, and `zw` does
+       NOT see it -- zw only counts Z_CanAllocate/Z_LargestAllocatable.  Latched as row-20 `z` =
+       the worst single Z_Malloc on the frame.  The 08-07 note "z_scan_steps read 0" retired a STEP
+       counter, never a timer, so nothing here has actually been measured. */
+    RP_StampBegin (3);
+
     size = (size + MEM_ALIGN - 1) & ~(MEM_ALIGN - 1);
     
     // scan through the block list,
@@ -433,7 +446,8 @@ Z_Malloc
     mainzone->rover = base->next;	
 	
     base->id = ZONEID;
-    
+
+    RP_StampEnd (3);            /* SATURN 2026-08-14: row-20 `z`.  The only other exit is I_Error. */
     return result;
 }
 

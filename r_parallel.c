@@ -1331,7 +1331,7 @@ static unsigned short prof_sl_t0;
 /* Bp sub-split as PERCENTAGES, latched on the frame that set the window's Bp peak (row 20 `BP`). */
 static unsigned int   prof_bp_r_pct, prof_bp_c_pct, prof_bp_g_pct, prof_bp_g_n, prof_bp_g_ms;
 static unsigned int   prof_bp_g_x;    /* worst SINGLE R_GetColumn call on the PK-Bp frame, in US */
-static unsigned int   prof_bp_g_e, prof_bp_g_a, prof_bp_g_k;  /* its three thirds, in MS */
+static unsigned int   prof_bp_g_e, prof_bp_g_a, prof_bp_g_k, prof_bp_g_z;  /* its parts, in MS */
 unsigned int          sat_bp_zw;     /* zone blocks walked on the PK-Bp frame (overlay row 22 `zw`) */
 static int            prof_bp_bad;   /* 1 = a ratio came out impossible -> row prints `B!` */
 /* SATURN 2026-08-08: R_GetColumn's own share of Bp -- the PER-COLUMN half of the ~60% that the
@@ -1356,13 +1356,18 @@ static unsigned short prof_gc_mx;       /* max single-call FRT delta this frame 
    `g`, and NONE of them touch the disc (`d0`, and `ld` moved +6 over the run).  46,7 ms also
    matches the 42 ms/composite that the 08-12 `b4` latch measured and that I threw away because a
    MODEL said 2,8-7,7 ms.  Two independent instruments, one number: R_GenerateComposite.
-   46,7 ms for a 8-32 KB composite is ~82 cycles/BYTE, which no copy loop costs, so split the build
-   in three and let the row say which third it is:
-     e = R_EnsureLookup (the R4 lazy directory)     a = the composite allocation
-     k = the patch loop + R_DrawColumnInCache
-   Each is the WORST single invocation on the frame, latched with `g`, so e+a+k <= x by construction
-   and the missing remainder is the part nobody bracketed. */
-static unsigned short prof_st_t0[3], prof_st_mx[3];
+   ROUND 2 (`e0 a0 k2` against `x46769`) CLEARED THE COMPOSITE TOO: the whole build is 2 ms.  And it
+   cleared it twice over -- `e` sat on the R_EnsureLookup INSIDE R_GenerateComposite, which always
+   finds the directory resident because R_GetColumn rebuilt it one line earlier.  The slots now point
+   at the sites that were never bracketed at all:
+     e = R_EnsureLookup called from R_GetColumn itself (the R4 lazy directory rebuild)
+     a = W_CacheLumpNum on the single-patch path (`d0` says its already-cached branch)
+     k = the composite patch loop + R_DrawColumnInCache  (kept as a CONTROL: must stay ~2)
+     z = the worst single Z_Malloc -- the rover scan that purges and coalesces as it walks, which
+         sits under e and a both, and which `zw` does NOT see (zw counts only Z_CanAllocate /
+         Z_LargestAllocatable).  Nothing has ever timed it; the 08-07 note retired a STEP counter.
+   Each is the WORST single invocation on the frame, latched with `g`.  `x` bounds them all. */
+static unsigned short prof_st_t0[4], prof_st_mx[4];
 static int            prof_in_wp;
 static unsigned int   prof_flatalloc;   /* W_CacheLumpNum/Release per visplane c P  */
 static unsigned short prof_fc_t0;
@@ -1456,7 +1461,7 @@ void RP_GetColLeave(void)
 void RP_StampBegin(int slot)
 {
 #if RP_PROF
-    if (!prof_in_wp || (unsigned)slot >= 3u) return;
+    if (!prof_in_wp || (unsigned)slot >= 4u) return;
     prof_st_t0[slot] = rp_frt();
 #endif
 }
@@ -1464,7 +1469,7 @@ void RP_StampEnd(int slot)
 {
 #if RP_PROF
     unsigned short d;
-    if (!prof_in_wp || (unsigned)slot >= 3u) return;
+    if (!prof_in_wp || (unsigned)slot >= 4u) return;
     d = (unsigned short)(rp_frt() - prof_st_t0[slot]);
     if (d > prof_st_mx[slot]) prof_st_mx[slot] = d;
 #endif
@@ -1901,7 +1906,7 @@ void RP_BeginFrame(void)
     prof_segloop = prof_segrout = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
     prof_getcol = prof_getcol_n = 0;                                     /* R_GetColumn share of Bp */
     prof_gc_mx  = 0;                                                     /* worst single call (row 20 `x`) */
-    prof_st_mx[0] = prof_st_mx[1] = prof_st_mx[2] = 0;                   /* composite split (row 20 e/a/k) */
+    prof_st_mx[0] = prof_st_mx[1] = prof_st_mx[2] = prof_st_mx[3] = 0;   /* row 20 e/a/k/z */
     { extern int z_walk_blocks; z_walk_blocks = 0; }                     /* zone blocks walked / frame */
     /* (r_lookup_rebuilds reset REMOVED 2026-08-10 with row-20 `e` -- see core/r_data.c:507) */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
@@ -2166,6 +2171,7 @@ static void rp_p3_prof_show(void)
                 prof_bp_g_e = prof_st_mx[0] / 224u;
                 prof_bp_g_a = prof_st_mx[1] / 224u;
                 prof_bp_g_k = prof_st_mx[2] / 224u;
+                prof_bp_g_z = prof_st_mx[3] / 224u;
                 /* (`b` = per-frame composite count RETIRED 2026-08-12, one capture after it was
                    added.  It did its job: g30/b0 and g197/b4 killed R_GenerateComposite as the
                    explanation of the R_GetColumn hole, so keeping the latch would be a value
@@ -2263,9 +2269,9 @@ static void rp_p3_prof_show(void)
         /* `d` RETIRED after ONE capture, and that is the correct lifetime for it: `d0` on every
            photo, with `ld` moving +6 over the whole run as the independent witness.  The disc is
            not in R_GetColumn's hot path.  (r_getcol_disc still exists and still counts.) */
-        snprintf(p, sizeof p, "%s g%u n%u x%u e%u a%u k%u    ",
+        snprintf(p, sizeof p, "%s g%u n%u x%u e%u a%u k%u z%u  ",
                  prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_g_n,
-                 prof_bp_g_x, prof_bp_g_e, prof_bp_g_a, prof_bp_g_k);
+                 prof_bp_g_x, prof_bp_g_e, prof_bp_g_a, prof_bp_g_k, prof_bp_g_z);
         dbg_print(0, 20, p);
     }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one
