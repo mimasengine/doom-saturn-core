@@ -1330,6 +1330,7 @@ static unsigned int   prof_segrout;     /* R_RenderSegLoop's per-seg routing pre
 static unsigned short prof_sl_t0;
 /* Bp sub-split as PERCENTAGES, latched on the frame that set the window's Bp peak (row 20 `BP`). */
 static unsigned int   prof_bp_r_pct, prof_bp_c_pct, prof_bp_g_pct, prof_bp_g_n, prof_bp_g_ms;
+unsigned int          sat_bp_zw;     /* zone blocks walked on the PK-Bp frame (overlay row 22 `zw`) */
 static int            prof_bp_bad;   /* 1 = a ratio came out impossible -> row prints `B!` */
 /* SATURN 2026-08-08: R_GetColumn's own share of Bp -- the PER-COLUMN half of the ~60% that the
    pad L+X mode-2 A/B attributed to texturing (that A/B removed the per-column fetch AND the
@@ -1853,6 +1854,7 @@ void RP_BeginFrame(void)
     prof_wallprep = 0;                                                   /* Bp accumulator */
     prof_segloop = prof_segrout = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
     prof_getcol = prof_getcol_n = 0;                                     /* R_GetColumn share of Bp */
+    { extern int z_walk_blocks; z_walk_blocks = 0; }                     /* zone blocks walked / frame */
     /* (r_lookup_rebuilds reset REMOVED 2026-08-10 with row-20 `e` -- see core/r_data.c:507) */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
     prof_pp_cur_sum = prof_pp_cur_vq = 0;
@@ -2099,6 +2101,11 @@ static void rp_p3_prof_show(void)
                    ~3 ms for the 17 the 165 ms frame did.  It cannot be the hole and it cost the one
                    number that can size it.  ms, not %, because a percentage of Bp cannot separate
                    "Bp grew and g kept its share" from "g IS the growth". */
+                {   /* Latch the zone-walk work of THIS frame, so it can be subtracted from `g`
+                       with no clock conversion at all: ms = zw x ~30 cycles / 28600. */
+                    extern int z_walk_blocks;
+                    sat_bp_zw = (unsigned int)z_walk_blocks;
+                }
                 prof_bp_g_ms  = prof_getcol / 224u;   /* FRT ticks -> ms, same divisor as bp10 */
                 if (prof_bp_g_ms > 999u) prof_bp_g_ms = 999u;
                 /* (`b` = per-frame composite count RETIRED 2026-08-12, one capture after it was

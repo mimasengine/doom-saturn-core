@@ -61,7 +61,8 @@ void    Z_ChangeTag2 (void *ptr, int tag, char *file, int line);
 void    Z_ChangeUser(void *ptr, void **user);
 int     Z_FreeMemory (void);
 int     Z_LargestAllocatable (void);
-int Z_CanAllocate (int size);   /* SATURN: early-exit threshold form of the above */   // largest contiguous run after purging (frag vs exhaustion)
+int Z_CanAllocate (int size);   /* SATURN: early-exit threshold form of the above */
+extern int z_walk_blocks;       /* SATURN: zone blocks walked this frame (reset in RP_BeginFrame) */   // largest contiguous run after purging (frag vs exhaustion)
 void    Z_RoverToStart (void);         // SATURN: pack the next slab LOW (see z_zone.c)
 unsigned int Z_ZoneSize(void);
 

@@ -673,7 +673,15 @@ int	z_block_count = 0;
    r_data.c:615 tests this function PER COLUMN on the single-patch path, and at zb~790 blocks one
    walk is ~23 700 cycles = 0.83 ms.  392 calls x 54% = 211 walks = 175 ms, which is exactly the
    measured `g`.  Reset by the platform after printing. */
-int	z_walk_calls = 0;
+/* (z_walk_calls -- the 08-12 per-WINDOW call count -- REMOVED 08-14 after two captures: it summed
+   over the ~1 s overlay window while row-20 `g` is latched to ONE frame, so it could never be divided
+   into g.  Same clock error as `cb`, made twice.  Superseded by z_walk_blocks below.) */
+/* SATURN 2026-08-14: BLOCKS walked this FRAME -- the number that needs no division.  z_walk_calls is
+   a 1 s window and z_block_count is clobbered by the overlay's own Z_LargestAllocatable() for row-11
+   `lg`, so neither could be put against row-20 `g`, which is latched to ONE frame.  This one is
+   latched on the SAME frame as g (core/r_parallel.c, the PK-Bp block) and converts directly:
+   ms = zw x ~30 cycles / 28600.  Reset in RP_BeginFrame. */
+int	z_walk_blocks = 0;
 
 /* SATURN 2026-08-12 -- THE EARLY-EXIT TWIN.  Six of this function's nine call sites do not want the
    largest run at all, they ask a THRESHOLD question (`Z_LargestAllocatable() < need`).  Answering it
@@ -690,7 +698,6 @@ int Z_CanAllocate (int size)
     int		nblk = 0;
 
     if (size <= 0) return 1;
-    z_walk_calls++;
     for (block = mainzone->blocklist.next ;
          block != &mainzone->blocklist ;
          block = block->next)
@@ -702,6 +709,7 @@ int Z_CanAllocate (int size)
             if (run >= size)
             {
                 z_block_count = nblk;   /* blocks actually WALKED, not the zone total */
+                z_walk_blocks += nblk;
                 return 1;
             }
         }
@@ -709,6 +717,7 @@ int Z_CanAllocate (int size)
             run = 0;   // unpurgeable block breaks the contiguous run
     }
     z_block_count = nblk;
+    z_walk_blocks += nblk;
     return 0;
 }
 
@@ -719,7 +728,6 @@ int Z_LargestAllocatable (void)
     int		largest = 0;
     int		nblk = 0;
 
-    z_walk_calls++;
 
     for (block = mainzone->blocklist.next ;
          block != &mainzone->blocklist ;
@@ -737,6 +745,7 @@ int Z_LargestAllocatable (void)
     }
 
     z_block_count = nblk;
+    z_walk_blocks += nblk;
     return largest;
 }
 
