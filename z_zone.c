@@ -668,6 +668,49 @@ void Z_RoverToStart (void)
    i.e. 0.4 ms vs 1.6 ms PER WALK, which decides whether the allocator is the subject or a detail.
    Measure it instead of arguing about it.  Overlay row 22 `zb`. */
 int	z_block_count = 0;
+/* SATURN 2026-08-12: how many times the walk ran this overlay window (overlay row 22 `zc`).  The
+   product zb x zc is the real cost, and it is the leading explanation of the R_GetColumn hole:
+   r_data.c:615 tests this function PER COLUMN on the single-patch path, and at zb~790 blocks one
+   walk is ~23 700 cycles = 0.83 ms.  392 calls x 54% = 211 walks = 175 ms, which is exactly the
+   measured `g`.  Reset by the platform after printing. */
+int	z_walk_calls = 0;
+
+/* SATURN 2026-08-12 -- THE EARLY-EXIT TWIN.  Six of this function's nine call sites do not want the
+   largest run at all, they ask a THRESHOLD question (`Z_LargestAllocatable() < need`).  Answering it
+   never required walking to the end: stop at the first purgeable run that already reaches `size`.
+   Semantically identical to `Z_LargestAllocatable() >= size` -- same coalescing rule, same tags --
+   but O(blocks-until-found) instead of O(all blocks).  It cannot be slower, and on the hot site it
+   is the difference between 0.83 ms and a few microseconds whenever a big run sits early in the
+   list.  The header's own warning ("O(blocks); call sparingly, at overlay rate") was written for a
+   reason and then ignored by a per-column caller. */
+int Z_CanAllocate (int size)
+{
+    memblock_t*	block;
+    int		run = 0;
+    int		nblk = 0;
+
+    if (size <= 0) return 1;
+    z_walk_calls++;
+    for (block = mainzone->blocklist.next ;
+         block != &mainzone->blocklist ;
+         block = block->next)
+    {
+	nblk++;
+        if (block->tag == PU_FREE || block->tag >= PU_PURGELEVEL)
+        {
+            run += block->size;
+            if (run >= size)
+            {
+                z_block_count = nblk;   /* blocks actually WALKED, not the zone total */
+                return 1;
+            }
+        }
+        else
+            run = 0;   // unpurgeable block breaks the contiguous run
+    }
+    z_block_count = nblk;
+    return 0;
+}
 
 int Z_LargestAllocatable (void)
 {
@@ -675,6 +718,8 @@ int Z_LargestAllocatable (void)
     int		run = 0;
     int		largest = 0;
     int		nblk = 0;
+
+    z_walk_calls++;
 
     for (block = mainzone->blocklist.next ;
          block != &mainzone->blocklist ;

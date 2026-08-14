@@ -296,7 +296,7 @@ void R_GenerateComposite (int texnum)
     {
 	cached = 1;	// pool block; texturecomposite[texnum] already published
     }
-    else if (Z_LargestAllocatable() < texturecompositesize[texnum])
+    else if (!Z_CanAllocate (texturecompositesize[texnum]))
     {
 	// SATURN garde-COMPOSITE: the composite will not fit the zone even after purging PU_CACHE
 	// (Z_LargestAllocatable == what Z_Malloc could get).  A Z_Malloc here would I_Error-freeze.
@@ -323,7 +323,7 @@ void R_GenerateComposite (int texnum)
 	texpatch_t *pp = texture->patches;
 	for (k = 0; k < texture->patchcount; k++, pp++)
 	{ int pl = W_LumpLength (pp->patch); if (pl > big) big = pl; }
-	if (Z_LargestAllocatable () < big)
+	if (!Z_CanAllocate (big))
 	{
 	    if (!cached) Z_Free (block);
 	    texturecomposite[texnum] = r_column_stub;
@@ -349,7 +349,7 @@ void R_GenerateComposite (int texnum)
 	   just leaves its columns as they are -- a partial texture, which is what the neighbouring
 	   garde-COMPOSITE already accepts. */
 	if (!W_LumpResident (patch->patch)
-	    && Z_LargestAllocatable () < W_LumpLength (patch->patch) + 64)
+	    && !Z_CanAllocate (W_LumpLength (patch->patch) + 64))
 	{ r_patch_ovf++; continue; }
 	realpatch = W_CacheLumpNum (patch->patch, PU_CACHE);
 	x1 = patch->originx;
@@ -446,7 +446,7 @@ void R_GenerateLookup (int texnum)
 	   does: free the temp, leave the texture without a directory.  R_EnsureLookup retries on a
 	   later frame, so the texture builds itself the moment a 35 KB run exists. */
 	if (!W_LumpResident (patch->patch)
-	    && Z_LargestAllocatable () < W_LumpLength (patch->patch) + 64)
+	    && !Z_CanAllocate (W_LumpLength (patch->patch) + 64))
 	{
 	    r_patch_ovf++;
 	    Z_Free (patchcount);
@@ -612,7 +612,7 @@ R_GetColumn_impl
 	   The test is Z_LargestAllocatable, i.e. free + purgeable after coalescing -- exactly what
 	   Z_Malloc's own scan can reach -- so this only fires when the allocation really would
 	   fail.  Resident lumps never reach the test. */
-	if (!W_LumpResident (lump) && Z_LargestAllocatable () < W_LumpLength (lump) + 64)
+	if (!W_LumpResident (lump) && !Z_CanAllocate (W_LumpLength (lump) + 64))
 	{
 	    r_patch_ovf++;
 	    return r_column_stub;
