@@ -73,6 +73,9 @@ void*	W_LumpCached (int lump);     /* SATURN: pure read, no alloc/no retag -- fo
 extern int w_lump_reads;             /* SATURN: cumulative W_ReadLump calls (lumps off the medium) */
 extern unsigned int w_cd_ms10;       /* SATURN: cumulative ms*10 spent in medium commands (see w_wad.c) */
 int	W_LumpPinned (int lumpnum);          /* SATURN: 1 = W_CacheLumpNum must not retag it       */
+/* SATURN: first nbytes of a lump into a private scratch, WITHOUT populating lumpinfo[].cache.
+   NULL = cannot serve cheaply, fall back to W_CacheLumpNum.  Valid only until the next call. */
+void*	W_CacheLumpPrefix (int lumpnum, int nbytes);
 void	W_UnpinAll (void);                   /* SATURN: drop every pin (call before re-pinning)    */
 void	W_PinLump (int lumpnum, int tag);    /* SATURN: cache + pin (see w_wad.c: the sky patch)   */
 void    W_ReadLump (unsigned int lump, void *dest);

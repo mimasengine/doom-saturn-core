@@ -584,6 +584,60 @@ void *W_CacheLumpNum(int lumpnum, int tag)
 
 
 
+/* SATURN 2026-08-14 -- HEADER-ONLY FETCH, the fix for the measured 46 ms `e`.
+**
+** R_GenerateLookup needs a patch's `width` + `columnofs[]` (8 + 4*width, ~1 KB) and NOTHING else --
+** it never reads a texel.  Serving that through W_CacheLumpNum LZSS-decoded the whole 35 080-byte
+** patch: `k12` per patch, ~4 patches per directory rebuild, ~4 rebuilds a frame = the whole hole.
+**
+** THE HAZARD, and why the scratch buffer is not optional: a prefix is NOT a lump.  If it were
+** published into lumpinfo[].cache, the next caller wanting real pixels would get 1 KB of truth
+** followed by garbage -- silent, and exactly the shape of the wrong-texture bugs already fought in
+** r_data.c.  So this decodes into a private scratch and leaves lump->cache untouched.
+**
+** LIFETIME: the returned pointer is valid only until the NEXT call.  R_GenerateLookup uses it
+** within one loop iteration, which is the only supported pattern.
+**
+** Returns NULL when it cannot serve a prefix cheaply (mapped WAD, already-cached lump, request too
+** big, backend declined) -- the caller then falls back to plain W_CacheLumpNum, which is always
+** correct, just slower. */
+/* Sized, not rounded: this array is .bss and costs the TLSF pool 1:1 (a 2 KB first cut took the pool
+   15.47 -> 13.28 KB).  8 + 4*320 covers the widest patch a Doom WAD can hold; anything beyond falls
+   back to W_CacheLumpNum, which is correct, just slower. */
+#define W_PREFIX_SCRATCH (8 + 4 * 320)
+static byte w_prefix_buf[W_PREFIX_SCRATCH];
+
+void *W_CacheLumpPrefix (int lumpnum, int nbytes)
+{
+    lumpinfo_t *lump;
+
+    if ((unsigned)lumpnum >= numlumps) return NULL;
+    if (nbytes <= 0 || nbytes > W_PREFIX_SCRATCH) return NULL;
+
+    lump = &lumpinfo[lumpnum];
+
+    /* Already free: a mapped WAD hands back a real pointer, and a resident lump is already paid
+       for.  In both cases the FULL lump is correct and costs nothing, so prefer it. */
+    if (w_wadfile != NULL && w_wadfile->mapped != NULL)
+        return w_wadfile->mapped + lump->position;
+    if (lump->cache != NULL)
+        return lump->cache;
+
+    if (nbytes > lump->size) nbytes = lump->size;
+
+#ifdef SAT_REPACK
+    {
+        extern int sat_drp_read_lump_n (unsigned int lump, void *dest, int size, int want);
+        if (sat_drp_read_lump_n ((unsigned int)lumpnum, w_prefix_buf, lump->size, nbytes))
+            return w_prefix_buf;
+    }
+#endif
+
+    /* Not in the repack subset: the full-WAD backend has no prefix path (and a CD read is a CD read
+       either way), so let the caller take the classic route. */
+    return NULL;
+}
+
 //
 // W_CacheLumpName
 //

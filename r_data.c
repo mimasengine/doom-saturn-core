@@ -473,7 +473,26 @@ void R_GenerateLookup (int texnum)
 	    return;
 	}
 	RP_StampBegin (2);
-	realpatch = W_CacheLumpNum (patch->patch, PU_CACHE);
+	/* SATURN 2026-08-14 -- HEADER ONLY.  This loop reads `width` and `columnofs[]` and never a
+	   texel, but W_CacheLumpNum LZSS-decoded the whole 35 080-byte patch to serve them: measured
+	   `k12` per patch, ~4 patches per rebuild, ~4 rebuilds per frame = the whole 46 ms `e`.
+	   Two steps because `width` lives inside the header we are trying to size: 8 bytes to read it,
+	   then 8 + 4*width for the offset table.  The second decode subsumes the first and both are
+	   ~1 KB, so the pair costs ~3 % of one full decode.
+	   W_CacheLumpPrefix returns NULL whenever it cannot serve cheaply (mapped WAD, resident lump,
+	   oversized request, lump outside the repack subset) -- fall back to the classic path, which is
+	   always correct.  The prefix lives in a scratch buffer valid until the next call, which is why
+	   it is consumed entirely within this iteration and never stored. */
+	realpatch = (patch_t *) W_CacheLumpPrefix (patch->patch, 8);
+	if (realpatch)
+	{
+	    int pw = SHORT(realpatch->width);
+	    realpatch = (pw > 0)
+		? (patch_t *) W_CacheLumpPrefix (patch->patch, 8 + 4 * pw)
+		: NULL;
+	}
+	if (!realpatch)
+	    realpatch = W_CacheLumpNum (patch->patch, PU_CACHE);
 	RP_StampEnd (2);
 	x1 = patch->originx;
 	x2 = x1 + SHORT(realpatch->width);
