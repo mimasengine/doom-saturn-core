@@ -170,6 +170,10 @@ int			r_patch_ovf = 0;
 /* SATURN 2026-08-14: R_GetColumn calls THIS FRAME that found the single-patch lump non-resident,
    i.e. calls that go to the disc.  Reset in RP_BeginFrame, latched with `g` as row-20 `d`. */
 int			r_getcol_disc = 0;
+/* SATURN 2026-08-14: textures abandoned by R_GenerateLookup because a column has no patch -- the
+   vanilla printf site, which cost 46 ms A PIECE on Saturn.  Cumulative; overlay row 22 `np`.
+   Non-zero is NORMAL on TNT/Plutonia; it means those textures render from the composite path. */
+int			r_nopatch_col = 0;
 /* SATURN 2026-08-08: columns whose composite offset lay OUTSIDE texturecompositesize -- the
    wrong-texture-for-one-frame bug (see the long note in R_GetColumn).  Cumulative; overlay `ob`
    on row 12.  **It must read 0.**  Non-zero means R_GenerateLookup left a directory that does not
@@ -483,8 +487,20 @@ void R_GenerateLookup (int texnum)
     {
 	if (!patchcount[x])
 	{
-	    printf ("R_GenerateLookup: column without a patch (%s)\n",
-		    texture->name);
+	    /* SATURN 2026-08-14 -- THE 46 ms.  Vanilla prints here; on Saturn `printf` goes through
+	       newlib to _write (src/syscalls.c), which pushes EVERY CHARACTER through
+	       sat_console_putc + a volatile A-bus store at 0x22100001, and the trailing '\n' then
+	       calls console_redraw(): 26 rows x SRL::Debug::Print of a 44-char padded string =
+	       ~1150 VDP2 VRAM writes, plus a console_scroll once the console is full.  Measured, on
+	       g's own frame: `e46` inside `x46648` = 99 % of the worst R_GetColumn call, with `z0`
+	       (not the allocator), `a0` (not W_CacheLumpNum) and the control `k3` steady.  ~4 such
+	       textures visible per frame accounted for the whole 176 ms `g`.
+	       Two independent corroborations: `x` reproduced to 0,3 % across five different frames --
+	       the cost is a FIXED 26-row redraw, only the `%s` name varies -- and row-10 `hp1256` is
+	       newlib's 1024-byte stdio buffer, which nothing else in this build allocates.
+	       TNT textures legitimately have patchless columns, so this fires forever, every frame.
+	       Keep the diagnostic, drop the console blit: count it and read it on row 22 as `np`. */
+	    r_nopatch_col++;
 	    Z_Free (patchcount);   // SATURN R4: the vanilla early-return leaked this PU_STATIC temp;
 	    return;                // under lazy rebuilds (M4 purge churn) that leak accretes + fragments
 	}
