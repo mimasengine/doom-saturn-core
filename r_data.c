@@ -348,8 +348,7 @@ void R_GenerateComposite (int texnum)
     colofs = texturecolumnofs[texnum];
 
     // Composite the columns together.
-    RP_StampBegin (2);                            /* SATURN 2026-08-14: row-20 `k` (the copy) */
-    patch = texture->patches;
+    patch = texture->patches;                     /* cleared: `k2..k3` on 2026-08-14 */
 		
     for (i=0 , patch = texture->patches;
 	 i<texture->patchcount;
@@ -389,7 +388,6 @@ void R_GenerateComposite (int texnum)
 	}
 						
     }
-    RP_StampEnd (2);
 
     // Classic path: now that the texture is built it is purgable from the zone.
     // Cache-pool blocks are managed by the LRU (R_PostTexCacheFrame), not the
@@ -445,6 +443,15 @@ void R_GenerateLookup (int texnum)
     for (x = 0 ; x < texture->width ; x++) { collump[x] = -1; colofs[x] = 0; }
     patch = texture->patches;
 
+    /* SATURN 2026-08-14 (round 4): `e46` survived `np0`, so the printf branch is NEVER TAKEN and my
+       printf story was wrong -- the 46 ms is elsewhere inside R_GenerateLookup.  The slots move in:
+	 a = this whole patch loop (fetch + the per-column write-back)
+	 k = the worst single W_CacheLumpNum(patch->patch) inside it -- the ONLY call left that was
+	     never bracketed.  `d`/`ld` argued the disc is out, but `d` counted the OTHER
+	     W_CacheLumpNum (R_GetColumn's single-patch return); this one is a different lump.
+       a~46 & k~46 => the patch fetch.  a~46 & k~0 => the per-column write-back loop.
+       a~0        => the cost is the init loop or the final width loop below. */
+    RP_StampBegin (1);
     for (i=0 , patch = texture->patches;
 	 i<texture->patchcount;
 	 i++, patch++)
@@ -462,9 +469,12 @@ void R_GenerateLookup (int texnum)
 	{
 	    r_patch_ovf++;
 	    Z_Free (patchcount);
+	    RP_StampEnd (1);
 	    return;
 	}
+	RP_StampBegin (2);
 	realpatch = W_CacheLumpNum (patch->patch, PU_CACHE);
+	RP_StampEnd (2);
 	x1 = patch->originx;
 	x2 = x1 + SHORT(realpatch->width);
 	
@@ -482,7 +492,8 @@ void R_GenerateLookup (int texnum)
 	    colofs[x] = LONG(realpatch->columnofs[x-x1])+3;
 	}
     }
-	
+    RP_StampEnd (1);
+
     for (x=0 ; x<texture->width ; x++)
     {
 	if (!patchcount[x])
@@ -658,15 +669,7 @@ R_GetColumn_impl
 		return r_column_stub;
 	    }
 	}
-	{   /* row-20 `a`: the single-patch fetch.  `d0` proved it never reaches the disc, so this
-	       measures W_CacheLumpNum's ALREADY-CACHED branch -- which still rewrites the tag through
-	       Z_ChangeTag on every column. */
-	    byte *rp;
-	    RP_StampBegin (1);
-	    rp = (byte *)W_CacheLumpNum(lump,PU_CACHE);
-	    RP_StampEnd (1);
-	    return rp+ofs;
-	}
+	return (byte *)W_CacheLumpNum(lump,PU_CACHE)+ofs;   /* cleared: `a0` on 2026-08-14 */
     }
 
     if (!texturecomposite[tex])
