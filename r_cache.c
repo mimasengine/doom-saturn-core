@@ -82,6 +82,10 @@ extern int sat_xsplit;           // r_main.c  -- parallel x-split render in prog
 extern int sat_local_players;    // platform  -- >1 => local split-screen
 
 int sat_texcache_active  = 0;   // 1 while a pool is live this level
+/* SATURN 2026-08-14: USE of the carved pool, flipped live by pad L+Right (overlay row 22 `xc`).
+   DEFAULT 0 = the slab is carved but inert, i.e. composites take the classic PU_CACHE path exactly
+   as they do today.  Split-screen keeps its proven behaviour by defaulting to 1 at init. */
+int sat_texcache_use     = 0;
 int sat_texcache_poolkb  = 0;   // pool size in KB (0 if no pool)
 int sat_texcache_entries = 0;   // live composites currently in the pool
 int sat_texcache_builds  = 0;   // cumulative pool allocs this level (misses built in)
@@ -165,7 +169,18 @@ void R_SetupTextureCaches (void)
        because R_EmitWorldThingsVDP1 allocates inside it.
        ⚠ DO NOT re-lift this without first freeing REAL contiguous zone -- and judge it on FPS, which
        is what moved 3-4x, not only on the cumulative CD counters. */
-    if (!sat_streaming_mode || sat_local_players <= 1)
+    /* SATURN 2026-08-14 -- RE-MEASUREMENT, not a re-lift.  The verdict above stands; what no longer
+       stands is its stated MECHANISM.  It blames "every Z_Malloc walks and purges the WHOLE block
+       list, then z_emergency RESCANS it" -- and row-20 `z`, which now TIMES the worst single
+       Z_Malloc of the frame, reads 0 on every capture.  The result was real; the reason was not, and
+       the likeliest thing that measurement was actually charging to the cache is the LZSS storm
+       killed on 2026-08-14 (a31601f): R_GenerateLookup was decoding a whole 35 KB patch per patch,
+       ~16 times a frame, which any change to zone timing would perturb.
+       So: CARVE in 1p (this gate), but leave USE off by default (sat_texcache_use below).  Both
+       sides of the A/B then have a byte-identical memory layout, which is the only honest way to
+       measure it ([[interbuild-perf-noise]]) -- the same discipline the R+Z flat-pool A/B uses.
+       Judge it on FPS, exactly as the warning above demands. */
+    if (!sat_streaming_mode)
         return;
 
     // `largest` = the run Z_Malloc could hand out after purging PU_CACHE
@@ -191,6 +206,9 @@ void R_SetupTextureCaches (void)
     texcache_slab = Z_Malloc (sz, PU_STATIC, NULL);  // non-purgable; we own its lifetime
     texcache_zone = Z_InitZone (texcache_slab, sz);
     sat_texcache_active  = 1;
+    /* SATURN 2026-08-14: split-screen keeps the proven ON behaviour; 1p carves inert and waits for
+       the pad L+Right A/B (see the note at the streaming gate above). */
+    sat_texcache_use     = (sat_local_players > 1);
     sat_texcache_poolkb  = sz >> 10;
     sat_texcache_entries = 0;
     sat_texcache_builds  = 0;
@@ -222,8 +240,8 @@ byte *R_TexCacheAlloc (int size, void **userp)
     byte           *blk;
     int             need;
 
-    if (!sat_texcache_active || sat_xsplit)
-        return NULL;                  // inactive, or a parallel x-split pass owns the allocator
+    if (!sat_texcache_active || !sat_texcache_use || sat_xsplit)
+        return NULL;                  // inactive/inert, or a parallel x-split pass owns the allocator
 
     need = size + (int)sizeof(texcache_hdr_t);
 
@@ -253,7 +271,7 @@ void R_TexCacheTouch (byte *data)
 {
     texcache_hdr_t *h;
 
-    if (!sat_texcache_active || sat_xsplit || !data)
+    if (!sat_texcache_active || !sat_texcache_use || sat_xsplit || !data)
         return;                       // never touch the pool during a parallel x-split pass
     // data-12 lands on our header for a pool block, or harmlessly inside the
     // preceding 24-byte memblock_t header (id==ZONEID) for a classic main-zone

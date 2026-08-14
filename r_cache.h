@@ -37,6 +37,7 @@ void  R_TexCacheTouch (byte *data);             // recency bump on a cache hit
 void  R_PostTexCacheFrame (void);
 
 extern int sat_texcache_active;       // 1 while a pool is live this level
+extern int sat_texcache_use;          // SATURN: live A/B (pad L+Right, row 22 `xc`); 0 = carved but inert
 extern int sat_texcache_poolkb;       // pool size (KB), 0 if none
 extern int sat_texcache_entries;      // live composites in the pool
 extern int sat_texcache_builds;       // cumulative pool allocs this level (misses built in)
