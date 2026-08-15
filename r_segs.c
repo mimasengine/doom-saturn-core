@@ -1797,7 +1797,12 @@ void R_RenderSegLoop (void)
     int lod_flat = 0;
     if (sat_wall_lod_scale)
     {
-	int lod_h = FixedMul (worldtop - worldbottom, rw_scale) >> FRACBITS;
+	/* ⚠ HEIGHTBITS, not FRACBITS.  R_StoreWallRange already does `worldtop >>= 4` before this
+	   loop, so FixedMul(world, rw_scale) lands in 1/2^12 pixel units -- the same scale the tier
+	   coordinates use two lines below (`>> HEIGHTBITS`).  Shifting by 16 divided the height by a
+	   further 16, every tier scored under the smallest rung, and all three steps flattened the
+	   WHOLE level identically: `n0 g0 cb0/0`, 1215 hits at every step. */
+	int lod_h = FixedMul (worldtop - worldbottom, rw_scale) >> HEIGHTBITS;
 	int lod_w = rw_stopx - rw_x;
 	if (lod_h < 0) lod_h = 0;
 	if (lod_w < 0) lod_w = 0;
