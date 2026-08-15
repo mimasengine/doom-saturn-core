@@ -2136,7 +2136,11 @@ static void rp_p3_prof_show(void)
     if (sat_wall_lod_scale == -1)
     {
         static const int gov_rung[4] = { 0, 200, 400, 800 };
-        unsigned bp_ms = bp10 / 224u;
+        /* ⚠ `bp10` is TENTHS OF A MILLISECOND (`prof_wallprep * 10 / 224`, line above), not FRT
+           ticks.  Dividing by 224 again turned a 132,8 ms frame into `5`, permanently under the
+           40 ms floor: the owner's captures read `u0 d99` on every photo -- the governor counting
+           down forever and never once seeing the overload it was built for. */
+        unsigned bp_ms = bp10 / 10u;
         if (rend <= RP_REC_SANE)                      /* never steer on a glitched frame */
         {
             if (bp_ms > 100u)      { sat_lod_gov_up++; sat_lod_gov_dn = 0; }
@@ -2147,6 +2151,10 @@ static void rp_p3_prof_show(void)
                 { sat_lod_auto_step++; sat_lod_gov_up = 0; }
             else if (sat_lod_gov_dn >= 90 && sat_lod_auto_step > 0)
                 { sat_lod_auto_step--; sat_lod_gov_dn = 0; }
+            /* Stop counting at the rails: a run that cannot fire anything is not information, and
+               `d99` pinned at the clamp told the owner nothing about what the governor was seeing. */
+            if (sat_lod_auto_step >= 3 && sat_lod_gov_up > 8)  sat_lod_gov_up = 8;
+            if (sat_lod_auto_step <= 0 && sat_lod_gov_dn > 90) sat_lod_gov_dn = 90;
         }
         sat_lod_eff = gov_rung[sat_lod_auto_step & 3];
     }
