@@ -261,6 +261,11 @@ int R_LoadBudgetLeft (void)
 }
 int sat_wall_flat_io    = 0;    /* tiers drawn flat for want of residency  (~1 s window)       */
 int sat_wall_flat_nocol = 0;    /* ...of which we had no cached colour either (~1 s window)    */
+/* SATURN 2026-08-15: DISTANCE LOD.  Tiers whose rw_scale falls under this threshold draw flat in
+   their dominant colour instead of paying R_GenerateComposite.  0 = OFF.  Cycled live by pad L+B:
+   0 -> FRACUNIT/16 -> /8 -> /4 -> 0, i.e. progressively nearer walls get flattened.  Row 13 `Lo`. */
+int sat_wall_lod_scale = 0;
+int sat_wall_lod_hits  = 0;     /* tiers flattened by distance this ~1 s window                 */
 /* Neutral index used when a texture has never been resident, so its dominant colour was never
    computed and CANNOT be without loading it.  Mid-grey in the Doom palette; dc_colormap still
    shades it by distance/sector light, so it reads as a lit surface, not a hole. */
@@ -268,6 +273,7 @@ int sat_wall_flat_nocol = 0;    /* ...of which we had no cached colour either (~
 
 extern int  R_TextureIOFree (int tex);
 extern int  R_WallPotatoColorPeek (int tex);
+extern int  R_WallPotatoSeed (int tex);   /* SATURN: one texel from the first patch, no composite */
 extern int  R_WallPotatoColor (int tex);
 /* Read-only, never allocates, NULL for any doubt -- the ONLY column fetch legal off the master or
    across a phase boundary.  See the long note at its definition in r_data.c. */
@@ -315,9 +321,16 @@ static int sat_wall_flat_color (int tex)
     int c = R_WallPotatoColorPeek (tex);
     if (c < 0)
     {
-	if (R_TextureIOFree (tex) || R_LoadBudgetLeft ())
-	    c = R_WallPotatoColor (tex);
-	else
+	/* SATURN 2026-08-15: SEED, never WALK.  This used to call R_WallPotatoColor whenever IO was
+	   free -- but "free" means no DISC, and the real bill is R_GenerateComposite: that walk faults
+	   the whole texture in through R_GetColumn and builds the composite, measured at 31 ms
+	   (row-20 `k`).  Paying it to colour a tier we have just decided NOT to texture is precisely
+	   the work the distance LOD exists to remove.  R_WallPotatoSeed reads ONE texel out of the
+	   first patch through a ~1,3 KB prefix decode: no composite, no full decode, ~0,4 ms once per
+	   texture, and it upgrades itself to the exact dominant colour the first time the texture is
+	   genuinely drawn close up. */
+	c = R_WallPotatoSeed (tex);
+	if (c < 0)
 	    { c = SAT_WALL_FLAT_UNKNOWN; sat_wall_flat_nocol++; }
     }
     return c;
@@ -1757,9 +1770,20 @@ void R_RenderSegLoop (void)
        next frames as the budget refills -- bounded loading, no hitch, no async machinery.
        No distance test is needed: the BSP walk is front-to-back, so the budget is spent on the
        NEAREST walls by construction and the far ones are what degrades. */
-    int io_flat_mid = midtexture    ? sat_wall_io_flat (midtexture)    : 0;
-    int io_flat_up  = toptexture    ? sat_wall_io_flat (toptexture)    : 0;
-    int io_flat_lo  = bottomtexture ? sat_wall_io_flat (bottomtexture) : 0;
+    /* SATURN 2026-08-15 -- DISTANCE LOD, the first rule of the LOD governor.
+       The budget gate above answers *"can I afford to LOAD this?"*.  This one answers a different
+       question the budget never asked: *"is this tier worth TEXTURING at all?"*  A wall whose
+       on-screen scale is tiny costs a full R_GenerateComposite -- 31 ms, measured, `cb21/8` says 8
+       distinct textures a second on TNT MAP11 -- to produce a few pixels nobody can read.  Flatten
+       it to its dominant colour instead: sat_dc_solid then skips R_GetColumn entirely, so no
+       composite, no patch decode, no purge pressure on the composites that ARE close.
+       Test is `rw_scale`, not raw distance: scale is how big the tier actually lands on screen, so a
+       huge far wall still textures while a small far one does not.  0 = off (pad L+B cycles it). */
+    int lod_flat = (sat_wall_lod_scale && rw_scale < sat_wall_lod_scale);
+    if (lod_flat) sat_wall_lod_hits++;
+    int io_flat_mid = midtexture    ? (lod_flat || sat_wall_io_flat (midtexture))    : 0;
+    int io_flat_up  = toptexture    ? (lod_flat || sat_wall_io_flat (toptexture))    : 0;
+    int io_flat_lo  = bottomtexture ? (lod_flat || sat_wall_io_flat (bottomtexture)) : 0;
     int io_col_mid  = io_flat_mid ? sat_wall_flat_color (midtexture)    : 0;
     int io_col_up   = io_flat_up  ? sat_wall_flat_color (toptexture)    : 0;
     int io_col_lo   = io_flat_lo  ? sat_wall_flat_color (bottomtexture) : 0;

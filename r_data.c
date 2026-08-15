@@ -1026,7 +1026,11 @@ int R_WallPotatoColor (int tex)
 	wallpot_cache = Z_Malloc(numtextures * (int)sizeof(short), PU_STATIC, 0);
 	for (i = 0; i < numtextures; i++) wallpot_cache[i] = -1;
     }
-    if (wallpot_cache[tex] >= 0) return wallpot_cache[tex];
+    /* SATURN 2026-08-15: bit 8 = EXACT (the full dominant-colour walk below).  A cheap seed from
+       R_WallPotatoSeed stores the colour with bit 8 CLEAR, so it serves distant walls immediately
+       and still gets upgraded the first time the texture is genuinely drawn up close. */
+    if (wallpot_cache[tex] >= 0 && (wallpot_cache[tex] & 0x100))
+	return wallpot_cache[tex] & 0xff;
 
     memset (hist, 0, sizeof hist);
     w = texturewidthmask[tex] + 1;
@@ -1036,8 +1040,57 @@ int R_WallPotatoColor (int tex)
 	p = R_GetColumn(tex, col);
 	for (y = 0; y < h; y += 2) hist[p[y]]++;
     }
-    wallpot_cache[tex] = (short) R_PotatoRepColor (hist);
-    return wallpot_cache[tex];
+    wallpot_cache[tex] = (short) (R_PotatoRepColor (hist) | 0x100);
+    return wallpot_cache[tex] & 0xff;
+}
+
+/* SATURN 2026-08-15 -- CHEAP POTATO SEED, the owner's question answered: *"pour avoir la couleur
+   dominante, il faut avoir lu la texture non ? et si on lisait le premier pixel à la place ?"*
+   Yes -- and worse than reading it: R_WallPotatoColor above walks every other column through
+   R_GetColumn, which BUILDS THE COMPOSITE (row-20 `k31`).  Calling it to colour a wall we have just
+   decided NOT to texture would pay the exact cost the LOD exists to avoid.
+   So take one texel out of the FIRST PATCH, with no composite and no full decode: a patch's first
+   column starts right after `8 + 4*width`, so a ~1,3 KB prefix carries the header, the offset table
+   and the first post -- the same W_CacheLumpPrefix machinery that killed the 46 ms LZSS storm.
+   ~0,4 ms, once per texture, and it self-heals: bit 8 stays clear, so the first close-up textured
+   draw replaces it with the true dominant colour.
+   Returns -1 when it cannot look cheaply (no patch, oversized offset table, empty first column) --
+   the caller then uses the neutral index and counts it (`nocol`). */
+int R_WallPotatoSeed (int tex)
+{
+    texture_t  *t;
+    patch_t    *ph;
+    const byte *post;
+    int         lump, w, ofs, want, i;
+
+    if (tex < 0 || tex >= numtextures) return -1;
+    if (!wallpot_cache)
+    {
+	wallpot_cache = Z_Malloc(numtextures * (int)sizeof(short), PU_STATIC, 0);
+	for (i = 0; i < numtextures; i++) wallpot_cache[i] = -1;
+    }
+    if (wallpot_cache[tex] >= 0) return wallpot_cache[tex] & 0xff;
+
+    t = textures[tex];
+    if (!t || t->patchcount <= 0) return -1;
+    lump = t->patches[0].patch;
+
+    ph = (patch_t *) W_CacheLumpPrefix (lump, 8);          /* just the header, for `width` */
+    if (!ph) return -1;
+    w = SHORT(ph->width);
+    if (w <= 0) return -1;
+
+    want = 8 + 4 * w + 8;                                  /* + one post header + one texel */
+    ph = (patch_t *) W_CacheLumpPrefix (lump, want);
+    if (!ph) return -1;
+
+    ofs = LONG(ph->columnofs[0]);
+    if (ofs < 8 + 4 * w || ofs + 4 > want) return -1;      /* first column outside what we decoded */
+    post = (const byte *)ph + ofs;
+    if (post[0] == 0xff || post[1] == 0) return -1;        /* column empty -> no honest colour */
+
+    wallpot_cache[tex] = (short)(post[3] & 0xff);          /* topdelta, length, pad, then texels */
+    return wallpot_cache[tex] & 0xff;                      /* bit 8 clear = CHEAP, upgradable */
 }
 
 /* SATURN: the dominant colour PEEKED -- returns it if already computed, -1 otherwise, and NEVER
@@ -1051,7 +1104,8 @@ int R_WallPotatoColor (int tex)
 int R_WallPotatoColorPeek (int tex)
 {
     if (tex < 0 || tex >= numtextures || !wallpot_cache) return -1;
-    return wallpot_cache[tex];
+    if (wallpot_cache[tex] < 0) return -1;
+    return wallpot_cache[tex] & 0xff;   /* strip the EXACT bit; a cheap seed answers just as well */
 }
 
 /* SATURN 2026-08-09 -- ALLOCATION-FREE, SLAVE-SAFE column fetch.  R_GetColumn cannot be used off

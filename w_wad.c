@@ -604,7 +604,8 @@ void *W_CacheLumpNum(int lumpnum, int tag)
 /* Sized, not rounded: this array is .bss and costs the TLSF pool 1:1 (a 2 KB first cut took the pool
    15.47 -> 13.28 KB).  8 + 4*320 covers the widest patch a Doom WAD can hold; anything beyond falls
    back to W_CacheLumpNum, which is correct, just slower. */
-#define W_PREFIX_SCRATCH (8 + 4 * 320)
+#define W_PREFIX_SCRATCH (8 + 4 * 320 + 8)   /* +8: room for the first column's post header + a texel
+					        (R_WallPotatoSeed), still one .bss KB */
 static byte w_prefix_buf[W_PREFIX_SCRATCH];
 
 void *W_CacheLumpPrefix (int lumpnum, int nbytes)
