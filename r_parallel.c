@@ -2016,6 +2016,8 @@ void RP_BeginMasked(void)
 int sat_prof_rec_max=0;            /* window max (= p100), tenths-ms */
 int sat_prof_dropped=0;            /* glitch/transition frames excluded from the window */
 int sat_prof_pk_bw=0, sat_prof_pk_bp=0, sat_prof_pk_p=0, sat_prof_pk_m=0;  /* per-phase peaks */
+/* SATURN 2026-08-15: the LOD governor's state lives in r_segs.c beside the knob it drives. */
+extern int sat_wall_lod_scale, sat_lod_eff, sat_lod_auto_step, sat_lod_gov_up, sat_lod_gov_dn;
 int sat_prof_mx_map=0, sat_prof_mx_x=0, sat_prof_mx_y=0, sat_prof_mx_ang=0, sat_prof_mx_t=0;
 /* SATURN PERF (2026-07-09): full detail of the worst-REC frame, snapshotted at each new peak
    (persists until beaten / config change).  Phase split + slave b/Pb AT that frame. tenths-ms / %. */
@@ -2117,6 +2119,40 @@ static void rp_p3_prof_show(void)
        delta -> a bogus >300ms REC (impossible M, out-of-bounds MX); drop it so the
        peaks/max/histogram are not poisoned (Ymir shareware proved these are NOT CD
        stalls -- they survive into resident mode -> a profiler artifact, now excluded). */
+    /* ------------------------------------------------------------------------------------------
+       SATURN 2026-08-15 -- LOD GOVERNOR, first axis: Bp drives the wall threshold.
+       The owner's shape: *"si Bp trop élevé, alors sacrifier x; si P trop élevé, sacrifier y"*.
+       Only the Bp axis is wired, deliberately: one axis that behaves beats three that pump, and the
+       other knobs (SQ floor/ceiling on Y and L+Y, the thing cap) are not yet proven safe to move
+       from a controller rather than a pad ([[mode-switch-corruption-2026-07-19]]).
+
+       ASYMMETRIC ON PURPOSE.  Quality that oscillates is worse to look at than quality that is
+       merely low, so: climb fast (8 frames over the ceiling), release slowly (90 frames under the
+       floor), and put a dead band between the two so a frame sitting between them moves nothing.
+       Thresholds straddle the measured cliff -- at Bp ~168 ms the composites are being built, at
+       Bp ~28 ms none are; 100/40 ms leaves both sides of that unambiguous.
+       Steps are the same pixel rungs the pad offers, so AUTO can never reach a setting the owner
+       cannot reproduce by hand.  Row 21 reports it; step 0 = the governor chose full quality. */
+    if (sat_wall_lod_scale == -1)
+    {
+        static const int gov_rung[4] = { 0, 200, 400, 800 };
+        unsigned bp_ms = bp10 / 224u;
+        if (rend <= RP_REC_SANE)                      /* never steer on a glitched frame */
+        {
+            if (bp_ms > 100u)      { sat_lod_gov_up++; sat_lod_gov_dn = 0; }
+            else if (bp_ms < 40u)  { sat_lod_gov_dn++; sat_lod_gov_up = 0; }
+            else                   { sat_lod_gov_up = sat_lod_gov_dn = 0; }   /* dead band */
+
+            if (sat_lod_gov_up >= 8 && sat_lod_auto_step < 3)
+                { sat_lod_auto_step++; sat_lod_gov_up = 0; }
+            else if (sat_lod_gov_dn >= 90 && sat_lod_auto_step > 0)
+                { sat_lod_auto_step--; sat_lod_gov_dn = 0; }
+        }
+        sat_lod_eff = gov_rung[sat_lod_auto_step & 3];
+    }
+    else
+        sat_lod_eff = sat_wall_lod_scale;             /* manual rung, or 0 = off */
+
     if (rend <= RP_REC_SANE) {
         if (bw10 > (unsigned)sat_prof_pk_bw) sat_prof_pk_bw = (int)bw10;
         if (bp10 > (unsigned)sat_prof_pk_bp) {

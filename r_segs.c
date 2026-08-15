@@ -265,8 +265,15 @@ int sat_wall_flat_nocol = 0;    /* ...of which we had no cached colour either (~
    threshold draws flat in its dominant colour instead of paying R_GenerateComposite.  0 = OFF,
    cycled live by pad L+B.  Units are PIXELS -- the name kept `_scale` from the first, wrong version
    that tested rw_scale (= 1/distance) and flattened big mid-distance walls.  Row 22 `Lo`. */
-int sat_wall_lod_scale = 0;
+int sat_wall_lod_scale = 0;     /* pad L+B: 0=off, 200/400/800 px, -1 = AUTO (governor drives)  */
 int sat_wall_lod_hits  = 0;     /* tiers flattened by distance this ~1 s window                 */
+/* SATURN 2026-08-15 LOD GOVERNOR (controller in r_parallel.c, reported on row 21).
+   `sat_lod_eff` is the threshold the renderer ACTUALLY uses -- the manual rung, or the governor's
+   choice when sat_wall_lod_scale == -1.  One writer (the governor), one reader (below). */
+int sat_lod_eff        = 0;
+int sat_lod_auto_step  = 0;     /* 0..3, index into the governor's rung table                   */
+int sat_lod_gov_up     = 0;     /* consecutive frames over the ceiling / under the floor         */
+int sat_lod_gov_dn     = 0;
 /* Neutral index used when a texture has never been resident, so its dominant colour was never
    computed and CANNOT be without loading it.  Mid-grey in the Doom palette; dc_colormap still
    shades it by distance/sector light, so it reads as a lit surface, not a hole. */
@@ -1795,7 +1802,7 @@ void R_RenderSegLoop (void)
        20-column sliver scores 640 and flattens while a 100-column facade scores 3200 and keeps its
        texture.  Threshold is in PIXELS; 0 = off (pad L+B cycles it). */
     int lod_flat = 0;
-    if (sat_wall_lod_scale)
+    if (sat_lod_eff > 0)
     {
 	/* ⚠ HEIGHTBITS, not FRACBITS.  R_StoreWallRange already does `worldtop >>= 4` before this
 	   loop, so FixedMul(world, rw_scale) lands in 1/2^12 pixel units -- the same scale the tier
@@ -1806,7 +1813,7 @@ void R_RenderSegLoop (void)
 	int lod_w = rw_stopx - rw_x;
 	if (lod_h < 0) lod_h = 0;
 	if (lod_w < 0) lod_w = 0;
-	lod_flat = (lod_h * lod_w) < sat_wall_lod_scale;
+	lod_flat = (lod_h * lod_w) < sat_lod_eff;
     }
     if (lod_flat) sat_wall_lod_hits++;
     int io_flat_mid = midtexture    ? (lod_flat || sat_wall_io_flat (midtexture))    : 0;
