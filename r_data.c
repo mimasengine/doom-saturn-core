@@ -211,7 +211,11 @@ void R_CompositeWindowReset (void)
     r_composite_builds  = 0;
     r_composite_distinct = 0;
     r_cd_seen_n = 0;
-    r_composite_pf = 0;
+    /* ⚠ `r_composite_pf` is NOT reset here.  This function is called right after row 18 prints, and
+       `pf` lives on row 22, which prints LATER in the same overlay block -- resetting it here zeroed
+       it before it was ever displayed, and `pf0` on the first seven captures was that bug, not a
+       measurement.  Exactly the clobber that made `zb` useless (row 11's `lg` overwrote it).
+       Row 22 clears it itself, immediately after printing. */
 }
 
 /* ------------------------------------------------------------------------------------------------
@@ -237,7 +241,14 @@ void R_CompositeWindowReset (void)
 #define R_CPIN_BUDGET  (64*1024)
 #define R_CPIN_FLOOR   (48*1024)
 
-int			sat_cpin_on   = 1;   /* live A/B, pad L+Left */
+/* DEFAULT 0 since 2026-08-14, and the reason is arithmetic, not taste.  Shipped ON, it yielded on
+   essentially every build: seven captures read `pn0/1` .. `pn0/25` -- zero KB held, the ring released
+   again and again -- because row-11 `lg` sits at 24-38 KB against the 48 KB floor.  The zone cannot
+   spare a 48 KB run, so the pin never engages; worse, `lg` already dips BELOW the ~35 KB a sky/face
+   patch needs, so relaxing the floor would trade a real crash risk for a pin that still barely holds.
+   Same wall as the 1p slab (`lf60`), reached from the other side.  The chord and the yield counter
+   stay as the witness -- if a future change frees real contiguous zone, `pn` will say so. */
+int			sat_cpin_on   = 0;   /* live A/B, pad L+Left */
 int			r_cpin_kb     = 0;   /* overlay row 22 `pn<kb>/<yields>` */
 int			r_cpin_yield  = 0;   /* times the ring was released under pressure */
 static int		r_cpin_tex[R_CPIN_MAX];
