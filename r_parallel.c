@@ -2018,6 +2018,7 @@ int sat_prof_dropped=0;            /* glitch/transition frames excluded from the
 int sat_prof_pk_bw=0, sat_prof_pk_bp=0, sat_prof_pk_p=0, sat_prof_pk_m=0;  /* per-phase peaks */
 /* SATURN 2026-08-15: the LOD governor's state lives in r_segs.c beside the knob it drives. */
 extern int sat_wall_lod_scale, sat_lod_eff, sat_lod_auto_step, sat_lod_gov_up, sat_lod_gov_dn;
+extern int sat_gov_axis, sat_gov_p_step, sat_gov_p_dirty;
 int sat_prof_mx_map=0, sat_prof_mx_x=0, sat_prof_mx_y=0, sat_prof_mx_ang=0, sat_prof_mx_t=0;
 /* SATURN PERF (2026-07-09): full detail of the worst-REC frame, snapshotted at each new peak
    (persists until beaten / config change).  Phase split + slave b/Pb AT that frame. tenths-ms / %. */
@@ -2136,30 +2137,68 @@ static void rp_p3_prof_show(void)
     if (sat_wall_lod_scale == -1)
     {
         static const int gov_rung[4] = { 0, 200, 400, 800 };
-        /* ⚠ `bp10` is TENTHS OF A MILLISECOND (`prof_wallprep * 10 / 224`, line above), not FRT
-           ticks.  Dividing by 224 again turned a 132,8 ms frame into `5`, permanently under the
-           40 ms floor: the owner's captures read `u0 d99` on every photo -- the governor counting
-           down forever and never once seeing the overload it was built for. */
-        unsigned bp_ms = bp10 / 10u;
+        /* THE TRIGGER IS THE WHOLE FRAME, not one phase.  The first version watched `Bp` alone, and
+           the owner put his finger straight on the hole: *"100ms au total ? et ensuite il regarde
+           quel paramètre est le plus gros ?"*  It did neither.  A 250 ms frame whose Bp is only 60
+           left it asleep while the game crawled, because it could not see the term that was actually
+           costing.  `rend` is the render total the sanity guard already validates, in the same
+           tenths of a millisecond as the phases.
+           ⚠ `bp10`/`p10`/`m10`/`rend` are TENTHS OF A MS (`prof_x * 10 / 224`), not FRT ticks -- the
+           second version divided by 224 again and a 132,8 ms frame arrived as `5`. */
+        unsigned tot_ms = rend / 10u;
         if (rend <= RP_REC_SANE)                      /* never steer on a glitched frame */
         {
-            if (bp_ms > 100u)      { sat_lod_gov_up++; sat_lod_gov_dn = 0; }
-            else if (bp_ms < 40u)  { sat_lod_gov_dn++; sat_lod_gov_up = 0; }
-            else                   { sat_lod_gov_up = sat_lod_gov_dn = 0; }   /* dead band */
+            if (tot_ms > 100u)      { sat_lod_gov_up++; sat_lod_gov_dn = 0; }
+            else if (tot_ms < 60u)  { sat_lod_gov_dn++; sat_lod_gov_up = 0; }
+            else                    { sat_lod_gov_up = sat_lod_gov_dn = 0; }  /* dead band */
 
-            if (sat_lod_gov_up >= 8 && sat_lod_auto_step < 3)
-                { sat_lod_auto_step++; sat_lod_gov_up = 0; }
-            else if (sat_lod_gov_dn >= 90 && sat_lod_auto_step > 0)
-                { sat_lod_auto_step--; sat_lod_gov_dn = 0; }
-            /* Stop counting at the rails: a run that cannot fire anything is not information, and
-               `d99` pinned at the clamp told the owner nothing about what the governor was seeing. */
-            if (sat_lod_auto_step >= 3 && sat_lod_gov_up > 8)  sat_lod_gov_up = 8;
-            if (sat_lod_auto_step <= 0 && sat_lod_gov_dn > 90) sat_lod_gov_dn = 90;
+            /* WHICH KNOB: the dominant phase of THIS frame owns the degradation.  Bw is measured and
+               deliberately absent from the vote -- it is the BSP walk plus sprite projection and has
+               no quality knob at all, so electing it would degrade something innocent.  When Bw is
+               what dominates, the governor holds and row 21 says `d-`: an honest "I cannot help
+               here" beats a confident wrong move. */
+            if (sat_lod_gov_up >= 8)
+            {
+                unsigned bp = bp10, p = p10, m = m10;
+                sat_lod_gov_up = 0;
+                if (bp >= p && bp >= m)      sat_gov_axis = 'B';
+                else if (p >= bp && p >= m)  sat_gov_axis = 'P';
+                else                         sat_gov_axis = 'M';
+
+                if (sat_gov_axis == 'B' && sat_lod_auto_step < 3)
+                    sat_lod_auto_step++;
+                else if (sat_gov_axis == 'P' && sat_gov_p_step < 2)
+                    { sat_gov_p_step++; sat_gov_p_dirty = 1; }
+                /* 'M' has no proven live knob yet (the thing cap is not validated for a controller),
+                   so it is REPORTED and not acted on -- see row 21 `m-`. */
+            }
+            else if (sat_lod_gov_dn >= 90)
+            {
+                /* Release the MOST degraded axis first, so quality comes back in the reverse order
+                   it was given up and the picture converges on full rather than on whichever axis
+                   happened to be cheap to restore. */
+                sat_lod_gov_dn = 0;
+                if (sat_lod_auto_step >= sat_gov_p_step && sat_lod_auto_step > 0)
+                    sat_lod_auto_step--;
+                else if (sat_gov_p_step > 0)
+                    { sat_gov_p_step--; sat_gov_p_dirty = 1; }
+                else
+                    sat_gov_axis = '-';               /* fully released */
+            }
+            /* Stop the runs at the rails: a run that cannot fire anything is not information, and a
+               counter pinned at its display clamp tells the owner nothing about what was seen. */
+            if (sat_lod_auto_step >= 3 && sat_gov_p_step >= 2 && sat_lod_gov_up > 8)
+                sat_lod_gov_up = 8;
+            if (sat_lod_auto_step <= 0 && sat_gov_p_step <= 0 && sat_lod_gov_dn > 90)
+                sat_lod_gov_dn = 90;
         }
         sat_lod_eff = gov_rung[sat_lod_auto_step & 3];
     }
     else
+    {
         sat_lod_eff = sat_wall_lod_scale;             /* manual rung, or 0 = off */
+        if (sat_gov_p_step) { sat_gov_p_step = 0; sat_gov_p_dirty = 1; }   /* leaving AUTO restores */
+    }
 
     if (rend <= RP_REC_SANE) {
         if (bw10 > (unsigned)sat_prof_pk_bw) sat_prof_pk_bw = (int)bw10;

@@ -274,6 +274,14 @@ int sat_lod_eff        = 0;
 int sat_lod_auto_step  = 0;     /* 0..3, index into the governor's rung table                   */
 int sat_lod_gov_up     = 0;     /* consecutive frames over the ceiling / under the floor         */
 int sat_lod_gov_dn     = 0;
+/* SATURN 2026-08-15 -- the governor became MULTI-AXIS: it triggers on the WHOLE frame and then
+   degrades whichever phase dominated it.  `sat_gov_axis` is the letter row 21 prints (B/P/M/-),
+   `sat_gov_p_step` is the plane axis (0 = untouched, 1 = at least LD, 2 = FLAT) applied by
+   sat_apply_mode() as a FLOOR over the owner's own SQ setting -- it can only ever degrade, never
+   silently improve past what he chose.  `_dirty` asks the platform to re-apply. */
+int sat_gov_axis       = '-';
+int sat_gov_p_step     = 0;
+int sat_gov_p_dirty    = 0;
 /* Neutral index used when a texture has never been resident, so its dominant colour was never
    computed and CANNOT be without loading it.  Mid-grey in the Doom palette; dc_colormap still
    shades it by distance/sector light, so it reads as a lit surface, not a hole. */
