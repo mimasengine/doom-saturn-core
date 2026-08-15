@@ -184,6 +184,37 @@ int			r_composite_oob = 0;
    answers "free" and lets it through.  If `Bp` spikes track this counter, the cost is the REBUILD,
    not the CD, and the fix is to stop the composite being purged (or to key the budget on it too). */
 int			r_composite_builds = 0;
+/* SATURN 2026-08-14: DISTINCT textures behind those builds, this same window, saturating at 16.
+   `cb<builds>/<distinct>` separates the only two worlds left now that the 1p composite pool is dead
+   by arithmetic (`xc0/0/60`: the floor rung needs 96 KB contiguous and the level had 60):
+     distinct << builds  =>  THRASH -- the same few textures destroyed and rebuilt in a loop.  The
+                             work is wasted and something can be won by keeping them alive.
+     distinct ~= builds  =>  CHURN -- the player keeps meeting NEW multi-patch textures.  The cost is
+                             intrinsic, no cache helps, and the only lever is a cheaper BUILD.
+   16 slots because the answer is "a handful" vs "many"; a bitmap over ~1500 texnums would cost the
+   TLSF pool 1:1 for a resolution the question does not need. */
+int			r_composite_distinct = 0;
+static short		r_cd_seen[16];
+static int		r_cd_seen_n = 0;
+
+void R_CompositeWindowReset (void)
+{
+    r_composite_builds  = 0;
+    r_composite_distinct = 0;
+    r_cd_seen_n = 0;
+}
+
+static void R_CompositeNoteDistinct (int texnum)
+{
+    int i;
+    for (i = 0; i < r_cd_seen_n; i++)
+	if (r_cd_seen[i] == (short)texnum) return;
+    if (r_cd_seen_n < 16)
+	r_cd_seen[r_cd_seen_n++] = (short)texnum;
+    r_composite_distinct++;	/* keeps counting past 16 even though the set stops growing,
+				   so `distinct > 16` still reads as "many" rather than saturating
+				   into a number that could be mistaken for thrash */
+}
 /* (r_composite_n -- the per-FRAME twin added 2026-08-12 -- REMOVED the same day.  It existed to put
    the composite count on the same clock and the same frame as row-20 `g`, and it answered in one
    capture: g30 with b0 (zero composites, 30 ms of R_GetColumn) and g197 with b4 (+167 ms for +4
@@ -291,6 +322,7 @@ void R_GenerateComposite (int texnum)
     // PIN it PU_STATIC across the composite alloc below (which can purge PU_CACHE) -- we read
     // collump/colofs from it after the alloc.  Unpinned at the end.
     r_composite_builds++;
+    R_CompositeNoteDistinct (texnum);
     R_EnsureLookup (texnum);
     Z_ChangeTag (texturecolumnlump[texnum], PU_STATIC);
     Z_ChangeTag (texturecolumnofs[texnum],  PU_STATIC);
