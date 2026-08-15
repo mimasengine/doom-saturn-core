@@ -2273,7 +2273,10 @@ static void rp_p3_prof_show(void)
            header-only fetch, reads exactly `e` on every capture -- a field that can only repeat its
            neighbour is a field that has answered.  Its slot still accumulates; only the print is
            gone, so re-adding it is one line if the question reopens. */
-        snprintf(p, sizeof p, "%s g%u n%u x%u e%u k%u z%u    ",
+        /* Trailing spaces sized for the widest form (`x99999` + 3-digit e/k/z): dbg_print does not
+           clear the tail, so a shorter line leaves the previous one's digits behind -- the owner's
+           `z0     0` ghost. */
+        snprintf(p, sizeof p, "%s g%u n%u x%u e%u k%u z%u          ",
                  prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_g_n,
                  prof_bp_g_x, prof_bp_g_e, prof_bp_g_k, prof_bp_g_z);
         dbg_print(0, 20, p);
