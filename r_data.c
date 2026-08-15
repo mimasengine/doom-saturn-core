@@ -197,11 +197,102 @@ int			r_composite_distinct = 0;
 static short		r_cd_seen[16];
 static int		r_cd_seen_n = 0;
 
+/* SATURN 2026-08-14: worst "useful fraction" of a patch decode this window, in percent -- the last
+   column offset R_GenerateComposite actually READS, over the lump length.  It sizes the OTHER lever
+   (bounding the decode the way R_GenerateLookup's header-only fetch already does) BEFORE writing it:
+     pf 30 => 70 % of every patch decode is thrown away, bound it and take that back for free
+     pf 95 => the needed columns run to the end of the patch, bounding it buys nothing.
+   A percentage, so a window max is meaningful -- unlike a duration, it cannot be corrupted by being
+   read on a different clock than row 20 ([[debug-overlay-legend]]). */
+int			r_composite_pf = 0;
+
 void R_CompositeWindowReset (void)
 {
     r_composite_builds  = 0;
     r_composite_distinct = 0;
     r_cd_seen_n = 0;
+    r_composite_pf = 0;
+}
+
+/* ------------------------------------------------------------------------------------------------
+   SATURN 2026-08-14 -- COMPOSITE PIN.  Measured: `cb13/6` and `cb20/6` = SIX distinct textures
+   rebuilt 13-20 times a second, i.e. each of them destroyed and rebuilt almost every frame, at
+   `k33` a piece.  THRASH, and the working set is tiny.
+
+   They are not purged for lack of room (`zf241k` free) but for lack of CONTIGUITY: every ~32 KB
+   composite alloc has to carve a run and sweeps its neighbours -- which are the composites just
+   built.  Self-sustaining, hence the stable ~5/frame.
+
+   Why this is not the pool that just failed (`lf60`, [[getcolumn-per-call-explosion]]): the slab
+   needed 96 KB CONTIGUOUS up front.  This needs none -- the blocks already exist, they merely stop
+   being purge victims.  And the clause that makes it safe: if a 48 KB run can no longer be found,
+   the whole ring is released at once, so the pin can never cause the ~35 KB sky/face contiguous-OOM
+   that killed the pool.  It yields before it can hurt.
+
+   Tag is PU_LEVEL, not PU_STATIC: non-purgeable, but freed by P_SetupLevel's Z_FreeTags -- so a
+   level change reclaims every pinned composite with no lifecycle code, and Z_Free NULLs the user
+   pointer (`&texturecomposite[tex]`) exactly as the classic purge does.
+   ------------------------------------------------------------------------------------------------ */
+#define R_CPIN_MAX     8
+#define R_CPIN_BUDGET  (64*1024)
+#define R_CPIN_FLOOR   (48*1024)
+
+int			sat_cpin_on   = 1;   /* live A/B, pad L+Left */
+int			r_cpin_kb     = 0;   /* overlay row 22 `pn<kb>/<yields>` */
+int			r_cpin_yield  = 0;   /* times the ring was released under pressure */
+static int		r_cpin_tex[R_CPIN_MAX];
+static byte*		r_cpin_ptr[R_CPIN_MAX];
+static int		r_cpin_sz [R_CPIN_MAX];
+static int		r_cpin_n     = 0;
+static int		r_cpin_bytes = 0;
+
+static void R_CPinDrop (int i)
+{
+    /* Only retag if the composite is still OURS.  After a level change Z_FreeTags has already freed
+       the block and NULLed texturecomposite[tex], so the compare fails and we just drop the slot --
+       no touch, no leak, self-healing without a per-level hook. */
+    if (texturecomposite[r_cpin_tex[i]] == r_cpin_ptr[i])
+	Z_ChangeTag (r_cpin_ptr[i], PU_CACHE);
+    r_cpin_bytes -= r_cpin_sz[i];
+    for (; i < r_cpin_n - 1; i++)
+    {
+	r_cpin_tex[i] = r_cpin_tex[i+1];
+	r_cpin_ptr[i] = r_cpin_ptr[i+1];
+	r_cpin_sz [i] = r_cpin_sz [i+1];
+    }
+    r_cpin_n--;
+    if (r_cpin_bytes < 0) r_cpin_bytes = 0;
+    r_cpin_kb = r_cpin_bytes >> 10;
+}
+
+void R_CompositePinFlush (void)
+{
+    while (r_cpin_n)
+	R_CPinDrop (0);
+    r_cpin_bytes = 0;
+    r_cpin_kb    = 0;
+}
+
+static void R_CPinAdd (int texnum, byte *block, int size)
+{
+    int i;
+
+    if (size <= 0 || size > R_CPIN_BUDGET)
+	return;				/* one composite bigger than the whole budget: never pin it */
+
+    for (i = 0; i < r_cpin_n; i++)	/* rebuilt in place -> refresh its slot, do not double-count */
+	if (r_cpin_tex[i] == texnum) { R_CPinDrop (i); break; }
+
+    while (r_cpin_n && (r_cpin_n >= R_CPIN_MAX || r_cpin_bytes + size > R_CPIN_BUDGET))
+	R_CPinDrop (0);			/* oldest out first */
+
+    r_cpin_tex[r_cpin_n] = texnum;
+    r_cpin_ptr[r_cpin_n] = block;
+    r_cpin_sz [r_cpin_n] = size;
+    r_cpin_n++;
+    r_cpin_bytes += size;
+    r_cpin_kb = r_cpin_bytes >> 10;
+    Z_ChangeTag (block, PU_LEVEL);
 }
 
 static void R_CompositeNoteDistinct (int texnum)
@@ -305,6 +396,7 @@ void R_GenerateComposite (int texnum)
     byte*		block;
     extern int		r_composite_builds;
     int			cached = 0;
+    int			pf_maxofs, ofs_used;   /* SATURN: useful-fraction probe, row-22 `pf` */
     texture_t*		texture;
     texpatch_t*		patch;	
     patch_t*		realpatch;
@@ -405,27 +497,54 @@ void R_GenerateComposite (int texnum)
 	if (x2 > texture->width)
 	    x2 = texture->width;
 
+	pf_maxofs = 0;
 	for ( ; x<x2 ; x++)
 	{
 	    // Column does not have multiple patches?
 	    if (collump[x] >= 0)
 		continue;
-	    
-	    patchcol = (column_t *)((byte *)realpatch
-				    + LONG(realpatch->columnofs[x-x1]));
+
+	    ofs_used = LONG(realpatch->columnofs[x-x1]);
+	    if (ofs_used > pf_maxofs) pf_maxofs = ofs_used;   /* SATURN: row-22 `pf` */
+
+	    patchcol = (column_t *)((byte *)realpatch + ofs_used);
 	    R_DrawColumnInCache (patchcol,
 				 block + colofs[x],
 				 patch->originy,
 				 texture->height);
 	}
-						
+	/* SATURN 2026-08-14: how much of this patch the copy actually REACHED.  `+ height + 8` is the
+	   slack for the last column's posts; clamped, and kept as the window's worst case.  This sizes
+	   a decode bound before anyone writes one -- see r_composite_pf. */
+	{
+	    int plen = W_LumpLength (patch->patch);
+	    if (plen > 0 && pf_maxofs > 0)
+	    {
+		int pct = (pf_maxofs + texture->height + 8) * 100 / plen;
+		if (pct > 100) pct = 100;
+		if (pct > r_composite_pf) r_composite_pf = pct;
+	    }
+	}
     }
 
     // Classic path: now that the texture is built it is purgable from the zone.
     // Cache-pool blocks are managed by the LRU (R_PostTexCacheFrame), not the
     // zone purger, so they are left alone here.
     if (!cached)
-	Z_ChangeTag (block, PU_CACHE);
+    {
+	/* SATURN 2026-08-14: PIN instead of demote, while the zone can still hand out a 48 KB run.
+	   Z_CanAllocate early-exits on the first run that fits, so the healthy case is cheap (`zw`
+	   measures it: ~0,2 ms a frame).  The moment it cannot, release the WHOLE ring in one go and
+	   fall back to the classic purgeable composite -- the pin yields before it can starve the
+	   ~35 KB sky/face patches, which is exactly what the 1p slab could not do. */
+	if (sat_cpin_on && Z_CanAllocate (R_CPIN_FLOOR))
+	    R_CPinAdd (texnum, block, texturecompositesize[texnum]);
+	else
+	{
+	    if (r_cpin_n) { R_CompositePinFlush (); r_cpin_yield++; }
+	    Z_ChangeTag (block, PU_CACHE);
+	}
+    }
 
     // SATURN R4: unpin the directory -- purgeable again.
     Z_ChangeTag (texturecolumnlump[texnum], PU_CACHE);

@@ -2269,9 +2269,13 @@ static void rp_p3_prof_show(void)
         /* `d` RETIRED after ONE capture, and that is the correct lifetime for it: `d0` on every
            photo, with `ld` moving +6 over the whole run as the independent witness.  The disc is
            not in R_GetColumn's hot path.  (r_getcol_disc still exists and still counts.) */
-        snprintf(p, sizeof p, "%s g%u n%u x%u e%u a%u k%u z%u  ",
+        /* `a` RETIRED 2026-08-14: it bracketed R_GenerateLookup's patch loop and, ever since the
+           header-only fetch, reads exactly `e` on every capture -- a field that can only repeat its
+           neighbour is a field that has answered.  Its slot still accumulates; only the print is
+           gone, so re-adding it is one line if the question reopens. */
+        snprintf(p, sizeof p, "%s g%u n%u x%u e%u k%u z%u    ",
                  prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_g_n,
-                 prof_bp_g_x, prof_bp_g_e, prof_bp_g_a, prof_bp_g_k, prof_bp_g_z);
+                 prof_bp_g_x, prof_bp_g_e, prof_bp_g_k, prof_bp_g_z);
         dbg_print(0, 20, p);
     }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one
