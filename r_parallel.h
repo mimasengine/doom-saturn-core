@@ -83,4 +83,18 @@ extern int rp_disabled;
    declaration only -> zero impact). */
 void rp_sgl_workptr_reset(void);
 
+/* SATURN 2026-08-16 -- GAME-TIC BREAKDOWN.  On hardware row-1 `T` is 69-83 ms of a 181-222 ms
+   frame (~40 %), against 8-14 ms for the same build on Ymir -- so the biggest single cost in the
+   frame has been invisible for the whole renderer hunt.  These bracket the two halves worth
+   naming: P_RunThinkers (p_tick.c, once per tic) and P_CheckSight's full BSP walk (p_sight.c,
+   accumulated per call).  Accumulators are RAW FRT TICKS; the platform converts to ms and resets
+   them, because only it knows the window's frame count.  DoomJo-safe: plain C, and the port simply
+   gets two extra timer reads per tic. */
+void RP_ThinkBegin(void);
+void RP_ThinkEnd(void);
+void RP_SightBegin(void);
+void RP_SightEnd(void);
+extern unsigned int sat_tic_think_frt;   /* P_RunThinkers, cumulative FRT ticks */
+extern unsigned int sat_tic_sight_frt;   /* P_CrossBSPNode, cumulative FRT ticks */
+
 #endif

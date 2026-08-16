@@ -178,6 +178,14 @@ int sat_thing_vdp1_spill  = 0;   /* sprites spilled to software by the budget (o
    0 = vanilla (draw every projected sprite); 1 = cull far decorations.  Shootable actors
    (monsters/barrels) are NEVER culled.  Default ON (HW-validated 2026-07-09, pad R+X to A/B off). */
 int sat_near_sprites = 1;
+/* SATURN 2026-08-16 -- ROLE CULL (see R_ProjectSprite).  Default ON: the owner authorised the rule
+   explicitly (*"Ok pour couper les éléments AUTRES que monstres actifs, poursuivant ou attaquant le
+   joueur"*), and unlike a plain distance cull it cannot make a threat disappear.  DoomJo leaves it
+   at this default too -- the predicate is vanilla mobj flags, no platform hook.
+   Distance is in MAP UNITS and bounds the NON-ENGAGED world only. */
+int sat_thing_role_cull = 1;
+int sat_thing_cull_dist = 1024;
+int sat_thing_role_cut  = 0;    /* sprites dropped by the role cull (~1 s window, row 21 `rc`) */
 /* SATURN piste-3 (split thing cull, pad L+Left): in a co-op split, drop sprites that PROJECT to
    near-nothing (tiny xscale) -- each of the N views pays vissprite alloc + sort + VDP1/software emit,
    and a sub-few-px sprite in a 96-row quadrant is invisible.  TWO buckets: SHOOTABLE actors AND
@@ -750,6 +758,33 @@ void R_ProjectSprite (mobj_t* thing)
     if (sat_near_sprites && !(thing->flags & MF_SHOOTABLE)
 	&& (abs(tr_x) > 40000000 || abs(tr_y) > 40000000))
 	return;
+
+    /* SATURN 2026-08-16 -- ROLE CULL.  The owner's rule, and it is stricter about the right things
+       than a plain distance test would be: *"Ok pour couper les éléments AUTRES que monstres
+       actifs, poursuivant ou attaquant le joueur (sauf s'ils sont derrière le brouillard)"*.
+       Distance alone is the wrong predicate for an actor -- a cacodemon closing on you at 900 units
+       is exactly the sprite you must not drop, while the barrel and the corpse beside it are free.
+       So: role decides WHETHER a thing can be cut, distance decides WHERE.
+         KEEP unconditionally  : players, and anything in flight (MF_MISSILE) -- a rocket you cannot
+                                 see is a rocket you cannot dodge.
+         KEEP while engaged    : a live monster (MF_COUNTKILL, health > 0, not a corpse) that has a
+                                 target, i.e. one that is hunting or shooting.
+         EVERYTHING ELSE       : cut past sat_thing_cull_dist -- decor, corpses, pickups, and
+                                 monsters still asleep in a room you have not entered.
+       (A second rule keyed on a fog boundary was written and removed the same day with the veil the
+       owner rejected -- nothing sets a boundary now, so it would have been a dead branch.) */
+    if (sat_thing_role_cull)
+    {
+	int mdx = abs(tr_x) >> FRACBITS;
+	int mdy = abs(tr_y) >> FRACBITS;
+	int far = (mdx > mdy ? mdx : mdy);
+	int engaged = (thing->player != NULL)
+		   || (thing->flags & MF_MISSILE)
+		   || ((thing->flags & MF_COUNTKILL) && thing->health > 0
+		       && !(thing->flags & MF_CORPSE) && thing->target != NULL);
+	if (!engaged && far > sat_thing_cull_dist)
+	    { sat_thing_role_cut++; return; }
+    }
 
     gxt = FixedMul(tr_x,viewcos);
     gyt = -FixedMul(tr_y,viewsin);

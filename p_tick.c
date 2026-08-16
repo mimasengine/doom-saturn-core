@@ -20,6 +20,7 @@
 
 #include "z_zone.h"
 #include "p_local.h"
+#include "r_parallel.h"   /* SATURN: RP_ThinkBegin/End -- the game-tic breakdown */
 
 #include "doomstat.h"
 
@@ -95,6 +96,10 @@ void P_RunThinkers (void)
 {
     thinker_t*	currentthinker;
 
+    /* SATURN 2026-08-16: the thinker half of the game-tic split (row 24 `TIC`).  See r_parallel.c
+       -- on hardware `T` is ~40 % of the frame and nothing inside it had ever been timed. */
+    RP_ThinkBegin ();
+
     currentthinker = thinkercap.next;
     while (currentthinker != &thinkercap)
     {
@@ -112,6 +117,8 @@ void P_RunThinkers (void)
 	}
 	currentthinker = currentthinker->next;
     }
+
+    RP_ThinkEnd ();
 }
 
 

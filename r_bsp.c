@@ -439,6 +439,17 @@ int	checkcoord[12][4] =
 };
 
 
+/* SATURN 2026-08-16 -- ADAPTIVE VIEW DISTANCE: BUILT, MEASURED, REMOVED THE SAME DAY.
+   It pruned any BSP subtree whose bounding box lay past 2048 map units, which is the only knob `Bw`
+   has ever had and cut all four phases at once.  It worked -- row-24 `fc` counted 12 to 136 subtrees
+   pruned per second -- and it was still WORTHLESS, for a reason no amount of tuning fixes:
+   **`fc` read 0 on the three heaviest captures.**  The expensive scenes on TNT MAP11 are ENCLOSED;
+   nothing in them is far enough to prune.  The clip fired only in the scenes that were already fast,
+   while charging every frame a full-view memset (the backstop against pruned pixels showing last
+   frame's picture).  Inert where it was needed, costly everywhere: measured-negative, not unproven.
+   Keep this note so the idea is not re-derived: the prerequisite for a far clip is a map whose COST
+   is in its DISTANCE.  Measure `fc` against fps before writing the clip, not after. */
+
 boolean R_CheckBBox (fixed_t*	bspcoord)
 {
     int			boxx;

@@ -1131,6 +1131,14 @@ lighttable_t *sat_vdp2_floor_cmap = 0;
    or dark ZONE) keeps drawing in software at its own brightness, so it stays correct no
    matter where the player stands (instead of the whole HW floor flipping brightness). */
 int sat_vdp2_floor_band = 0;
+/* SATURN 2026-08-16 -- RELAXING THE PUNCH'S LIGHT TERM: BUILT, MEASURED, REMOVED THE SAME DAY.
+   The idea was sound on paper -- the punch requires (height, picnum, light band), so a same-flat
+   plane at another brightness keeps drawing in software, and outdoors that ought to be most of the
+   floor.  The counter said otherwise: row-24 `pe` read **0 on six captures out of eight** (23 and 8
+   on the others).  The light band was almost never what kept a plane in software on TNT MAP11, so
+   dropping it bought nothing while making dark alcove floors snap to the dominant's brightness.
+   Kept as a note so the reasoning is not re-run: the term to attack is HEIGHT or PICNUM, not the
+   light band -- and measure `pe`-equivalent first. */
 /* SATURN (Romain 2026-06-30): alternate RBG0 floor pick.  0 (default, and DoomJo) -> RBG0 renders
    the floor UNDER THE EYE (legacy).  1 -> RBG0 renders the DOMINANT visible floor (the flat
    covering the most on-screen pixels), recomputed ONLY when the view sector changes -- kept

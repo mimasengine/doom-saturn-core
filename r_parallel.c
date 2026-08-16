@@ -1312,6 +1312,27 @@ static unsigned short rp_frt(void)
     __asm__ volatile ("ldc %0, sr" :: "r"(sr) : "memory");
     return (unsigned short)((h << 8) | l);
 }
+
+/* SATURN 2026-08-16 -- THE GAME TIC HAS NO INSTRUMENTATION AND IT IS THE BIGGEST TERM ON HARDWARE.
+   Four hardware captures put row-1 `T` at 69-83 ms of a 181-222 ms frame -- ~40 % -- while the SAME
+   build on Ymir reads T 8-14.  A 6-9x gap the emulator hides completely, so the entire renderer
+   hunt was optimising `R` with the largest single cost invisible.  Nothing inside `T` has ever been
+   timed; the row that says `LOS` is the WALL row (its sight counters were dropped for space in
+   August) and `sightcounts[]` has sat in core/p_sight.c unprinted the whole time.
+   Two brackets are enough to split it three ways: thinkers (one bracket per tic) and P_CheckSight
+   (accumulated per call, it is called from inside the thinkers), leaving `T - thinkers` as the
+   rest.  Raw FRT ticks -- the PLATFORM converts and resets, because only it knows the window's
+   frame count and `T` is a per-frame mean it must be comparable to ([[budget-before-mechanism]]:
+   write the subtraction before naming a cause).
+   ⚠ Individual brackets are short, so the (unsigned short) FRT deltas cannot wrap (292 ms bound);
+   the ACCUMULATORS are unsigned int and hold a full second (223 600 ticks) with room to spare. */
+unsigned int sat_tic_think_frt = 0;
+unsigned int sat_tic_sight_frt = 0;
+static unsigned short tic_think_t0, tic_sight_t0;
+void RP_ThinkBegin (void) { tic_think_t0 = rp_frt(); }
+void RP_ThinkEnd   (void) { sat_tic_think_frt += (unsigned short)(rp_frt() - tic_think_t0); }
+void RP_SightBegin (void) { tic_sight_t0 = rp_frt(); }
+void RP_SightEnd   (void) { sat_tic_sight_frt += (unsigned short)(rp_frt() - tic_sight_t0); }
 static unsigned short prof_begin, prof_recend, prof_wait;
 /* SATURN PERF 2.4 Stage 0: split REC into BSP / planes / masked sub-times to
    find which generation phase dominates REC (decides what to offload).  Marks:
@@ -2017,7 +2038,7 @@ int sat_prof_rec_max=0;            /* window max (= p100), tenths-ms */
 int sat_prof_dropped=0;            /* glitch/transition frames excluded from the window */
 int sat_prof_pk_bw=0, sat_prof_pk_bp=0, sat_prof_pk_p=0, sat_prof_pk_m=0;  /* per-phase peaks */
 /* SATURN 2026-08-15: the LOD governor's state lives in r_segs.c beside the knob it drives. */
-extern int sat_wall_lod_scale, sat_lod_eff, sat_lod_auto_step, sat_lod_gov_up, sat_lod_gov_dn;
+extern int sat_lod_eff, sat_lod_auto_step, sat_gov_debt;
 extern int sat_gov_axis, sat_gov_p_step, sat_gov_p_dirty;
 int sat_prof_mx_map=0, sat_prof_mx_x=0, sat_prof_mx_y=0, sat_prof_mx_ang=0, sat_prof_mx_t=0;
 /* SATURN PERF (2026-07-09): full detail of the worst-REC frame, snapshotted at each new peak
@@ -2121,63 +2142,95 @@ static void rp_p3_prof_show(void)
        peaks/max/histogram are not poisoned (Ymir shareware proved these are NOT CD
        stalls -- they survive into resident mode -> a profiler artifact, now excluded). */
     /* ------------------------------------------------------------------------------------------
-       SATURN 2026-08-15 -- LOD GOVERNOR, first axis: Bp drives the wall threshold.
-       The owner's shape: *"si Bp trop élevé, alors sacrifier x; si P trop élevé, sacrifier y"*.
-       Only the Bp axis is wired, deliberately: one axis that behaves beats three that pump, and the
-       other knobs (SQ floor/ceiling on Y and L+Y, the thing cap) are not yet proven safe to move
-       from a controller rather than a pad ([[mode-switch-corruption-2026-07-19]]).
+       SATURN -- THE LOD GOVERNOR.  Triggers on the whole render frame, then degrades whichever
+       phase dominated it: `B` -> the wall size-LOD rung, `P` -> the plane SQ floor.  Always on;
+       there is no manual rung and no chord (owner 2026-08-16: *"active le gouverneur par défaut,
+       enlève le toggle"*).
 
-       ASYMMETRIC ON PURPOSE.  Quality that oscillates is worse to look at than quality that is
-       merely low, so: climb fast (8 frames over the ceiling), release slowly (90 frames under the
-       floor), and put a dead band between the two so a frame sitting between them moves nothing.
-       Thresholds straddle the measured cliff -- at Bp ~168 ms the composites are being built, at
-       Bp ~28 ms none are; 100/40 ms leaves both sides of that unambiguous.
-       Steps are the same pixel rungs the pad offers, so AUTO can never reach a setting the owner
-       cannot reproduce by hand.  Row 21 reports it; step 0 = the governor chose full quality. */
-    if (sat_wall_lod_scale == -1)
+       🔴 REWRITTEN 2026-08-16 AFTER EIGHT CAPTURES SHOWED IT NEVER FIRED.  Every heavy capture read
+       `u0 r0 px0 w0` while the game sat at 7-10 fps.  The bug was not the ceiling, it was the SHAPE:
+       the previous version kept two counters and had each branch RESET THE OTHER.  Row 3 says this
+       workload is bimodal -- `REC 50:36.0 95:86.0` -- so the median frame landed under the 60 ms
+       floor, took the `dn` branch, and wiped the debt to zero.  Reaching 300 ms of debt would have
+       required an unbroken run of >100 ms frames in a workload whose median is 36.  **The
+       accumulator was structurally unable to fill.**  `u31` on one capture is exactly that: debt
+       rising, one light frame, back to nothing.
+
+       The fix is the standard integrator: ONE SIGNED accumulator, no cross-reset, so a bimodal load
+       nets out instead of cancelling.  Fast frames now genuinely PAY DOWN debt rather than erasing
+       it, which is the behaviour a frame counter can never have.
+
+       ⚠ `rend` is Bw+Bp+P+M ONLY -- it is NOT the frame.  MST runs ~20-25 ms higher (T + S + blit +
+       dg).  That gap is the trap the first version fell into: the owner's *"100 ms au total"* was a
+       FRAME number and I applied it to `rend`, a smaller quantity, which put the ceiling ABOVE the
+       p95 of the thing being compared to it.
+       ⚠ `bp10`/`p10`/`m10`/`rend` are TENTHS OF A MS (`prof_x * 10 / 224`), not FRT ticks.
+
+       🔴 THE TARGET IS CALIBRATED ON **HARDWARE**, NOT ON YMIR (2026-08-16, four console captures).
+       The two machines do not share a distribution: Ymir reads `REC 50:36.0 95:86.0`, the Saturn
+       reads `REC 50:82.0 95:126.0`.  A 55 ms target set from Ymir's numbers puts EVERY hardware
+       frame above the band, so the integral only ever climbs and the governor slams to the top rung
+       and stays there -- a constant wearing a governor's clothes.  95 ms sits just above the
+       console's p50 and well under its p95, which is what makes it adapt on the machine that
+       matters.  Ymir will now under-drive it; that is correct, Ymir is genuinely faster.
+       ⚠ Ymir is NOT a valid oracle for the game tic either -- row-1 `T` is 8-14 ms there and 69-83
+       on console.  Only the RENDER transposes between the two at all.
+
+       ASYMMETRIC IN BOTH PLACES: fire at +300 ms, release at -900 ms, AND credit integrates at HALF
+       rate.  Thresholds alone were not enough -- with symmetric rates a single quiet second erased a
+       heavy one.  Quality that oscillates is worse to look at than quality that is merely low.
+
+       ⚠ These constants are still a judgement call against a distribution known only through its
+       p50/p95.  `e` on row 21 IS the falsifier: pinned negative while the game crawls = target still
+       too high; rungs moving every second = pumping, target too low. */
+#define GOV_TARGET10   950        /*  95,0 ms of render -- from the CONSOLE's p50/p95, see above    */
+#define GOV_BAND10     150        /* +/- 15 ms dead band: inside it the integral is left alone      */
+#define GOV_FIRE10    3000        /* +300 ms integrated -> degrade                                  */
+#define GOV_REL10    (-9000)      /* -900 ms integrated -> give quality back                        */
     {
         static const int gov_rung[4] = { 0, 200, 400, 800 };
-        /* THE TRIGGER IS THE WHOLE FRAME, not one phase.  The first version watched `Bp` alone, and
-           the owner put his finger straight on the hole: *"100ms au total ? et ensuite il regarde
-           quel paramètre est le plus gros ?"*  It did neither.  A 250 ms frame whose Bp is only 60
-           left it asleep while the game crawled, because it could not see the term that was actually
-           costing.  `rend` is the render total the sanity guard already validates, in the same
-           tenths of a millisecond as the phases.
-           ⚠ `bp10`/`p10`/`m10`/`rend` are TENTHS OF A MS (`prof_x * 10 / 224`), not FRT ticks -- the
-           second version divided by 224 again and a 132,8 ms frame arrived as `5`. */
-        unsigned tot_ms = rend / 10u;
         if (rend <= RP_REC_SANE)                      /* never steer on a glitched frame */
         {
-            if (tot_ms > 100u)      { sat_lod_gov_up++; sat_lod_gov_dn = 0; }
-            else if (tot_ms < 60u)  { sat_lod_gov_dn++; sat_lod_gov_up = 0; }
-            else                    { sat_lod_gov_up = sat_lod_gov_dn = 0; }  /* dead band */
+            int err = (int)rend - GOV_TARGET10;
+            if (err > GOV_BAND10)        sat_gov_debt += err - GOV_BAND10;
+            else if (err < -GOV_BAND10)  sat_gov_debt += (err + GOV_BAND10) / 2;   /* half rate */
+            /* inside the band: hold the integral.  NEVER reset it -- that was the whole bug. */
 
             /* WHICH KNOB: the dominant phase of THIS frame owns the degradation.  Bw is measured and
                deliberately absent from the vote -- it is the BSP walk plus sprite projection and has
                no quality knob at all, so electing it would degrade something innocent.  When Bw is
                what dominates, the governor holds and row 21 says `d-`: an honest "I cannot help
                here" beats a confident wrong move. */
-            if (sat_lod_gov_up >= 8)
+            if (sat_gov_debt >= GOV_FIRE10)
             {
                 unsigned bp = bp10, p = p10, m = m10;
-                sat_lod_gov_up = 0;
+                sat_gov_debt = 0;
                 if (bp >= p && bp >= m)      sat_gov_axis = 'B';
                 else if (p >= bp && p >= m)  sat_gov_axis = 'P';
                 else                         sat_gov_axis = 'M';
 
+                /* 🔴 FALL THROUGH WHEN THE ELECTED AXIS IS RAILED (fix 2026-08-16, seen on console:
+                   `dB w3 p0` with `e` cycling back to 0).  The first version elected the dominant
+                   phase, found its rung already at maximum, DID NOTHING, and still reset the debt --
+                   so it burned a fire every 300 ms and `p` stayed 0 forever while `P` and `M` were
+                   both large.  Electing an axis you cannot move is the same as not firing.
+                   'M' still has no proven live knob (the thing cap is not validated for a
+                   controller), so it is only ever REPORTED -- but it must not BLOCK the others. */
                 if (sat_gov_axis == 'B' && sat_lod_auto_step < 3)
                     sat_lod_auto_step++;
                 else if (sat_gov_axis == 'P' && sat_gov_p_step < 2)
                     { sat_gov_p_step++; sat_gov_p_dirty = 1; }
-                /* 'M' has no proven live knob yet (the thing cap is not validated for a controller),
-                   so it is REPORTED and not acted on -- see row 21 `m-`. */
+                else if (sat_lod_auto_step < 3)          /* elected axis railed -> next best */
+                    sat_lod_auto_step++;
+                else if (sat_gov_p_step < 2)
+                    { sat_gov_p_step++; sat_gov_p_dirty = 1; }
             }
-            else if (sat_lod_gov_dn >= 90)
+            else if (sat_gov_debt <= GOV_REL10)
             {
                 /* Release the MOST degraded axis first, so quality comes back in the reverse order
                    it was given up and the picture converges on full rather than on whichever axis
                    happened to be cheap to restore. */
-                sat_lod_gov_dn = 0;
+                sat_gov_debt = 0;
                 if (sat_lod_auto_step >= sat_gov_p_step && sat_lod_auto_step > 0)
                     sat_lod_auto_step--;
                 else if (sat_gov_p_step > 0)
@@ -2185,19 +2238,15 @@ static void rp_p3_prof_show(void)
                 else
                     sat_gov_axis = '-';               /* fully released */
             }
-            /* Stop the runs at the rails: a run that cannot fire anything is not information, and a
-               counter pinned at its display clamp tells the owner nothing about what was seen. */
-            if (sat_lod_auto_step >= 3 && sat_gov_p_step >= 2 && sat_lod_gov_up > 8)
-                sat_lod_gov_up = 8;
-            if (sat_lod_auto_step <= 0 && sat_gov_p_step <= 0 && sat_lod_gov_dn > 90)
-                sat_lod_gov_dn = 90;
+            /* CLAMP AT THE RAILS.  Fully degraded and still behind, the integral would run away and
+               then owe a huge unwind before quality could ever come back -- integrator windup, the
+               classic failure of this exact loop.  Hold it one step short of firing instead. */
+            if (sat_lod_auto_step >= 3 && sat_gov_p_step >= 2 && sat_gov_debt > GOV_FIRE10)
+                sat_gov_debt = GOV_FIRE10;   /* every axis railed: hold, do not wind up */
+            if (sat_lod_auto_step <= 0 && sat_gov_p_step <= 0 && sat_gov_debt < GOV_REL10)
+                sat_gov_debt = GOV_REL10;
         }
         sat_lod_eff = gov_rung[sat_lod_auto_step & 3];
-    }
-    else
-    {
-        sat_lod_eff = sat_wall_lod_scale;             /* manual rung, or 0 = off */
-        if (sat_gov_p_step) { sat_gov_p_step = 0; sat_gov_p_dirty = 1; }   /* leaving AUTO restores */
     }
 
     if (rend <= RP_REC_SANE) {

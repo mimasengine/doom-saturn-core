@@ -265,15 +265,22 @@ int sat_wall_flat_nocol = 0;    /* ...of which we had no cached colour either (~
    threshold draws flat in its dominant colour instead of paying R_GenerateComposite.  0 = OFF,
    cycled live by pad L+B.  Units are PIXELS -- the name kept `_scale` from the first, wrong version
    that tested rw_scale (= 1/distance) and flattened big mid-distance walls.  Row 22 `Lo`. */
-int sat_wall_lod_scale = 0;     /* pad L+B: 0=off, 200/400/800 px, -1 = AUTO (governor drives)  */
 int sat_wall_lod_hits  = 0;     /* tiers flattened by distance this ~1 s window                 */
-/* SATURN 2026-08-15 LOD GOVERNOR (controller in r_parallel.c, reported on row 21).
-   `sat_lod_eff` is the threshold the renderer ACTUALLY uses -- the manual rung, or the governor's
-   choice when sat_wall_lod_scale == -1.  One writer (the governor), one reader (below). */
+/* SATURN 2026-08-16 -- the LOD's DISTANCE FLOOR, in MAP UNITS (rw_distance >> FRACBITS).  A tier
+   nearer than this is never flattened however small it scores, so the LOD can only ever eat the
+   background.  384 ~ three player-widths: inside that, a sliver is something you are standing next
+   to.  `sat_wall_lod_near` counts tiers the floor rescued (~1 s window, row 21 `nr`). */
+int sat_lod_mindist    = 384;
+int sat_wall_lod_near  = 0;
+/* SATURN LOD GOVERNOR (controller in r_parallel.c, reported on row 21).  `sat_lod_eff` is the
+   threshold the renderer ACTUALLY uses.  One writer (the governor), one reader (below).  There is
+   no manual rung and no chord any more -- the governor is unconditional (owner 2026-08-16). */
 int sat_lod_eff        = 0;
 int sat_lod_auto_step  = 0;     /* 0..3, index into the governor's rung table                   */
-int sat_lod_gov_up     = 0;     /* consecutive frames over the ceiling / under the floor         */
-int sat_lod_gov_dn     = 0;
+/* SIGNED integral of (render - target) in tenths of a ms: >0 = behind, <0 = ahead.  A single
+   accumulator with NO cross-reset -- two counters that reset each other could never fill on a
+   bimodal load, which is why the governor never fired before 2026-08-16. */
+int sat_gov_debt       = 0;
 /* SATURN 2026-08-15 -- the governor became MULTI-AXIS: it triggers on the WHOLE frame and then
    degrades whichever phase dominated it.  `sat_gov_axis` is the letter row 21 prints (B/P/M/-),
    `sat_gov_p_step` is the plane axis (0 = untouched, 1 = at least LD, 2 = FLAT) applied by
@@ -1821,7 +1828,21 @@ void R_RenderSegLoop (void)
 	int lod_w = rw_stopx - rw_x;
 	if (lod_h < 0) lod_h = 0;
 	if (lod_w < 0) lod_w = 0;
-	lod_flat = (lod_h * lod_w) < sat_lod_eff;
+	/* SATURN 2026-08-16 -- DISTANCE FLOOR, on the owner's rule: *"si on coupe des éléments plus
+	   loin, c'est potentiellement moins grave que de dégrader le premier plan"*.  Area alone is
+	   not enough: a big wall seen edge-on a few units away subtends a THIN sliver and scores
+	   under the rung, so the purely-areal predicate flattened foreground geometry -- the same
+	   complaint that killed the rw_scale version, arriving by a different road.  Requiring BOTH
+	   makes the LOD monotone in distance: nothing inside sat_lod_mindist ever flattens, whatever
+	   its area.  `nr` on row 21 counts what the floor SAVED -- if it stays 0 the floor is inert
+	   and the area rung is doing all the work; if it is large the rung is far too aggressive. */
+	if ((lod_h * lod_w) < sat_lod_eff)
+	{
+	    if ((rw_distance >> FRACBITS) > sat_lod_mindist)
+		lod_flat = 1;
+	    else
+		sat_wall_lod_near++;
+	}
     }
     if (lod_flat) sat_wall_lod_hits++;
     int io_flat_mid = midtexture    ? (lod_flat || sat_wall_io_flat (midtexture))    : 0;

@@ -22,6 +22,7 @@
 
 #include "i_system.h"
 #include "p_local.h"
+#include "r_parallel.h"   /* SATURN: RP_SightBegin/End -- the game-tic breakdown */
 
 // State.
 #include "r_state.h"
@@ -385,7 +386,14 @@ P_CheckSight
 
     // the head node is the last node output
     {
-	boolean res = P_CrossBSPNode (numnodes-1);
+	/* SATURN 2026-08-16: time ONLY the full BSP walk (row 24 `TIC` field `s`).  The three
+	   early-outs above -- REJECT, the temporal cache, the distance clamp -- are O(1) by
+	   construction and bracketing them would cost more than it measures; `sc<rejects>/<walks>`
+	   on the same row says how often each path was taken.  One bracket, one exit. */
+	boolean res;
+	RP_SightBegin ();
+	res = P_CrossBSPNode (numnodes-1);
+	RP_SightEnd ();
 	if (sat_sight_cache)
 	{
 	    sightcache_t *c = &sight_cache[SIGHT_HASH(t1, t2)];
