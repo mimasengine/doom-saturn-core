@@ -1325,11 +1325,30 @@ static unsigned short rp_frt(void)
    frame count and `T` is a per-frame mean it must be comparable to ([[budget-before-mechanism]]:
    write the subtraction before naming a cause).
    ⚠ Individual brackets are short, so the (unsigned short) FRT deltas cannot wrap (292 ms bound);
-   the ACCUMULATORS are unsigned int and hold a full second (223 600 ticks) with room to spare. */
+   the ACCUMULATORS are unsigned int and hold a full second (223 600 ticks) with room to spare.
+
+   🔴 2026-08-16, SECOND HARDWARE VIDEO -- `th` EXCEEDED row-1 `T` BY 50 % BELOW 4,3 fps, which is
+   impossible for a subset.  Row-1 `T` comes from `d_ms()` (DG_GetTicksMs) and it SATURATES at
+   72-73 ms across three different frame rates (5,2 / 3,9 / 4,3 fps) while `th` keeps climbing
+   48 -> 70 -> 106 -> 110.  A quantity that stops moving while the work grows is a clock artefact,
+   not work.  So do not compare across clocks: RP_TicBegin/End brackets the WHOLE TryRunTics with
+   THE SAME FRT the thinkers use, and row 24 prints its own `T`.  Row-1 `T` stays as the
+   cross-check -- when the two disagree, believe the FRT one and suspect d_ms.
+   (Same disease as every unit error this session: compare only within one clock.) */
+unsigned int sat_tic_total_frt = 0;
 unsigned int sat_tic_think_frt = 0;
 unsigned int sat_tic_sight_frt = 0;
-static unsigned short tic_think_t0, tic_sight_t0;
-void RP_ThinkBegin (void) { tic_think_t0 = rp_frt(); }
+static unsigned short tic_total_t0, tic_think_t0, tic_sight_t0;
+void RP_TicBegin   (void) { tic_total_t0 = rp_frt(); }
+void RP_TicEnd     (void) { sat_tic_total_frt += (unsigned short)(rp_frt() - tic_total_t0); }
+/* SATURN 2026-08-16 -- TICS PER FRAME.  `th` is a PER-FRAME mean, so it conflates two different
+   things: how long one tic's thinkers take, and HOW MANY TICS landed in this frame.  The maketic
+   cap is +8 ([[gametic-slowmotion-tic-cap]]), so at 3,6 fps up to EIGHT tics run inside one frame
+   -- and a frame that runs more tics is slower, which makes the next frame run more tics still.
+   Without this counter `th111` at 3,6 fps and `th18` at 16,5 fps cannot be compared at all: they
+   may be the same cost per tic.  One increment per P_RunThinkers call = one per tic, exactly. */
+unsigned int sat_tic_runs = 0;
+void RP_ThinkBegin (void) { sat_tic_runs++; tic_think_t0 = rp_frt(); }
 void RP_ThinkEnd   (void) { sat_tic_think_frt += (unsigned short)(rp_frt() - tic_think_t0); }
 void RP_SightBegin (void) { tic_sight_t0 = rp_frt(); }
 void RP_SightEnd   (void) { sat_tic_sight_frt += (unsigned short)(rp_frt() - tic_sight_t0); }

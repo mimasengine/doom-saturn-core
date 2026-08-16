@@ -74,6 +74,7 @@
 #include "statdump.h"
 
 #include "d_main.h"
+#include "r_parallel.h"   /* SATURN: RP_TicBegin/End -- row 24's FRT-clocked game tic */
 
 //
 // D-DoomLoop()
@@ -716,7 +717,13 @@ void doomgeneric_Tick()
 #endif
 
     game_phase = 1; /* TryRunTics */
+    /* SATURN 2026-08-16: bracket the WHOLE tic on the FRT, the same clock the thinker/sight
+       sub-timers use.  `sat_tic_ms` below is d_ms-based and was seen SATURATING at 72-73 ms on
+       hardware while the thinkers alone measured 106-110 -- row 24 must be internally consistent
+       or its decision rule is worthless.  Row-1 `T` keeps the d_ms value as the cross-check. */
+    RP_TicBegin ();
     TryRunTics (); // will run at least one tic
+    RP_TicEnd ();
 
     V_Canary ("tryruntics");
 

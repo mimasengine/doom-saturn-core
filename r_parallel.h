@@ -90,11 +90,15 @@ void rp_sgl_workptr_reset(void);
    accumulated per call).  Accumulators are RAW FRT TICKS; the platform converts to ms and resets
    them, because only it knows the window's frame count.  DoomJo-safe: plain C, and the port simply
    gets two extra timer reads per tic. */
+void RP_TicBegin(void);
+void RP_TicEnd(void);
 void RP_ThinkBegin(void);
 void RP_ThinkEnd(void);
 void RP_SightBegin(void);
 void RP_SightEnd(void);
+extern unsigned int sat_tic_total_frt;   /* TryRunTics,    cumulative FRT ticks -- row 24's own `T` */
 extern unsigned int sat_tic_think_frt;   /* P_RunThinkers, cumulative FRT ticks */
 extern unsigned int sat_tic_sight_frt;   /* P_CrossBSPNode, cumulative FRT ticks */
+extern unsigned int sat_tic_runs;        /* P_RunThinkers CALLS = tics run; divides `th` into cost x count */
 
 #endif

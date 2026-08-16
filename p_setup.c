@@ -725,27 +725,56 @@ static void P_LoadReject(int lumpnum)
     int minlength;
     int lumplen;
 
+    // Calculate the size that the REJECT lump *should* be.
+
+    minlength = (numsectors * numsectors + 7) / 8;
+
 #ifndef SAT_KEEP_REJECT
-    /* SATURN streaming (DEFAULT; build with -DSAT_KEEP_REJECT=1 to force-keep):
-       the REJECT matrix is numsectors^2/8 bytes -- 45-125 KB of PU_LEVEL on big
-       Doom II maps, the largest LATE level-load alloc (a fragmentation-OOM magnet,
-       e.g. the "Z_Malloc fail 68192" freeze).  It is PURELY a P_CheckSight early-
-       out optimization: a NULL rejectmatrix just makes sight checks do the full
-       LOS test (a bit more CPU, imperceptible at Saturn frame rates -- see the
-       NULL guard in p_sight.c P_CheckSight).  In the tight CD-streaming zone that
-       45-125 KB matters far more than the sight-check speedup, so skip it.  Non-
-       streaming (shareware/cart; DoomJo always has sat_streaming_mode==0) keeps
-       the matrix unchanged. */
-    if (sat_streaming_mode)
+    /* 🔴 SATURN 2026-08-16 -- THE BLANKET SKIP WAS A MEASURED MISTAKE, NOW SIZE-GATED.
+       The original comment justified dropping REJECT in streaming mode because it is
+       "numsectors^2/8 bytes -- 45-125 KB on big Doom II maps", and asserted the cost of a NULL
+       matrix was "a bit more CPU, IMPERCEPTIBLE at Saturn frame rates".
+       Hardware measured it: **13,0 to 20,7 ms PER FRAME** of full BSP sight walks on TNT MAP11
+       (row 24 `s`), with `sc0/124..346` -- ZERO trivial rejects, every single check walking the
+       tree.  On a 48-73 ms tic that is a fifth to a third of it.  "Imperceptible" was an
+       assumption nobody had ever put a number on.
+       And the size that justified the skip is not this map's size: TNT MAP11 has 274 sectors, so
+       its REJECT is **9,2 KB**, not 45-125.  The 45-125 KB case is real but it is the TAIL, and a
+       blanket skip paid the whole tail's price on every map to avoid it.
+       So gate on the ACTUAL size: keep the matrix when it fits the budget, skip it only when it
+       is genuinely the fragmentation magnet the comment describes.  Z_CanAllocate is checked too
+       -- on a tight level the sight speedup is not worth a level that will not load
+       ([[zone-contiguity-wall-loadsegs]]).  Non-streaming (shareware/cart; DoomJo always has
+       sat_streaming_mode==0) is unaffected either way.
+
+       The owner then reported "le ciel a disparu, du noir, partout", and the hardware capture
+       named the mechanism: `px1` on row 13 (r_patch_ovf, which had read 0 on EVERY capture before)
+       = the garde-PATCH fired once.  REJECT is PU_LEVEL -- NOT purgeable -- so it permanently
+       shortens the longest contiguous run, and at the first frame of the level the renderer needs
+       **35080 bytes IN ONE RUN**: the size of every 256x128 TNT patch, RSKY1 included.  It missed,
+       R_GetColumn served the zero-init placeholder for all 256 sky columns, and the uploader turned
+       every zero into near-black -- a black sky, made permanent by a latch that has since been
+       fixed (dg_saturn.cxx sky_cell_upload now refuses to latch a stubbed read and retries).
+
+       🔴 AND THE OBVIOUS FIX HERE WAS THE WRONG LEVER -- the same capture killed it.  Reserving a
+       big headroom (64 KB was tried) sounds right and is not: row 12 reads **`lg37k`..`lg38k`**
+       steadily through the whole level, because ~366 KB of small unpurgeable PU_STATIC texture
+       blocks chop the zone (r_data.c) -- 38 KB is the STRUCTURAL ceiling of this zone, REJECT or
+       no REJECT.  Any headroom above ~28 KB therefore refuses the matrix on every map, and the
+       matrix is worth **13-21 ms -> 1,2-4,9 ms** of sight per frame, measured on console
+       (`sc544/28` vs the old `sc0/346`).  Keep the gate permissive and let the SKY heal instead:
+       mid-level lg (37-38 KB) clears the 35 KB patch comfortably, so the retry always wins.
+       `px` is the live check -- it must stop climbing once the sky is up. */
+#define SAT_REJECT_MAX      (32*1024)   /* keep up to 32 KB; above that it is the OOM magnet    */
+#define SAT_REJECT_HEADROOM (16*1024)   /* modest ON PURPOSE: lg is structurally ~38 KB here    */
+    if (sat_streaming_mode
+        && (minlength > SAT_REJECT_MAX
+            || !Z_CanAllocate (minlength + SAT_REJECT_HEADROOM)))
     {
         rejectmatrix = NULL;
         return;
     }
 #endif
-
-    // Calculate the size that the REJECT lump *should* be.
-
-    minlength = (numsectors * numsectors + 7) / 8;
 
     // If the lump meets the minimum length, it can be loaded directly.
     // Otherwise, we need to allocate a buffer of the correct size
@@ -938,6 +967,21 @@ static void SAT_PrecacheLevelSounds (void)
 }
 #endif
 
+/* 🔴 SATURN 2026-08-16 -- SKY PRECACHE HOOK.  Owner: "le ciel est toujours absent", twice.
+   The platform uploads the sky into VDP2 VRAM from R_GetColumn, which needs the sky PATCH in
+   **one contiguous run of 35080 bytes** (every 256x128 TNT patch, RSKY included).  It used to do
+   that on the FIRST DISPLAYED FRAME, by which point the zone is already filling with composites
+   and flats -- it passed, but only just.  Restoring the REJECT matrix took 9,2 KB of PU_LEVEL and
+   that margin went: R_GetColumn served the zero-init placeholder, every zero became near-black,
+   and the sky went black.  A per-frame retry did NOT save it -- hardware read `px37`->`px40`
+   (climbing = retrying) against `lg22k`->`lg20k`, so the run NEVER comes back mid-level; in that
+   scene no 35 KB patch fits at all, sky or wall.
+   The defect is an ORDER, not a size.  The sky is a ONE-SHOT 35 KB read; REJECT is a 9,2 KB block
+   held for the whole level.  So serve the sky FIRST, here, where the zone is at its emptiest for
+   this level (geometry in, things/composites/flats not yet), and let REJECT take what is left.
+   NULL on DoomJo (never assigned) -> plain C, zero behaviour change there. */
+void (*sat_sky_precache_hook)(void) = NULL;
+
 //
 // P_SetupLevel
 //
@@ -1029,6 +1073,11 @@ P_SetupLevel
     P_LoadSegs     (lumpnum+ML_SEGS);
 
     P_GroupLines ();
+    /* SATURN: the sky gets its 35 KB run BEFORE P_LoadReject competes for it (see the hook note
+       above P_SetupLevel).  skytexture is already set -- G_DoLoadLevel assigns it before calling
+       us -- and the platform's uploader is idempotent: it latches and never runs again this level. */
+    if (sat_sky_precache_hook)
+	sat_sky_precache_hook ();
     P_LoadReject (lumpnum+ML_REJECT);
 
     // SATURN M5: geometry is final after P_GroupLines -- stage the hot BSP
