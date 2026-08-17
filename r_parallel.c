@@ -747,15 +747,28 @@ static void rp_slave_wrapper(void *arg) { (void)arg; rp_slave_body(); }
 #define RP_TO_SITES 4
 int rp_to_site[RP_TO_SITES] = { 0, 0, 0, 0 };
 
+/* 🔴 SATURN 2026-08-17 -- BACK OFF THE SPIN.  `flag` is deliberately UNCACHED (the callers OR in
+   0x20000000), so the bare `while (!*flag)` below issued one SYSTEM-BUS read every few cycles for
+   the entire wait.  There is ONE bus for the two SH-2s: while the master waits for the slave, that
+   poll stream is stealing bandwidth from the very job it is waiting on -- and every slave job we
+   own (framebuffer clear, lead-fill) is pure memory traffic, i.e. exactly what bus pressure slows
+   down.  Pausing between polls costs nothing: the pause loop runs out of the I-cache and touches
+   no bus at all.  64 iterations ~= 200 cycles ~= 7 us, so the join granularity stays three orders
+   of magnitude below RP_WAIT_TIMEOUT_FRT and four below any job we dispatch, while the poll rate
+   drops from millions/s to ~140k/s.  A job already finished still returns on the FIRST test, so
+   the common case (the clear, joined late) pays literally nothing. */
+#define RP_SPIN_PAUSE 64
 static int rp_wait(volatile int *flag, int site)
 {
     unsigned short t0 = rp_frt();
     while (!*flag) {
+        int k;
         if ((unsigned short)(rp_frt() - t0) >= RP_WAIT_TIMEOUT_FRT) {
             rp_timeout_count++;
             if ((unsigned int)site < (unsigned int)RP_TO_SITES) rp_to_site[site]++;
             return 0;
         }
+        for (k = RP_SPIN_PAUSE ; k > 0 ; k--) __asm__ volatile ("nop");
     }
     return 1;
 }
@@ -1335,6 +1348,9 @@ static unsigned short rp_frt(void)
    THE SAME FRT the thinkers use, and row 24 prints its own `T`.  Row-1 `T` stays as the
    cross-check -- when the two disagree, believe the FRT one and suspect d_ms.
    (Same disease as every unit error this session: compare only within one clock.) */
+/* SATURN 2026-08-17: `T` left row 24 on 08-16 (T - th was 2-4 ms on every capture, i.e. the game
+   tic IS the thinkers).  The accumulator and its bracket are kept but the reads are gone; they cost
+   the TLSF pool 1:1, so if the pool ever binds again this is the next thing to delete outright. */
 unsigned int sat_tic_total_frt = 0;
 unsigned int sat_tic_think_frt = 0;
 unsigned int sat_tic_sight_frt = 0;
@@ -1352,6 +1368,57 @@ void RP_ThinkBegin (void) { sat_tic_runs++; tic_think_t0 = rp_frt(); }
 void RP_ThinkEnd   (void) { sat_tic_think_frt += (unsigned short)(rp_frt() - tic_think_t0); }
 void RP_SightBegin (void) { tic_sight_t0 = rp_frt(); }
 void RP_SightEnd   (void) { sat_tic_sight_frt += (unsigned short)(rp_frt() - tic_sight_t0); }
+/* 🔴 SATURN 2026-08-17 -- DECOMPOSE THE THINKERS (row 23 `THK`).  Hardware reads `th` at 24-38 ms on
+   178-200 ms frames -- a fifth of the frame that is not rendering and that nobody has looked at all
+   session.  `s` (P_CheckSight's BSP walk) already carves one piece out; these carve the rest, so
+   the console session comes home with the whole picture instead of one number:
+     mo = P_MobjThinker, summed over the tic -- actors moving/animating
+     mv = P_CheckPosition + P_TryMove inside it, the BLOCKMAP walk that is Doom's classic hot spot
+          (a SUBSET of mo, so mo - mv is state/animation and mv is collision)
+     n  = thinkers actually RUN, so a big `th` can be read as "many" or as "expensive"
+   `th - mo` is then the sector thinkers (doors, platforms, lights).  Same raw-FRT contract as its
+   neighbours: the platform converts and resets.  DoomJo-safe (plain C, two timer reads per call). */
+unsigned int sat_thk_mobj_frt = 0, sat_thk_move_frt = 0, sat_thk_n = 0;
+static unsigned short thk_mo_t0, thk_mv_t0;
+void RP_ThkMobjBegin (void) { sat_thk_n++; thk_mo_t0 = rp_frt(); }
+void RP_ThkMobjEnd   (void) { sat_thk_mobj_frt += (unsigned short)(rp_frt() - thk_mo_t0); }
+void RP_ThkMoveBegin (void) { thk_mv_t0 = rp_frt(); }
+void RP_ThkMoveEnd   (void) { sat_thk_move_frt += (unsigned short)(rp_frt() - thk_mv_t0); }
+/* 🔴 SATURN 2026-08-17, round 2 -- CARVE THE RESIDUAL.  The console run named the problem: at 63 s
+   the frame reads `T165` against `R141` -- the GAME TIC has overtaken the whole renderer -- with
+   `th157,7 mo146,4 mv75,1 s2,4`.  So `mo - mv - s` = ~69 ms per frame is inside P_MobjThinker and
+   attributed to NOTHING.  Two hypotheses, one probe each, both chosen because they are the only
+   candidates that can walk a data structure rather than a state table:
+     pt = P_PathTraverse -- the blockmap/BSP traversal behind every HITSCAN shot (P_AimLineAttack,
+          P_LineAttack, P_UseLines).  It is NOT inside `mv`: `mv` is P_CheckPosition, which shots
+          never call.  A firefight fires several of these per tic per monster.
+     sp = P_SpawnMobj -- every puff, every blood splat, every dropped item, each one a Z_Malloc on a
+          zone holding 164-180 KB free in 22-32 KB runs.  SPAWN only, not P_RemoveMobj: removal does
+          NOT free anything (it flags the thinker and P_RunThinkers' own loop calls Z_Free next tic),
+          so the free already sits in `th - mo`, which measures 11 ms and is not the problem.
+          Counted as well as timed (`sp<ms>/<calls>`), because "expensive" and "merely frequent" need
+          opposite fixes: a fixed-size mobj_t free list kills the first and does nothing for the
+          second.
+   ⚠ `sp` is a SUBSET of `pt` whenever the spawn happens in a shot's callback (P_SpawnPuff), so the
+   two must never be added -- read each against `mo`.
+   Depth-guarded: only the OUTERMOST call is timed, so a nested traversal can never corrupt the
+   accumulator with a stale t0 (the failure that makes a probe quietly print fiction).
+   DoomJo-safe: plain C, two timer reads per call. */
+unsigned int sat_thk_path_frt = 0, sat_thk_spawn_frt = 0, sat_thk_spawn_n = 0;
+static unsigned short thk_pt_t0, thk_sp_t0;
+static int            thk_pt_depth = 0, thk_sp_depth = 0;
+void RP_ThkPathBegin (void) { if (!thk_pt_depth++) thk_pt_t0 = rp_frt(); }
+void RP_ThkPathEnd   (void)
+{
+    if (--thk_pt_depth <= 0)
+    { thk_pt_depth = 0; sat_thk_path_frt += (unsigned short)(rp_frt() - thk_pt_t0); }
+}
+void RP_ThkSpawnBegin (void) { sat_thk_spawn_n++; if (!thk_sp_depth++) thk_sp_t0 = rp_frt(); }
+void RP_ThkSpawnEnd   (void)
+{
+    if (--thk_sp_depth <= 0)
+    { thk_sp_depth = 0; sat_thk_spawn_frt += (unsigned short)(rp_frt() - thk_sp_t0); }
+}
 static unsigned short prof_begin, prof_recend, prof_wait;
 /* SATURN PERF 2.4 Stage 0: split REC into BSP / planes / masked sub-times to
    find which generation phase dominates REC (decides what to offload).  Marks:
@@ -1362,16 +1429,40 @@ static unsigned short prof_bsp_end, prof_planes_end;
 /* SATURN PERF 2.4 Stage 1: time spent inside R_StoreWallRange (wall generation)
    accumulated across the BSP walk.  prof_wallprep is a subset of B, so the pure
    BSP traversal = B - prof_wallprep.  prof_wp_t0 = enter timestamp. */
-static unsigned int   prof_wallprep;
+/* SATURN 2026-08-17: EXPORTED (was static).  The owner is right that Bp cannot be fill --
+   R_StoreWallRange runs for VDP1 walls too -- so the split between per-seg SETUP and the
+   per-column LOOP is now the number that picks the lever.  Row 4 prints all three in ms. */
+unsigned int   prof_wallprep;
 static unsigned short prof_wp_t0;
 /* SATURN PERF Phase-0a: finer Bp/P sub-splits (each a subset of Bp or P). */
-static unsigned int   prof_segloop;     /* R_RenderSegLoop's PER-COLUMN loop only, c Bp (see RP_SegRoutMark) */
-static unsigned int   prof_segrout;     /* R_RenderSegLoop's per-seg routing preamble, c Bp                  */
+/* SATURN 2026-08-17: EXPORTED (was static).  The owner is right that Bp cannot be fill --
+   R_StoreWallRange runs for VDP1 walls too -- so the split between per-seg SETUP and the
+   per-column LOOP is now the number that picks the lever.  Row 4 prints all three in ms. */
+unsigned int   prof_segloop;     /* R_RenderSegLoop's PER-COLUMN loop only, c Bp (see RP_SegRoutMark) */
+/* SATURN 2026-08-17: EXPORTED (was static).  The owner is right that Bp cannot be fill --
+   R_StoreWallRange runs for VDP1 walls too -- so the split between per-seg SETUP and the
+   per-column LOOP is now the number that picks the lever.  Row 4 prints all three in ms. */
+unsigned int   prof_segrout;     /* R_RenderSegLoop's per-seg routing preamble, c Bp                  */
+/* 🔴 SATURN 2026-08-17 -- SIZE `lp` BEFORE NAMING ITS CAUSE.  Hardware refuted the decision rule
+   written on row 4 four hours earlier: `pr` was supposed to dominate and it does not -- four
+   captures read `pr 9,9-12,4` against `lp 85,1-105,0`.  The per-column loop owns Bp, and the
+   comment's own arithmetic then says something is impossible: ~320-600 wall columns cannot cost
+   100 ms in adds.  So COUNT, do not guess.  These are increments only (no FRT read, no call), so
+   they cannot inflate what they measure:
+     prof_seg_cols = column iterations of R_RenderSegLoop
+     prof_seg_fill = colfunc() calls made from inside it (the 3 tiers + the lead-fill's own)
+     prof_seg_px   = pixels those calls wrote
+     prof_lead_px  = the share of prof_seg_px that belongs to the LEAD-FILL
+   THE SUBTRACTION THE ROW EXISTS FOR: R_DrawColumn costs ~7 cycles/pixel = ~0,25 us at 28,6 MHz,
+   so a fill-bound `lp` of 100 ms means ~400 000 pixels -- twelve times the whole 160x200 M7 screen.
+   If `k` comes back far below that, `lp` is NOT fill and no amount of flattening will move it. */
+unsigned int   prof_seg_cols, prof_seg_fill, prof_seg_px, prof_lead_px;
 static unsigned short prof_sl_t0;
 /* Bp sub-split as PERCENTAGES, latched on the frame that set the window's Bp peak (row 20 `BP`). */
 static unsigned int   prof_bp_r_pct, prof_bp_c_pct, prof_bp_g_pct, prof_bp_g_n, prof_bp_g_ms;
 static unsigned int   prof_bp_g_x;    /* worst SINGLE R_GetColumn call on the PK-Bp frame, in US */
 static unsigned int   prof_bp_g_e, prof_bp_g_a, prof_bp_g_k, prof_bp_g_z;  /* its parts, in MS */
+static unsigned int   prof_bp_g_q, prof_bp_g_c;   /* SATURN 2026-08-17: garde / W_CacheLumpNum */
 unsigned int          sat_bp_zw;     /* zone blocks walked on the PK-Bp frame (overlay row 22 `zw`) */
 static int            prof_bp_bad;   /* 1 = a ratio came out impossible -> row prints `B!` */
 /* SATURN 2026-08-08: R_GetColumn's own share of Bp -- the PER-COLUMN half of the ~60% that the
@@ -1407,7 +1498,10 @@ static unsigned short prof_gc_mx;       /* max single-call FRT delta this frame 
          sits under e and a both, and which `zw` does NOT see (zw counts only Z_CanAllocate /
          Z_LargestAllocatable).  Nothing has ever timed it; the 08-07 note retired a STEP counter.
    Each is the WORST single invocation on the frame, latched with `g`.  `x` bounds them all. */
-static unsigned short prof_st_t0[4], prof_st_mx[4];
+/* SATURN 2026-08-17: 4 -> 6 slots.  4 = the single-patch GARDE (W_LumpResident + Z_CanAllocate),
+   5 = W_CacheLumpNum on that same path.  Both were unbracketed, and row 16 proved the frame's cost
+   is exactly there -- see the note at their call sites in r_data.c. */
+static unsigned short prof_st_t0[6], prof_st_mx[6];
 static int            prof_in_wp;
 static unsigned int   prof_flatalloc;   /* W_CacheLumpNum/Release per visplane c P  */
 static unsigned short prof_fc_t0;
@@ -1476,9 +1570,25 @@ void RP_WallPrepLeave(void)
 /* SATURN 2026-08-08: bracket R_GetColumn (core r_data.c wraps its body for this).  Costs two FRT
    reads per column, ~2% of a heavy frame, and that cost lands INSIDE the measurement -- so `g` is
    an UPPER BOUND, and `n` is printed beside it so the inflation stays auditable. */
+/* 🔴 SATURN 2026-08-17 -- WHICH CALL SITE MAKES THE CALLS?  One capture reads `SEG c320 f0`
+   beside `BP g98 n402`: 402 R_GetColumn calls resolving columns that NOTHING fills, for 98 ms,
+   while every bracketed sub-site of the worst call reads ~0 (`a0 e1 k0 z0`).  The owner authorised
+   cutting the useless resolutions; cutting them before knowing WHO makes them would be guessing,
+   and guessing is what has cost this session two builds already.
+   So bin every call by its caller.  UNGATED on purpose: `g`/`n` are gated on prof_in_wp, which
+   hides the masked-midtexture path completely -- and that path is one of the three suspects.
+     1 = the seg loop's own tier resolution (the one a VDP1-routed wall should not need)
+     2 = R_StoreWallRange's routing preamble (R_WallPotatoColor walks a whole texture)
+     3 = R_RenderMaskedSegRange (grates), billed to M and invisible in `g`
+     0 = everything else (r_plane.c's sky column, ...) */
+int sat_gc_site = 0;
+unsigned int prof_gc_st[4], prof_gc_sn[4];
+static unsigned short prof_gcs_t0;
+
 void RP_GetColEnter(void)
 {
 #if RP_PROF
+    prof_gcs_t0 = rp_frt();          /* site split: every call, gated or not */
     if (!prof_in_wp) return;
     prof_gc_t0 = rp_frt();
 #endif
@@ -1487,6 +1597,11 @@ void RP_GetColLeave(void)
 {
 #if RP_PROF
     unsigned short d;
+    {
+        int s = sat_gc_site & 3;
+        prof_gc_st[s] += (unsigned short)(rp_frt() - prof_gcs_t0);
+        prof_gc_sn[s]++;
+    }
     if (!prof_in_wp) return;
     d = (unsigned short)(rp_frt() - prof_gc_t0);
     prof_getcol += d;
@@ -1501,7 +1616,7 @@ void RP_GetColLeave(void)
 void RP_StampBegin(int slot)
 {
 #if RP_PROF
-    if (!prof_in_wp || (unsigned)slot >= 4u) return;
+    if (!prof_in_wp || (unsigned)slot >= 6u) return;
     prof_st_t0[slot] = rp_frt();
 #endif
 }
@@ -1509,7 +1624,7 @@ void RP_StampEnd(int slot)
 {
 #if RP_PROF
     unsigned short d;
-    if (!prof_in_wp || (unsigned)slot >= 4u) return;
+    if (!prof_in_wp || (unsigned)slot >= 6u) return;
     d = (unsigned short)(rp_frt() - prof_st_t0[slot]);
     if (d > prof_st_mx[slot]) prof_st_mx[slot] = d;
 #endif
@@ -1948,9 +2063,13 @@ void RP_BeginFrame(void)
        ONE reset site, both paths.  Anything per-frame added below MUST go here. */
     prof_wallprep = 0;                                                   /* Bp accumulator */
     prof_segloop = prof_segrout = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
+    prof_seg_cols = prof_seg_fill = prof_seg_px = prof_lead_px = 0;      /* row 14 `SEG` -- lp sizing */
+    prof_gc_st[0] = prof_gc_st[1] = prof_gc_st[2] = prof_gc_st[3] = 0;   /* row 16 `GCS` -- who calls */
+    prof_gc_sn[0] = prof_gc_sn[1] = prof_gc_sn[2] = prof_gc_sn[3] = 0;
     prof_getcol = prof_getcol_n = 0;                                     /* R_GetColumn share of Bp */
     prof_gc_mx  = 0;                                                     /* worst single call (row 20 `x`) */
-    prof_st_mx[0] = prof_st_mx[1] = prof_st_mx[2] = prof_st_mx[3] = 0;   /* row 20 e/a/k/z */
+    prof_st_mx[0] = prof_st_mx[1] = prof_st_mx[2] = prof_st_mx[3] = 0;   /* row 20 e/a/k    */
+    prof_st_mx[4] = prof_st_mx[5] = 0;                                   /* row 20 q/c      */
     { extern int z_walk_blocks; z_walk_blocks = 0; }                     /* zone blocks walked / frame */
     /* (r_lookup_rebuilds reset REMOVED 2026-08-10 with row-20 `e` -- see core/r_data.c:507) */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
@@ -2062,6 +2181,54 @@ int sat_prof_dropped=0;            /* glitch/transition frames excluded from the
 int sat_prof_pk_bw=0, sat_prof_pk_bp=0, sat_prof_pk_p=0, sat_prof_pk_m=0;  /* per-phase peaks */
 /* SATURN 2026-08-15: the LOD governor's state lives in r_segs.c beside the knob it drives. */
 extern int sat_lod_eff, sat_lod_auto_step, sat_gov_debt;
+extern int sat_lead_mode, sat_wall_lead_x;   /* r_segs.c: the lead-fill's mode and depth */
+int sat_gov_lead_step = 0;   /* 0 = as the pad asked, 1 = force FLAT spans, 2 = lead-fill off */
+/* 🔴 SATURN 2026-08-17 -- THE GOVERNOR MUST PROVE ITS OWN LEVERS.  Owner: "le gouverneur a dégradé
+   tous les murs cpu en flats et ne les a jamais remontés", and his captures show exactly that --
+   `w3 p2 L1` with the debt STILL POSITIVE (e108, e191).  It is not a bug in the relaxation: it is a
+   RATCHET.  The `w` rung costs real picture (flat CPU walls) but attacks fill that is already on
+   VDP1 -- open scenes, mostly hardware, `Bp` unmoved -- so `rend` does not improve, so the debt
+   never clears, so it degrades again.  An ineffective degradation is a one-way trap.
+   So: after every fire, watch `rend` for GOV_PROBE frames.  If the step bought less than
+   GOV_PROOF tenths of a ms, UNDO it and mark that axis INERT -- never elected again this level.
+   The governor then spends its debt only on levers that have been observed to work. */
+#define GOV_PROBE 24        /* frames to wait before judging a step            */
+#define GOV_PROOF 80        /* 8,0 ms: less than this and the step bought nothing */
+static int gov_pr_wait = 0, gov_pr_axis = 0; static unsigned int gov_pr_rend = 0;
+int sat_gov_inert = 0;      /* bit0 = `w` axis proven inert, bit1 = `p`, bit2 = lead */
+/* 🔴 SATURN 2026-08-17 -- AN INERT MARK IS A PAROLE, NOT A LIFE SENTENCE.  Owner: *"il faut lui
+   rendre les leviers si on change de secteur.  Ce qui est vrai dans une partie de niveau ne l'est
+   pas partout."*  He is right, and the first version had exactly the defect shape this project has
+   now shipped three times: a FAILURE THAT LATCHES.  The `w` rung is inert in an open TNT courtyard
+   because the walls are far and already on VDP1 -- move the same player into a close corridor and
+   flattening segs is precisely what buys the frame back.  Freezing a scene-local verdict into a
+   level-long one throws away the lever exactly where it would have worked.
+   Crossing into a new SECTOR is the cheapest honest "the world changed" signal available: the game
+   already maintains mo->subsector->sector, so it costs one compare per frame (r_main.c publishes
+   it).  Re-arming is RATE LIMITED to once per GOV_RETEST frames, because a doorway crossed twice a
+   second would otherwise put the governor straight back into the probe/degrade cycle the parole
+   exists to end -- each retest costs GOV_PROBE frames of degraded picture, so the worst-case duty
+   cycle of "degraded for nothing" is bounded at 24/256 ~= 9 %.  A level change clears everything
+   outright: nothing measured on the old map is evidence about the new one. */
+/* 🔴 SATURN 2026-08-17 -- INERT BY CONSTRUCTION BEATS INERT BY MEASUREMENT.  The ms probe needs 24
+   frames and a >=8,0 ms signal to convict a rung, and on a 190 ms frame that signal is inside the
+   noise.  But the owner's captures already convicted the `w` axis in ONE glance: `sb96/0` with
+   `ds113-120` -- the budget was ARMED and flattened ZERO segs, because the cut also demands
+   rw_distance > sat_lod_mindist and nothing in that scene qualified.  A rung that performs no
+   ACTION cannot buy time, and that needs no statistics: count the actions, and if the count does
+   not move at all in GOV_ACTWAIT frames, unwind and blacklist immediately.
+   Cheap, fast (4 frames instead of 24), and it gives the picture back before the player sees it.
+   Only axes with a real per-item action counter qualify -- `w` (tiers flattened) and the lead-fill
+   (spans emitted).  The `p` axis changes a MODE rather than taking per-item decisions, so it has no
+   such count and keeps the ms probe; that is a gap, not an oversight. */
+#define GOV_ACTWAIT 4       /* frames to see at least ONE action from the rung just fired        */
+unsigned int sat_gov_act_w = 0, sat_gov_act_l = 0;
+static unsigned int gov_pr_act0 = 0;
+#define GOV_RETEST 256      /* frames a parole must ripen before the next sector change re-arms */
+extern void *sat_view_sector;                                   /* r_main.c, identity token only */
+extern int   gamemap;
+static void *gov_last_sector = NULL;
+static int   gov_last_map = -1, gov_retest_wait = 0;
 extern int sat_gov_axis, sat_gov_p_step, sat_gov_p_dirty;
 int sat_prof_mx_map=0, sat_prof_mx_x=0, sat_prof_mx_y=0, sat_prof_mx_ang=0, sat_prof_mx_t=0;
 /* SATURN PERF (2026-07-09): full detail of the worst-REC frame, snapshotted at each new peak
@@ -2224,7 +2391,56 @@ static void rp_p3_prof_show(void)
                no quality knob at all, so electing it would degrade something innocent.  When Bw is
                what dominates, the governor holds and row 21 says `d-`: an honest "I cannot help
                here" beats a confident wrong move. */
-            if (sat_gov_debt >= GOV_FIRE10)
+            /* PAROLE first (see GOV_RETEST): give the levers back before deciding anything, so a
+               fire that lands on the frame after a sector crossing can already elect the axis the
+               previous room had condemned. */
+            if (gamemap != gov_last_map)
+            {
+                gov_last_map = gamemap; gov_last_sector = sat_view_sector;
+                sat_gov_inert = 0; gov_retest_wait = 0;
+            }
+            else
+            {
+                if (gov_retest_wait > 0) gov_retest_wait--;
+                if (sat_view_sector != gov_last_sector)
+                {
+                    gov_last_sector = sat_view_sector;
+                    if (sat_gov_inert && gov_retest_wait == 0)
+                        { sat_gov_inert = 0; gov_retest_wait = GOV_RETEST; }
+                }
+            }
+            /* FAST PATH: the rung fired GOV_ACTWAIT frames ago and has not acted ONCE.  No timing
+               is involved, so there is nothing to be fooled by -- convict and give the picture back
+               now rather than after 24 frames of degradation bought for nothing. */
+            if (gov_pr_wait == GOV_PROBE - GOV_ACTWAIT && gov_pr_axis >= 0)
+            {
+                unsigned int act = (gov_pr_axis == 0) ? sat_gov_act_w
+                                 : (gov_pr_axis == 2) ? sat_gov_act_l
+                                 : gov_pr_act0 + 1u;    /* `p` has no action count -> never convicts */
+                if (act == gov_pr_act0)
+                {
+                    if      (gov_pr_axis == 0) { sat_lod_auto_step = 0; sat_gov_inert |= 1; }
+                    else if (gov_pr_axis == 2) { sat_gov_lead_step = 0; sat_gov_inert |= 4; }
+                    sat_gov_debt = 0; gov_pr_wait = 0; gov_pr_axis = -1;
+                }
+            }
+            if (gov_pr_wait > 0 && --gov_pr_wait == 0)
+            {
+                if (rend + GOV_PROOF > gov_pr_rend)      /* no measurable gain -> undo + blacklist */
+                {
+                    /* 🔴 UNWIND THE WHOLE AXIS, not one rung.  First hardware run of the probe read
+                       `i1` on ten captures out of eleven -- it correctly proved the `w` axis inert --
+                       and yet `w1`..`w3` PERSISTED, because backing off a single step leaves the rest
+                       of the ladder standing.  A rung that has been shown to buy nothing is pure
+                       visual cost, so give the picture back in full: that was the owner's original
+                       complaint ("dégradé et jamais remonté") and a one-step undo does not answer it. */
+                    if      (gov_pr_axis == 0) { sat_lod_auto_step = 0; sat_gov_inert |= 1; }
+                    else if (gov_pr_axis == 1) { sat_gov_p_step = 0; sat_gov_p_dirty = 1; sat_gov_inert |= 2; }
+                    else if (gov_pr_axis == 2) { sat_gov_lead_step = 0; sat_gov_inert |= 4; }
+                    sat_gov_debt = 0;                    /* do not immediately re-fire the same trap */
+                }
+            }
+            if (sat_gov_debt >= GOV_FIRE10 && gov_pr_wait == 0)
             {
                 unsigned bp = bp10, p = p10, m = m10;
                 sat_gov_debt = 0;
@@ -2239,14 +2455,41 @@ static void rp_p3_prof_show(void)
                    both large.  Electing an axis you cannot move is the same as not firing.
                    'M' still has no proven live knob (the thing cap is not validated for a
                    controller), so it is only ever REPORTED -- but it must not BLOCK the others. */
-                if (sat_gov_axis == 'B' && sat_lod_auto_step < 3)
-                    sat_lod_auto_step++;
-                else if (sat_gov_axis == 'P' && sat_gov_p_step < 2)
-                    { sat_gov_p_step++; sat_gov_p_dirty = 1; }
-                else if (sat_lod_auto_step < 3)          /* elected axis railed -> next best */
-                    sat_lod_auto_step++;
-                else if (sat_gov_p_step < 2)
-                    { sat_gov_p_step++; sat_gov_p_dirty = 1; }
+                gov_pr_rend = rend; gov_pr_axis = -1;
+                if (sat_gov_axis == 'B' && sat_lod_auto_step < 3 && !(sat_gov_inert & 1))
+                    { sat_lod_auto_step++; gov_pr_axis = 0; }
+                else if (sat_gov_axis == 'P' && sat_gov_p_step < 2 && !(sat_gov_inert & 2))
+                    { sat_gov_p_step++; sat_gov_p_dirty = 1; gov_pr_axis = 1; }
+                /* 🔴 THE FALL-THROUGH USED TO IGNORE THE BLACKLIST, and that is why the owner's
+                   ratchet SURVIVED the probe.  Four captures read `dB ... w1`/`w2` WITH `i1` set:
+                   the first branch correctly refused the inert `w` axis, the second did not match
+                   (the elected axis was 'B', not 'P'), and this third branch then raised `w`
+                   anyway -- with no gov_pr_axis, so no probe, so no undo.  Every fire re-degraded
+                   the one axis already proven useless.  The blacklist must bind on EVERY path that
+                   can move a rung, not only on the elected one. */
+                else if (sat_lod_auto_step < 3 && !(sat_gov_inert & 1))
+                    { sat_lod_auto_step++; gov_pr_axis = 0; }
+                else if (sat_gov_p_step < 2 && !(sat_gov_inert & 2))
+                    { sat_gov_p_step++; sat_gov_p_dirty = 1; gov_pr_axis = 1; }
+                /* 🔴 SATURN 2026-08-17 -- THE LEAD-FILL LADDER, the owner's own proposal: "full quand
+                   tout va bien, flat quand ça dégénère, désactivé quand c'est catastrophique".
+                   It is LAST on purpose.  The lead-fill is his correction for VDP1's motion lag and
+                   it stays until the VDP1/CPU sync is mastered -- but hardware says it costs the
+                   majority of the frame (L1s 5,4 fps vs L0s 16,0), so a frame that is already
+                   collapsing has to be allowed to trade it.  Step 1 keeps FULL COVERAGE and only
+                   drops the texturing (mode 2 = flat spans): no holes, and holes are the one thing
+                   that must never appear.  Step 2 is the last resort. */
+                else if (sat_gov_lead_step < 2 && !(sat_gov_inert & 4))
+                    { sat_gov_lead_step++; gov_pr_axis = 2; }
+                /* ARM THE PROBE ONLY IF A RUNG ACTUALLY MOVED.  Arming it unconditionally spent
+                   GOV_PROBE frames of blackout -- during which no further fire can happen -- on a
+                   fire that changed nothing, and then judged the result of a no-op. */
+                if (gov_pr_axis >= 0)
+                {
+                    gov_pr_wait = GOV_PROBE;
+                    gov_pr_act0 = (gov_pr_axis == 0) ? sat_gov_act_w
+                                : (gov_pr_axis == 2) ? sat_gov_act_l : 0u;
+                }
             }
             else if (sat_gov_debt <= GOV_REL10)
             {
@@ -2254,7 +2497,9 @@ static void rp_p3_prof_show(void)
                    it was given up and the picture converges on full rather than on whichever axis
                    happened to be cheap to restore. */
                 sat_gov_debt = 0;
-                if (sat_lod_auto_step >= sat_gov_p_step && sat_lod_auto_step > 0)
+                if (sat_gov_lead_step > 0)      /* give the picture back BEFORE the geometry */
+                    sat_gov_lead_step--;
+                else if (sat_lod_auto_step >= sat_gov_p_step && sat_lod_auto_step > 0)
                     sat_lod_auto_step--;
                 else if (sat_gov_p_step > 0)
                     { sat_gov_p_step--; sat_gov_p_dirty = 1; }
@@ -2268,6 +2513,21 @@ static void rp_p3_prof_show(void)
                 sat_gov_debt = GOV_FIRE10;   /* every axis railed: hold, do not wind up */
             if (sat_lod_auto_step <= 0 && sat_gov_p_step <= 0 && sat_gov_debt < GOV_REL10)
                 sat_gov_debt = GOV_REL10;
+        }
+        {
+            static int lead_pad_mode = -1, lead_pad_x = -1;
+            if (sat_gov_lead_step == 0)
+            {
+                if (lead_pad_mode >= 0)      /* restore whatever R+Right had selected */
+                    { sat_lead_mode = lead_pad_mode; sat_wall_lead_x = lead_pad_x; lead_pad_mode = -1; }
+            }
+            else
+            {
+                if (lead_pad_mode < 0)
+                    { lead_pad_mode = sat_lead_mode; lead_pad_x = sat_wall_lead_x; }
+                sat_lead_mode   = 2;                                   /* flat spans, FULL coverage */
+                sat_wall_lead_x = (sat_gov_lead_step >= 2) ? 0 : lead_pad_x;
+            }
         }
         sat_lod_eff = gov_rung[sat_lod_auto_step & 3];
         /* SATURN 2026-08-16: the SAME rung also bounds the drawseg COUNT.  Sized on the hardware
@@ -2334,6 +2594,8 @@ static void rp_p3_prof_show(void)
                 prof_bp_g_a = prof_st_mx[1] / 224u;
                 prof_bp_g_k = prof_st_mx[2] / 224u;
                 prof_bp_g_z = prof_st_mx[3] / 224u;
+                prof_bp_g_q = prof_st_mx[4] / 224u;   /* the garde (W_LumpResident + Z_CanAllocate) */
+                prof_bp_g_c = prof_st_mx[5] / 224u;   /* W_CacheLumpNum on the single-patch path    */
                 /* (`b` = per-frame composite count RETIRED 2026-08-12, one capture after it was
                    added.  It did its job: g30/b0 and g197/b4 killed R_GenerateComposite as the
                    explanation of the R_GetColumn hole, so keeping the latch would be a value
@@ -2438,9 +2700,19 @@ static void rp_p3_prof_show(void)
         /* Trailing spaces sized for the widest form (`x99999` + 3-digit e/k/z): dbg_print does not
            clear the tail, so a shorter line leaves the previous one's digits behind -- the owner's
            `z0     0` ghost. */
-        snprintf(p, sizeof p, "%s g%u n%u x%u e%u k%u z%u          ",
+        /* 🔴 SATURN 2026-08-17 -- PRINT `a`.  It has been COMPUTED since 2026-08-14 and never shown,
+           and that omission just cost a whole build: the WAD transform killed the composite
+           (`cb0/0`, `k0` on four captures, both witnesses agreeing) and `x` did not move -- 15 175 us
+           for one R_GetColumn against `e1 k0 z1`, i.e. ~14 ms in the one bracket the row refused to
+           display.  `a` is W_CacheLumpNum on the single-patch path: the LUMP FAULT itself. */
+        /* `z` RETIRED 2026-08-17 -- it read 0-1 on every capture ever taken, its question (is the
+           worst Z_Malloc the hole?) is answered NO, and its two columns are worth more to `q`/`c`,
+           the pair that now decides between "make the garde cheap" and "stop faulting lumps". */
+        snprintf(p, sizeof p, "%s g%u n%u x%u a%u e%u k%u q%u c%u  ",
                  prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_g_n,
-                 prof_bp_g_x, prof_bp_g_e, prof_bp_g_k, prof_bp_g_z);
+                 prof_bp_g_x, prof_bp_g_a, prof_bp_g_e, prof_bp_g_k,
+                 prof_bp_g_q, prof_bp_g_c);
+        (void)prof_bp_g_z;
         dbg_print(0, 20, p);
     }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one

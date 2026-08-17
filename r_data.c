@@ -34,7 +34,6 @@
 
 #include "doomstat.h"
 #include "r_sky.h"
-#include "r_cache.h"
 #include "r_flatcache.h"
 
 
@@ -306,6 +305,158 @@ static void R_CPinAdd (int texnum, byte *block, int size)
     Z_ChangeTag (block, PU_LEVEL);
 }
 
+/* ------------------------------------------------------------------------------------------------
+   🔴 SATURN 2026-08-17 -- THE PATCH-LUMP PIN.  The chain closed on this date, one measurement per link:
+     row 14  `k0`                 the per-column loop writes ~no pixels -> `lp` is NOT fill
+     row 16  `w125,7/258`         all of it is R_GetColumn, called from the seg loop
+                                  (`p0/0` killed the routing-preamble theory, `m` is 0,3-5,8 ms)
+     row 16  `w4,6/203` vs `w125,7/258`   SAME call count, 27x the time -> a few fat calls, not many calls
+     row 20  `q0` / `c8`..`c12`   the garde is FREE; W_CacheLumpNum is 80-90 % of the worst call
+   => ~12 PATCH-LUMP FAULTS per frame at ~11 ms each = the frame.  Loaded, purged, loaded again:
+   the same treadmill as the composites and the flats, two floors further down.
+
+   WHY A PIN AND NOT A SLAB.  A resident pool would need its slots CONTIGUOUS (r_flatcache.c
+   carves 64 KB); `lg` reads 35-55 KB and 12 x 13 KB is 160 KB, so it cannot be carved.  A pin needs
+   NO contiguous run at all -- the blocks already exist, they merely stop being purge victims.
+   That is why the composite pin was built this shape, and why it is the right tool here.
+
+   WHY IT CAN WORK NOW AND COULD NOT BEFORE.  The composite pin yields on a 48 KB floor and read
+   `pn0/1`..`pn0/25` all through July-August: it never held a byte.  That floor existed to protect
+   the ~35 KB contiguous sky/face patch.  The WAD flatten of 2026-08-17 cut the largest lump from
+   35 083 B to 13 160 B, so the run that must stay available is now 13 KB, not 35 -- and a 24 KB
+   floor clears it with headroom against the measured `lg`.  The flatten bought no fps; it bought
+   THIS.
+   ------------------------------------------------------------------------------------------------ */
+#define R_LPIN_MAX     16          /* 12 -> 16: what the 128 KB rung can actually hold             */
+/* 🔴 2026-08-17, FOURTH hardware run (64 s of TNT MAP11 on console) -- the budget is now a LIVE
+   3-WAY A/B on pad L+Left, because the two numbers that decide it point opposite ways and only the
+   console can arbitrate:
+     - the ring holds `P57/0`..`P61/0` for the WHOLE run: 64 KB held, **zero yields**, against
+       `zf164..180k` / `lg22..32k`.  The zone is no longer the binding constraint -- that was the
+       fear that drove 128 -> 64 and it did not materialise.
+     - and 64 KB is still too small: `w149,1/211` with `c12` = ~12 fat calls in one frame, against
+       64 KB / 13 KB = 4-5 lumps held.  A CYCLIC 12-lump working set through a 5-entry ring misses
+       every single time; FIFO and LRU are equally bad on that pattern (Belady), so no eviction
+       policy can fix it.  Only CAPACITY can.
+   128 KB "failed" once, but that run predates the "drop ONE entry, not the whole ring" fix below:
+   what was measured then was the flush oscillation (`P17/292`), not the budget.  Raising it is also
+   self-limiting now -- if `lg` really dips under the floor the ring sheds one entry per add until
+   the zone is comfortable, instead of collapsing to nothing.
+     2 = 128 KB (default)   1 = 64 KB (the known-good rung)   0 = off
+   R_LPIN_BUDGET stays as the CEILING (array sizing + the "lump bigger than the whole ring" reject);
+   the live rung is R_LPinBudget(). */
+#define R_LPIN_BUDGET  (128*1024)
+/* 24 KB -> 16 KB (2026-08-17, third hardware run).  The ring still yielded 180-223 times a window
+   while row-11 `lg` read 22-48 KB, because Z_LargestAllocatable at the ADD SITE -- mid-render, after
+   the visplanes and sprites are out -- is genuinely smaller than the number the overlay samples.
+   The run that must stay available is now the largest lump, 13 160 B; 16 KB clears it with 3 KB of
+   headroom and stops the floor firing on frames that were never actually tight. */
+#define R_LPIN_FLOOR   (16*1024)
+
+/* 🔴 DEFAULT BACK TO 1 (64 KB) -- the 128 KB rung was MEASURED AND LOST, same day, 5th HW run.
+   The capacity argument said a cyclic working set can only be fixed by capacity.  Console says no:
+     `P2126/0` with `w186,2/341`  and  `P2122/0` with `w211,2/333`
+   -- 122-126 KB held, zero yields, and R_GetColumn STILL spikes to 186-211 ms.  Capacity was not the
+   binding constraint, so the whole argument for 2 is void.
+   It also costs: 128 KB of PU_LEVEL blocks pushed row-11 `lg` from 22-32 KB down to 17-19 KB, which
+   is BELOW the 17 547 B largest strip lump of the width-128 WAD -- and `px` went 0 -> 14 -> 112, i.e.
+   112 wall columns drawn as the stub.  The rung that keeps `lg` healthy and `px` at 0 is 1.
+   The chord and the rung stay: this is a measurement that must remain repeatable, not a dead end. */
+int		sat_lpin_on   = 1;     /* 0 off / 1 = 64 KB / 2 = 128 KB -- pad L+Left cycles     */
+int		r_lpin_kb     = 0;
+int		r_lpin_yield  = 0;
+/* 🔴 THE MISSING NUMBER, and the reason the 128 KB run could not be read.  `yields` counts ONLY the
+   floor guard; the ring ALSO sheds entries in R_LPinAdd's while-loop when it is full, and that path
+   incremented nothing.  So `P2122/0` was read as "holding fine, no pressure" when the ring may have
+   been evicting on every single add: 122 KB across at most R_LPIN_MAX=16 slots is a 7,6 KB average,
+   so the SLOT COUNT -- not the budget -- is the plausible binding limit, and FIFO on a cyclic working
+   set then misses every time.  Per WINDOW (the platform resets it after printing), because the useful
+   form is a rate: `P<rung><kb>/<yields>.<evictions>`. */
+int		r_lpin_evict  = 0;
+static int	r_lpin_lump[R_LPIN_MAX];
+static byte*	r_lpin_ptr [R_LPIN_MAX];
+static int	r_lpin_sz  [R_LPIN_MAX];
+static int	r_lpin_n     = 0;
+static int	r_lpin_bytes = 0;
+static int	r_lpin_map   = -1;
+
+static void R_LPinDrop (int i)
+{
+    /* Only retag if the block is still OURS.  After a level change Z_FreeTags has already freed it
+       and NULLed lumpcache[], so the compare fails and the slot is simply dropped -- self-healing,
+       exactly like the composite pin, no per-level hook to forget. */
+    if ((byte *)W_LumpCached (r_lpin_lump[i]) == r_lpin_ptr[i])
+	Z_ChangeTag (r_lpin_ptr[i], PU_CACHE);
+    r_lpin_bytes -= r_lpin_sz[i];
+    for (; i < r_lpin_n - 1; i++)
+    {
+	r_lpin_lump[i] = r_lpin_lump[i+1];
+	r_lpin_ptr [i] = r_lpin_ptr [i+1];
+	r_lpin_sz  [i] = r_lpin_sz  [i+1];
+    }
+    r_lpin_n--;
+    if (r_lpin_bytes < 0) r_lpin_bytes = 0;
+    r_lpin_kb = r_lpin_bytes >> 10;
+}
+
+void R_LumpPinFlush (void)
+{
+    while (r_lpin_n)
+	R_LPinDrop (0);
+    r_lpin_bytes = 0;
+    r_lpin_kb    = 0;
+}
+
+/* The live rung behind pad L+Left.  A function, not a variable, so the only writer of the A/B state
+   stays `sat_lpin_on` -- one flag, one subject. */
+static int R_LPinBudget (void)
+{
+    return (sat_lpin_on >= 2) ? (128*1024) : (64*1024);
+}
+
+/* Called ONLY after a fault (the lump was not resident and we just read it from the disc), so the
+   ring holds exactly the lumps that have already proved they cost 11 ms to lose. */
+static void R_LPinAdd (int lump, byte *block, int size)
+{
+    extern int gamemap;
+    int i;
+    int budget = R_LPinBudget ();
+
+    if (!sat_lpin_on || !block || size <= 0 || size > budget)
+	return;
+    if (gamemap != r_lpin_map)			/* new level: the old pointers are already freed */
+	{ r_lpin_n = 0; r_lpin_bytes = 0; r_lpin_kb = 0; r_lpin_map = gamemap; }
+    /* 🔴 YIELD ONE ENTRY, NOT THE WHOLE RING (fixed 2026-08-17 on the first hardware run).
+       First version called R_LumpPinFlush() here, and the captures caught it oscillating: `P17/292`
+       and `P-0/279` -- 292 yields in one window, i.e. hold 128 KB, drive `lg` under the floor with
+       its own blocks, release EVERYTHING, re-pin, repeat.  The readout tells the story twice over,
+       because the frames where it did hold are the fast ones: `P102/0` with `w22,6`, `P100/0` with
+       `w5,6`, against `P39/35` with `w205,1`.  The mechanism is right; releasing all of it to
+       recover one block's worth of room is what was wrong.  Dropping the OLDEST entry converges:
+       the ring shrinks until the zone is comfortable and then stops. */
+    if (Z_LargestAllocatable () < R_LPIN_FLOOR)
+	{ if (r_lpin_n) R_LPinDrop (0); r_lpin_yield++; return; }
+    for (i = 0; i < r_lpin_n; i++)
+	if (r_lpin_lump[i] == lump)
+	    return;				/* already held */
+
+    /* Counted HERE, not inside R_LPinDrop: the flush and the floor guard also drop entries and they
+       are different events.  This one means "the ring was full and something had to go". */
+    while (r_lpin_n && (r_lpin_n >= R_LPIN_MAX || r_lpin_bytes + size > budget))
+    {
+	r_lpin_evict++;
+	R_LPinDrop (0);				/* oldest out first */
+    }
+
+    r_lpin_lump[r_lpin_n] = lump;
+    r_lpin_ptr [r_lpin_n] = block;
+    r_lpin_sz  [r_lpin_n] = size;
+    r_lpin_n++;
+    r_lpin_bytes += size;
+    r_lpin_kb = r_lpin_bytes >> 10;
+    Z_ChangeTag (block, PU_LEVEL);
+}
+
 static void R_CompositeNoteDistinct (int texnum)
 {
     int i;
@@ -406,7 +557,8 @@ void R_GenerateComposite (int texnum)
 {
     byte*		block;
     extern int		r_composite_builds;
-    int			cached = 0;
+    /* (`cached` RETIRED with core/r_cache.c: it flagged "this block belongs to the LRU pool, not the
+       zone", and the pool never once allocated.  A flag that is always 0 is a lie in the code.) */
     int			pf_maxofs, ofs_used;   /* SATURN: useful-fraction probe, row-22 `pf` */
     texture_t*		texture;
     texpatch_t*		patch;	
@@ -427,21 +579,27 @@ void R_GenerateComposite (int texnum)
     r_composite_builds++;
     R_CompositeNoteDistinct (texnum);
     R_EnsureLookup (texnum);
+    /* SATURN 2026-08-17: R_EnsureLookup may now return with no directory (see R_GetColumn_impl).
+       Publish the stub and bail rather than Z_ChangeTag a NULL ("block without a ZONEID" fatal). */
+    if (!texturecolumnlump[texnum] || !texturecolumnofs[texnum])
+    {
+	texturecomposite[texnum] = r_column_stub;
+	r_composite_ovf++;
+	return;
+    }
     Z_ChangeTag (texturecolumnlump[texnum], PU_STATIC);
     Z_ChangeTag (texturecolumnofs[texnum],  PU_STATIC);
 
-    // SATURN: in CD-streaming mode build the composite into the bounded LRU
-    // texture cache (recency-evicted, capped) instead of the main zone, so the
-    // streaming working set is bounded and the CD reads amortized.  A NULL
-    // return (cache inactive / pool full / parallel pass) falls back to the
-    // classic main-zone PU_CACHE composite -- i.e. exactly today's behaviour.
-    block = R_TexCacheAlloc (texturecompositesize[texnum],
-			     (void **)&texturecomposite[texnum]);
-    if (block)
-    {
-	cached = 1;	// pool block; texturecomposite[texnum] already published
-    }
-    else if (!Z_CanAllocate (texturecompositesize[texnum]))
+    /* 🔴 SATURN 2026-08-17 -- core/r_cache.c DELETED, and this is where it plugged in.  It carved a
+       96 KB CONTIGUOUS slab for a bounded LRU composite pool; row-22 `xc0/0/60` says the carve found
+       60 KB and the pool therefore never existed on a single frame of a single capture, all summer.
+       Its own header explained why it could not: a slab needs a contiguous run and `lg` reads
+       22-55 KB.  The lesson is already banked -- it is what made the LUMP PIN take the pin shape,
+       which needs no run at all and now holds 57-61 KB on hardware with zero yields.
+       Dead code is not free on this target: it costs the TLSF pool 1:1 with .bss
+       ([[boot-loop-can-be-tlsf-pool-starvation]]), and the pre-flight refused the build that added
+       these probes until this went.  `block`/`cached` stay: the tail below still branches on them. */
+    if (!Z_CanAllocate (texturecompositesize[texnum]))
     {
 	// SATURN garde-COMPOSITE: the composite will not fit the zone even after purging PU_CACHE
 	// (Z_LargestAllocatable == what Z_Malloc could get).  A Z_Malloc here would I_Error-freeze.
@@ -470,7 +628,7 @@ void R_GenerateComposite (int texnum)
 	{ int pl = W_LumpLength (pp->patch); if (pl > big) big = pl; }
 	if (!Z_CanAllocate (big))
 	{
-	    if (!cached) Z_Free (block);
+	    Z_Free (block);
 	    texturecomposite[texnum] = r_column_stub;
 	    r_composite_ovf++;
 	    Z_ChangeTag (texturecolumnlump[texnum], PU_CACHE);
@@ -538,23 +696,18 @@ void R_GenerateComposite (int texnum)
 	}
     }
 
-    // Classic path: now that the texture is built it is purgable from the zone.
-    // Cache-pool blocks are managed by the LRU (R_PostTexCacheFrame), not the
-    // zone purger, so they are left alone here.
-    if (!cached)
+    // Now that the texture is built it is purgable from the zone.
+    /* SATURN 2026-08-14: PIN instead of demote, while the zone can still hand out a 48 KB run.
+       Z_CanAllocate early-exits on the first run that fits, so the healthy case is cheap (`zw`
+       measures it: ~0,2 ms a frame).  The moment it cannot, release the WHOLE ring in one go and
+       fall back to the classic purgeable composite -- the pin yields before it can starve the
+       ~35 KB sky/face patches, which is exactly what the 1p slab could not do. */
+    if (sat_cpin_on && Z_CanAllocate (R_CPIN_FLOOR))
+	R_CPinAdd (texnum, block, texturecompositesize[texnum]);
+    else
     {
-	/* SATURN 2026-08-14: PIN instead of demote, while the zone can still hand out a 48 KB run.
-	   Z_CanAllocate early-exits on the first run that fits, so the healthy case is cheap (`zw`
-	   measures it: ~0,2 ms a frame).  The moment it cannot, release the WHOLE ring in one go and
-	   fall back to the classic purgeable composite -- the pin yields before it can starve the
-	   ~35 KB sky/face patches, which is exactly what the 1p slab could not do. */
-	if (sat_cpin_on && Z_CanAllocate (R_CPIN_FLOOR))
-	    R_CPinAdd (texnum, block, texturecompositesize[texnum]);
-	else
-	{
-	    if (r_cpin_n) { R_CompositePinFlush (); r_cpin_yield++; }
-	    Z_ChangeTag (block, PU_CACHE);
-	}
+	if (r_cpin_n) { R_CompositePinFlush (); r_cpin_yield++; }
+	Z_ChangeTag (block, PU_CACHE);
     }
 
     // SATURN R4: unpin the directory -- purgeable again.
@@ -821,7 +974,8 @@ R_GetColumn_impl
 {
     int		lump;
     int		ofs;
-	
+    int		fault = 0;   /* SATURN: this call went to the disc -> the lump pin should hold it */
+
     col &= texturewidthmask[tex];
     /* SATURN 2026-08-14 (round 3): THIS call site is the one that was never bracketed.  Round 2 put
        `e` on the R_EnsureLookup INSIDE R_GenerateComposite -- which by then always finds the
@@ -830,6 +984,18 @@ R_GetColumn_impl
        W_CacheLumpNum below, and nowhere else in the body. */
     RP_StampBegin (0);                            /* row-20 `e`: the R4 lazy directory rebuild */
     R_EnsureLookup (tex);   // SATURN R4: build the directory on first use (or after a purge)
+    /* 🔴 SATURN 2026-08-17 -- MY OWN REGRESSION, and the exact halt this file already warned about.
+       Yesterday's unlatch fix made R_GenerateLookup DESTROY both directories when the garde-PATCH
+       bails, so R_EnsureLookup can now legitimately return with them NULL -- and the very next line
+       used to index them.  A NULL[] read yields a garbage lump number and W_CacheLumpNum halts:
+       the owner's `W_CacheLumpNum: 8192 >= numlumps` fatal.  The unlatch is right (the failure must
+       not be permanent); what was missing is that every consumer has to accept "no directory yet".
+       Serve the placeholder, exactly like every other garde here -- it heals on a later frame. */
+    if (!texturecolumnlump[tex] || !texturecolumnofs[tex])
+    {
+	r_patch_ovf++;
+	return r_column_stub;
+    }
     RP_StampEnd (0);
     lump = texturecolumnlump[tex][col];
     ofs = texturecolumnofs[tex][col];
@@ -852,7 +1018,20 @@ R_GetColumn_impl
 	   The test is Z_LargestAllocatable, i.e. free + purgeable after coalescing -- exactly what
 	   Z_Malloc's own scan can reach -- so this only fires when the allocation really would
 	   fail.  Resident lumps never reach the test. */
-	if (!W_LumpResident (lump))
+	/* 🔴 SATURN 2026-08-17 -- THE LAST UNBRACKETED CALLS ON THE HOT PATH.  Row 16 `GCS` proved the
+	   cost lives here: `w166,2/253` against `w3,0/211` -- the SAME call count, 55x the time, so it
+	   is a handful of fat calls, not a call-count problem, and row 20 said `a e k z` were all ~0.
+	   These three calls were never timed.  Slot 4 (`q`) = the garde, i.e. W_LumpResident plus the
+	   Z_CanAllocate that walks the whole zone block list (row-22 `zw` reads 16 796..27 386 blocks
+	   per frame ~= 17..29 ms at ~30 cycles each).  Slot 5 (`c`) = W_CacheLumpNum, which on a
+	   non-resident lump is a real CD read.
+	   THE DECISION THIS SPLIT MAKES: `q` fat => make the garde cheap (memoise / drop it).  `c` fat
+	   => stop FAULTING lumps, i.e. the resident patch pool on the r_flatcache.c model -- which the
+	   WAD flatten has just made possible, since a 13 KB strip fits the measured `lg` and the old
+	   96 KB composite slab never could. */
+	RP_StampBegin (4);
+	fault = !W_LumpResident (lump);
+	if (fault)
 	{
 	    /* SATURN 2026-08-14: this is the ONLY branch of R_GetColumn that can reach the disc --
 	       W_CacheLumpNum below will W_ReadLump a patch that is routinely 35080 B in TNT.  Counted
@@ -863,11 +1042,22 @@ R_GetColumn_impl
 	    r_getcol_disc++;
 	    if (!Z_CanAllocate (W_LumpLength (lump) + 64))
 	    {
+		RP_StampEnd (4);
 		r_patch_ovf++;
 		return r_column_stub;
 	    }
 	}
-	return (byte *)W_CacheLumpNum(lump,PU_CACHE)+ofs;   /* cleared: `a0` on 2026-08-14 */
+	RP_StampEnd (4);
+	{
+	    byte *p;
+	    RP_StampBegin (5);
+	    p = (byte *)W_CacheLumpNum(lump,PU_CACHE);
+	    RP_StampEnd (5);
+	    /* It cost a disc read to get here -- hold it, so the next frame does not pay again. */
+	    if (fault)
+		R_LPinAdd (lump, p, W_LumpLength (lump));
+	    return p + ofs;
+	}
     }
 
     if (!texturecomposite[tex])
@@ -884,8 +1074,8 @@ R_GetColumn_impl
 	   stale and point at another column of the freshly-sized composite.  Re-read it. */
 	ofs = texturecolumnofs[tex][col];
     }
-    else if (sat_texcache_active && texturecomposite[tex] != r_column_stub)
-	R_TexCacheTouch (texturecomposite[tex]);   // keep visible composites resident
+    /* (the `else` arm here was R_TexCacheTouch -- the LRU recency bump for the pool deleted with
+       core/r_cache.c.  `sat_texcache_active` was never 1, so this arm never ran.) */
 
     if (texturecomposite[tex] == r_column_stub)   // SATURN garde-COMPOSITE: OOM sentinel -> placeholder, no crash/OOB
 	return r_column_stub;

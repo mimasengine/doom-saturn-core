@@ -108,7 +108,9 @@ R_RenderMaskedSegRange
     column_t*	col;
     int		lightnum;
     int		texnum;
-    
+    int sat_gc_save = sat_gc_site;
+    sat_gc_site = 3;                  /* SATURN row 16 `GCS`: grate columns, invisible in `g` */
+
     // Calculate light table.
     // Use different light tables
     //   for horizontal / vertical / diagonal. Diagonal?
@@ -160,6 +162,14 @@ R_RenderMaskedSegRange
     // draw the columns
     for (dc_x = x1 ; dc_x <= x2 ; dc_x++)
     {
+	/* ⚠ SATURN 2026-08-17 -- THE GRATE MASKING WAS HERE AND IS WITHDRAWN, on the owner's call
+	   (*"annule le masquage pour l'instant, on y reviendra plus précisément plus tard"*).
+	   It dropped every masked-midtexture column covered by a NEARER VDP1 sprite -- correct in
+	   principle, since NBG1 sits above the VDP1 sprite layer and the two cannot z-sort, so a grate
+	   BEHIND a monster shows through it.  What made it too blunt: the test used the sprite's
+	   BOUNDING BOX, and a monster does not fill its box, so the grate also vanished in the
+	   transparent margins beside it.  A precise version has to work per ROW, not per column.
+	   Its publisher (r_things.c sat_v1spr_sc[]) went with it, so nothing is left half-wired. */
 	// calculate lighting
 	if (maskedtexturecol[dc_x] != SHRT_MAX)
 	{
@@ -185,7 +195,7 @@ R_RenderMaskedSegRange
 	}
 	spryscale += rw_scalestep;
     }
-	
+    sat_gc_site = sat_gc_save;   /* SATURN row 16 `GCS` */
 }
 
 
@@ -660,7 +670,21 @@ int sat_lead_cols   = 0;   /* diagnostic: extra software column-spans drawn, per
          i.e. the memory-bound half of wall-prep.  Kept as the cheap fallback -- the owner judged it
          visible in motion, so it is no longer the default.
    ⚠ Mode 1 moves the FILL, not the composite: R_GetColumn mutates the shared texture cache, so it
-   has to stay on the master (that is what killed wall-prep-on-slave three times over). */
+   has to stay on the master (that is what killed wall-prep-on-slave three times over).
+
+   ⚠ 2026-08-17 -- I MOVED THIS DEFAULT TO 0 AND MOVED IT BACK THE SAME DAY.  The move rested on ONE
+   A/B (`L1s` 5,4 fps vs `L1-` 6,9) and the owner's next four captures did not reproduce it:
+   `L1s` MST 113 / 175 against `L1-` MST 192 / 185, i.e. the slave side at least as good.  Neither
+   run was same-spot (the two pairs peak at different map positions), so the honest verdict is
+   UNRESOLVED, not "slave loses" -- and an unresolved verdict does not get to change a default.
+   What survives from that analysis, because it is read from the code and not from fps:
+     - the overlap window is R_DrawPlanes ALONE (r_main.c dispatches just before it and joins just
+       after) and R_DrawPlanes is ~1 ms, so the CEILING on this offload is about 1 ms;
+     - the slave path does strictly more work -- it re-resolves every span through
+       R_GetColumnCached at drain time, on a cache rp_aux_body purged on entry.
+   What did NOT survive: I read row-12 `st` as a per-window RATE and concluded the re-resolve was
+   failing for nearly every span.  `st` is CUMULATIVE and never reset (two captures show the same
+   2839 with the slave path not even running), so it says nothing about the failure rate. */
 int sat_lead_mode   = 1;
 #define sat_lead_flat (sat_lead_mode == 2)
 
@@ -885,8 +909,16 @@ static void sat_lead_arm (sat_lead_t *L, int key, int x0, int x1)
     sat_lead_set (&L->on2, &L->x1b, &L->x2b, &L->ylfb, &L->ylstepb, &L->yhfb, &L->yhstepb, qb, x0);
 }
 
-/* One difference span: straight to the framebuffer, or into the slave's list. */
-#define SAT_LEAD_EMIT(a,b) do { 	if (sat_lead_mode == 1) sat_lead_span_add ((a), (b)); 	else { dc_yl = (a); dc_yh = (b); colfunc (); } 	sat_lead_cols++; } while (0)
+/* SATURN 2026-08-17 (row 14 `SEG`): one increment and one add per fill, NO timer -- a probe that
+   cannot inflate the very number it is sizing.  Wraps every colfunc() reachable from the seg loop. */
+#define SAT_PROF_FILL() do { prof_seg_fill++;				\
+	if (dc_yh >= dc_yl) prof_seg_px += (unsigned)(dc_yh - dc_yl + 1); } while (0)
+
+/* One difference span: straight to the framebuffer, or into the slave's list.
+   SATURN 2026-08-17: the span's PIXELS are counted on both paths (row 14 `SEG`), because the whole
+   question about the lead-fill is how its pixel bill compares with the walls' own -- `L1s/1224` on
+   hardware says it emits as many column-spans as the walls do, and that is a guess until counted. */
+#define SAT_LEAD_EMIT(a,b) do { 	if ((b) >= (a)) prof_lead_px += (unsigned)((b) - (a) + 1); 	if (sat_lead_mode == 1) sat_lead_span_add ((a), (b)); 	else { dc_yl = (a); dc_yh = (b); SAT_PROF_FILL (); colfunc (); } 	sat_lead_cols++; sat_gov_act_l++; } while (0)
 
 /* Draw [yl,yh] MINUS the rows BOTH armed quads covered at column x.  dc_source / sat_wall_color /
    dc_texturemid are already set by the caller; this only chooses the spans. */
@@ -1281,6 +1313,7 @@ void R_RenderSegLoop (void)
        stay readable against the flat-shaded plain walls. */
     /* DEBUG PAINT bit1 (r_data.c sat_wall_paint): paint EVERY CPU wall, doors and switches too --
        the point is to see which path owns each wall, and an exception would read as a hole. */
+    sat_gc_site = 2;   /* SATURN row 16 `GCS`: everything up to the column loop is the PREAMBLE */
     sat_wall_textured = (sat_wall_paint & 2) ? 0 : (curline->linedef->special != 0);
     /* SATURN PERF (step 2): a plain opaque wall in Potato mode is drawn as one
        solid colour by rp_exec_col (it reads cm->f3 + cm->cmap, NEVER cm->src) ->
@@ -1845,7 +1878,7 @@ void R_RenderSegLoop (void)
 	if ((lod_h * lod_w) < sat_lod_eff)
 	{
 	    if ((rw_distance >> FRACBITS) > sat_lod_mindist)
-		lod_flat = 1;
+		{ lod_flat = 1; sat_gov_act_w++; }
 	    else
 		sat_wall_lod_near++;
 	}
@@ -1870,6 +1903,7 @@ void R_RenderSegLoop (void)
     {
 	lod_flat = 1;
 	sat_seg_budget_cut++;
+	sat_gov_act_w++;
     }
     if (lod_flat) sat_wall_lod_hits++;
     int io_flat_mid = midtexture    ? (lod_flat || sat_wall_io_flat (midtexture))    : 0;
@@ -1883,12 +1917,14 @@ void R_RenderSegLoop (void)
        everything below is per-COLUMN.  They scale with different quantities, so `BP` on row 20
        reports them apart.  Single call, no early return above it -- audited 2026-08-08. */
     RP_SegRoutMark ();
+    sat_gc_site = 1;   /* SATURN row 16 `GCS`: from here on, the per-column loop owns the calls */
     for ( ; rw_x < rw_stopx ; rw_x++)
     {
 	/* SATURN L5: the CPU border columns of an edge-split wall (sat_we_on, armed in the claim
 	   block above).  Disarmed -> a constant 0 the compiler folds away, exactly like the old
 	   SAT_WALL_EDGE_FILL enum it replaces.  DoomJo / VDP1-off never arm it. */
 	int is_edge = sat_we_on && (rw_x <= sat_we_lo || rw_x >= sat_we_hi);
+	prof_seg_cols++;                          /* SATURN row 14 `SEG`: the loop's trip count */
 	// mark floor / ceiling areas
 	yl = (topfrac+HEIGHTUNIT-1)>>HEIGHTBITS;
 
@@ -1992,6 +2028,7 @@ void R_RenderSegLoop (void)
 		else
 		    dc_source = R_GetColumn(midtexture,texturecolumn);
 		sat_dc_solid = wall_solid || io_flat_mid;   /* SATURN: armed for WALL columns only (see r_draw.c) */
+			SAT_PROF_FILL ();
 		colfunc ();
 		sat_dc_solid = 0;
 	    }
@@ -2041,6 +2078,7 @@ void R_RenderSegLoop (void)
 			else
 			    dc_source = R_GetColumn(toptexture,texturecolumn);
 			sat_dc_solid = wall_solid || io_flat_up;   /* SATURN: WALL columns only (see r_draw.c) */
+				SAT_PROF_FILL ();
 			colfunc ();
 			sat_dc_solid = 0;
 		    }
@@ -2098,6 +2136,7 @@ void R_RenderSegLoop (void)
 			    dc_source = R_GetColumn(bottomtexture,
 						    texturecolumn);
 			sat_dc_solid = wall_solid || io_flat_lo;   /* SATURN: WALL columns only (see r_draw.c) */
+				SAT_PROF_FILL ();
 			colfunc ();
 			sat_dc_solid = 0;
 		    }
@@ -2579,6 +2618,7 @@ R_StoreWallRange_impl
     RP_SegLoopEnter ();   /* SATURN PERF Phase-0a: bracket the per-column loop (c Bp) */
     R_RenderSegLoop ();
     RP_SegLoopLeave ();
+    sat_gc_site = 0;   /* SATURN row 16 `GCS`: back to "other" (r_plane.c's sky column, ...) */
 
 
     // save sprite clipping info

@@ -37,7 +37,6 @@
 
 #include "r_local.h"
 #include "r_sky.h"
-#include "r_cache.h"
 #include "r_flatcache.h"
 
 
@@ -83,8 +82,15 @@ fixed_t			viewsin;
 
 player_t*		viewplayer;
 
+/* SATURN 2026-08-17: the sector the eye is in, republished every frame for the LOD governor's
+   PAROLE (r_parallel.c).  Owner: *"il faut lui rendre les leviers si on change de secteur.  Ce qui
+   est vrai dans une partie de niveau ne l'est pas partout."*  Stored as a bare pointer used ONLY
+   as an identity token -- no dereference, no header dependency, and the game already maintains it
+   (P_SetThingPosition), so this costs one store per frame and no BSP descent.  DoomJo-safe. */
+void*			sat_view_sector = NULL;
+
 // 0 = high, 1 = low
-int			detailshift;	
+int			detailshift;
 
 //
 // precalculated math tables
@@ -1000,6 +1006,7 @@ void R_SetupFrame (player_t* player)
     int		i;
 
     viewplayer = player;
+    sat_view_sector = (void *)player->mo->subsector->sector;   /* governor parole, see the decl */
     viewx = player->mo->x;
     viewy = player->mo->y;
     viewangle = player->mo->angle + viewangleoffset;
@@ -1294,9 +1301,8 @@ void R_RenderPlayerView (player_t* player)
 
     R_SetupFrame (player);
 
-    // SATURN: age the bounded streaming texture cache once per view, before the
-    // BSP walk re-touches the visible composites (no-op unless sat_streaming).
-    R_PostTexCacheFrame ();
+    /* (R_PostTexCacheFrame DELETED with core/r_cache.c on 2026-08-17 -- it aged an LRU pool that
+       never allocated a block.  The flat pool below keeps its own, real, aging beat.) */
     /* SATURN: age the resident flat pool on the same beat.  MUST be here -- before the BSP
        walk re-touches this view's flats -- so "age 0" means exactly "in use by the view being
        drawn" and the LRU can never reuse a slot a queued visplane still points into. */

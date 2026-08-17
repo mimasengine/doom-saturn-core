@@ -112,8 +112,19 @@ void P_RunThinkers (void)
 	}
 	else
 	{
+	    /* SATURN 2026-08-17 (row 23 `THK`): bill the MOBJ thinkers separately from the sector
+	       ones -- `th - mo` is then doors/platforms/lights, `mo` is the actor world. */
 	    if (currentthinker->function.acp1)
-		currentthinker->function.acp1 (currentthinker);
+	    {
+		if (currentthinker->function.acp1 == (actionf_p1)P_MobjThinker)
+		{
+		    RP_ThkMobjBegin ();
+		    currentthinker->function.acp1 (currentthinker);
+		    RP_ThkMobjEnd ();
+		}
+		else
+		    currentthinker->function.acp1 (currentthinker);
+	    }
 	}
 	currentthinker = currentthinker->next;
     }

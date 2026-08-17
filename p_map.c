@@ -38,6 +38,7 @@
 // State.
 #include "doomstat.h"
 #include "r_state.h"
+#include "r_parallel.h"   /* SATURN: RP_ThkMove* -- the blockmap half of the thinker breakdown */
 // Data.
 #include "sounds.h"
 
@@ -400,8 +401,26 @@ boolean PIT_CheckThing (mobj_t* thing)
 //  speciallines[]
 //  numspeciallines
 //
+/* SATURN 2026-08-17 (row 23 `THK` `mv`): thin wrapper so the BLOCKMAP walk is timed without
+   touching a single return path -- the same shape R_GetColumn uses.  P_TryMove funnels through
+   here, so bracketing this one function covers both. */
+static boolean P_CheckPosition_impl (mobj_t*, fixed_t, fixed_t);
+
 boolean
 P_CheckPosition
+( mobj_t*	thing,
+  fixed_t	x,
+  fixed_t	y )
+{
+    boolean r;
+    RP_ThkMoveBegin ();
+    r = P_CheckPosition_impl (thing, x, y);
+    RP_ThkMoveEnd ();
+    return r;
+}
+
+static boolean
+P_CheckPosition_impl
 ( mobj_t*	thing,
   fixed_t	x,
   fixed_t	y )

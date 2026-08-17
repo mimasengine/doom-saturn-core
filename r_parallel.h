@@ -100,6 +100,22 @@ extern unsigned int sat_tic_total_frt;   /* TryRunTics,    cumulative FRT ticks 
 extern unsigned int sat_tic_think_frt;   /* P_RunThinkers, cumulative FRT ticks */
 extern unsigned int sat_tic_sight_frt;   /* P_CrossBSPNode, cumulative FRT ticks */
 extern unsigned int sat_tic_runs;        /* P_RunThinkers CALLS = tics run; divides `th` into cost x count */
+/* SATURN 2026-08-17 -- row 23 `THK`: the inside of `th` (see the note in r_parallel.c). */
+void RP_ThkMobjBegin(void);
+void RP_ThkMobjEnd(void);
+void RP_ThkMoveBegin(void);
+void RP_ThkMoveEnd(void);
+extern unsigned int sat_thk_mobj_frt;    /* P_MobjThinker, cumulative FRT ticks           */
+extern unsigned int sat_thk_move_frt;    /* P_CheckPosition/P_TryMove inside it (SUBSET)  */
+extern unsigned int sat_thk_n;           /* thinkers RUN -- "many" vs "expensive"         */
+/* round 2: carve the ~69 ms of `mo` that `mv` and `s` do not explain (see r_parallel.c). */
+void RP_ThkPathBegin(void);
+void RP_ThkPathEnd(void);
+void RP_ThkSpawnBegin(void);
+void RP_ThkSpawnEnd(void);
+extern unsigned int sat_thk_path_frt;    /* P_PathTraverse -- hitscan shots, NOT part of `mv`      */
+extern unsigned int sat_thk_spawn_frt;   /* P_SpawnMobj (the Z_Malloc): puffs, blood, drops        */
+extern unsigned int sat_thk_spawn_n;     /* ...and how many: expensive vs merely frequent          */
 extern unsigned int sat_tic_avail;       /* d_loop.c: tics TryRunTics ELECTED to run -- `a` vs `x` says
                                             whether the lost tics were never built or built-then-skipped */
 extern unsigned int sat_tic_built;       /* d_loop.c: tics NetUpdate WANTED (`newtics`) -- row 24 `b` */
@@ -109,6 +125,22 @@ extern int sat_thing_masked_cut;         /* r_things.c: sprites sent back to sof
    spent in R_StoreWallRange, reset per view in RP_BeginFrame).  Bounds the NUMBER of textured segs,
    which is what `Bp` actually scales with (`ds118` at `Bp110,8`); the area rung bounds their SIZE.
    Past the budget a seg draws FLAT -- never skipped, or solidsegs would leave a see-through hole. */
+/* SATURN 2026-08-17 -- row 14 `SEG`: the COUNTS that size `lp` (see the note in r_parallel.c).
+   Plain increments, reset per frame with the rest of the Phase-0a split. */
+extern unsigned int prof_seg_cols, prof_seg_fill, prof_seg_px, prof_lead_px;
+
+/* SATURN 2026-08-17 -- GOVERNOR ACTION COUNTERS.  One increment each time a governor rung actually
+   CHANGES A PIXEL: `w` when a tier is flattened (area rung or drawseg budget), `l` when the
+   lead-fill emits a span.  Free-running and GOVERNOR-OWNED -- deliberately NOT the overlay's
+   `sb`/`L<n>` tallies, which the platform zeroes on its own window and would make the governor's
+   delta read as "no action" at random.  See the inert-by-construction test in r_parallel.c. */
+extern unsigned int sat_gov_act_w, sat_gov_act_l;
+
+/* SATURN 2026-08-17 -- row 16 `GCS`: R_GetColumn split by CALL SITE (see the note in r_parallel.c).
+   Callers stamp sat_gc_site; 1 = seg-loop tier, 2 = routing preamble, 3 = masked midtexture. */
+extern int sat_gc_site;
+extern unsigned int prof_gc_st[4], prof_gc_sn[4];
+
 extern int sat_seg_budget;       /* textured segs allowed per view, 0 = unbounded */
 extern int sat_seg_count;        /* segs stored so far this view                  */
 extern int sat_seg_budget_cut;   /* ~1 s tally of segs flattened by the budget    */

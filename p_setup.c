@@ -39,7 +39,6 @@
 #include "s_sound.h"
 
 #include "doomstat.h"
-#include "r_cache.h"
 #include "r_flatcache.h"
 
 
@@ -1013,10 +1012,9 @@ P_SetupLevel
 
     Z_FreeTags (PU_LEVEL, PU_PURGELEVEL-1);
 
-    // SATURN: free the previous level's bounded texture-cache pool (a PU_STATIC
-    // slab that survives Z_FreeTags) and drop its composite back-pointers BEFORE
-    // this level's geometry loads, so geometry gets the full free zone.
-    R_ClearTextureCaches ();
+    /* (R_ClearTextureCaches DELETED with core/r_cache.c on 2026-08-17.  Its slab needed 96 KB
+       CONTIGUOUS and `xc0/0/60` says the carve never found more than 60 -- the pool never existed,
+       so there was never anything to free here.  The flat pool below is the one that IS real.) */
     /* SATURN: same contract for the resident flat pool -- its slab is PU_STATIC and would
        otherwise survive Z_FreeTags as a MID-ZONE WALL while P_LoadSegs is asking for its one
        big contiguous SEGS array (see [[zone-contiguity-wall-loadsegs]]).  Release it here,
@@ -1134,8 +1132,7 @@ P_SetupLevel
        P_LoadSegs is what [[zone-contiguity-wall-loadsegs]] proved fatal on TNT MAP19. */
     Z_RoverToStart ();
     R_SetupFlatCache ();
-    Z_RoverToStart ();
-    R_SetupTextureCaches ();
+    /* (R_SetupTextureCaches DELETED with core/r_cache.c -- see above.) */
 
 #ifdef SAT_SND_PRECACHE
     // SATURN: warm this level's sound effects into SCSP RAM (off the gameplay frame).

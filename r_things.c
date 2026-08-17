@@ -188,7 +188,16 @@ int sat_thing_cull_dist = 1024;
 int sat_thing_role_cut  = 0;
 /* SATURN: sprites handed back to the software path because a masked midtexture (grate) overlapped
    them -- VDP1 things and NBG1 midtextures have FIXED relative priority and cannot z-sort.  Row 24 `mk`. */
-int sat_thing_masked_cut = 0;    /* sprites dropped by the role cull (~1 s window, row 21 `rc`) */
+int sat_thing_masked_cut = 0;    /* SATURN 2026-08-17: now GRATE COLUMNS HIDDEN behind a nearer VDP1
+				    sprite (~1 s window, row 24 `mk`).  It used to count sprites demoted
+				    to software; that cure was worse than the disease (see the note at
+				    the emit site) and the demotion is gone. */
+/* ⚠ SATURN 2026-08-17: sat_v1spr_sc[] (nearest VDP1 sprite scale per column) lived here to let
+   R_RenderMaskedSegRange hide grate columns behind a monster.  WITHDRAWN the same day on the
+   owner's call -- the test used the sprite's BOUNDING BOX, so the grate also vanished in the
+   transparent margins beside the monster.  Removed rather than left dormant: dead .bss costs the
+   TLSF pool 1:1 and the pool is the binding constraint on this branch.  A precise version must
+   work per ROW; see the note at the withdrawn test in r_segs.c. */
 /* SATURN piste-3 (split thing cull, pad L+Left): in a co-op split, drop sprites that PROJECT to
    near-nothing (tiny xscale) -- each of the N views pays vissprite alloc + sort + VDP1/software emit,
    and a sub-few-px sprite in a 96-row quadrant is invisible.  TWO buckets: SHOOTABLE actors AND
@@ -1960,14 +1969,21 @@ void R_EmitWorldThingsVDP1 (void)
 	   guessing, and guessing the direction IS the bug.  Costs software fill only for sprites that
 	   actually meet a grate; `mk` on row 24 says how many, and if it reads large the depth test
 	   becomes worth the risk. */
-	{
-	    drawseg_t *dsm;
-	    int masked = 0;
-	    for (dsm = ds_p - 1 ; dsm >= drawsegs ; dsm--)
-		if (dsm->maskedtexturecol && dsm->x1 <= spr->x2 && dsm->x2 >= spr->x1)
-		    { masked = 1; break; }
-	    if (masked) { sat_thing_masked_cut++; continue; }   /* vdp1[idx] stays 0 => software draws it */
-	}
+	/* 🔴 SATURN 2026-08-17 -- THE DEMOTION IS GONE, THE GRATE HIDES INSTEAD.  Owner, after
+	   playing the first fix: *"quand un gros sprite de monstre se trouve devant une petite
+	   grille, la grille est visible à travers... le fallback n'est même pas la bonne solution
+	   (car low res visible du monstre en gros plan).  Il vaudrait mieux cacher la grille, elle
+	   n'est qu'à peine visible sur le côté du monstre."*  He is right on both counts.
+	   FIRST, the priority contract says only ONE of the two cases was ever broken: the software
+	   framebuffer NBG1 sits ABOVE the VDP1 sprite layer, so a grate IN FRONT of a monster already
+	   covers it correctly -- by accident, but correctly.  Only "grate BEHIND the monster" is
+	   wrong, and it is wrong every single time, not intermittently.
+	   SECOND, demoting the sprite paid for that one case with a HALF-RES monster filling the
+	   screen (M7 renders 160 columns), which is a worse artefact than the one it fixed, and it
+	   paid on BOTH cases because the old test had no depth test at all.
+	   So: keep the monster on VDP1, and drop the grate columns a NEARER VDP1 sprite covers.
+	   sat_v1spr_sc[] publishes the nearest VDP1 sprite's scale per column; r_segs.c's
+	   R_RenderMaskedSegRange consults it.  Row 24 `mk` now counts HIDDEN GRATE COLUMNS. */
 	if (sat_thing_hook (patch, spr->patch, spr->colormap, R_ThingXlat (spr),
 			    x0s, y0s, x1s, y1s, cx0, cy0, cx1, cy1, (int)(spr->xiscale < 0)))
 	    sat_thing_vdp1[idx] = 1;

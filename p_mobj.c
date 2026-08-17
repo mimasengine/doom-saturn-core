@@ -24,6 +24,7 @@
 
 #include "doomdef.h"
 #include "p_local.h"
+#include "r_parallel.h"   /* SATURN: RP_ThkSpawn* -- row 23 `sp` */
 #include "sounds.h"
 
 #include "st_stuff.h"
@@ -502,8 +503,27 @@ void P_MobjThinker (mobj_t* mobj)
 //
 // P_SpawnMobj
 //
+/* SATURN 2026-08-17 (row 23 `sp`): timing wrapper -- the Z_Malloc below is one of the two candidates
+   for the ~69 ms of `mo` that `mv` and `s` do not explain.  Wrapped, not edited, so the body and its
+   return path stay identical. */
+static mobj_t* P_SpawnMobj_impl (fixed_t, fixed_t, fixed_t, mobjtype_t);
+
 mobj_t*
 P_SpawnMobj
+( fixed_t	x,
+  fixed_t	y,
+  fixed_t	z,
+  mobjtype_t	type )
+{
+    mobj_t*	r;
+    RP_ThkSpawnBegin ();
+    r = P_SpawnMobj_impl (x, y, z, type);
+    RP_ThkSpawnEnd ();
+    return r;
+}
+
+static mobj_t*
+P_SpawnMobj_impl
 ( fixed_t	x,
   fixed_t	y,
   fixed_t	z,
