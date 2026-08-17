@@ -217,93 +217,16 @@ void R_CompositeWindowReset (void)
        Row 22 clears it itself, immediately after printing. */
 }
 
-/* ------------------------------------------------------------------------------------------------
-   SATURN 2026-08-14 -- COMPOSITE PIN.  Measured: `cb13/6` and `cb20/6` = SIX distinct textures
-   rebuilt 13-20 times a second, i.e. each of them destroyed and rebuilt almost every frame, at
-   `k33` a piece.  THRASH, and the working set is tiny.
-
-   They are not purged for lack of room (`zf241k` free) but for lack of CONTIGUITY: every ~32 KB
-   composite alloc has to carve a run and sweeps its neighbours -- which are the composites just
-   built.  Self-sustaining, hence the stable ~5/frame.
-
-   Why this is not the pool that just failed (`lf60`, [[getcolumn-per-call-explosion]]): the slab
-   needed 96 KB CONTIGUOUS up front.  This needs none -- the blocks already exist, they merely stop
-   being purge victims.  And the clause that makes it safe: if a 48 KB run can no longer be found,
-   the whole ring is released at once, so the pin can never cause the ~35 KB sky/face contiguous-OOM
-   that killed the pool.  It yields before it can hurt.
-
-   Tag is PU_LEVEL, not PU_STATIC: non-purgeable, but freed by P_SetupLevel's Z_FreeTags -- so a
-   level change reclaims every pinned composite with no lifecycle code, and Z_Free NULLs the user
-   pointer (`&texturecomposite[tex]`) exactly as the classic purge does.
-   ------------------------------------------------------------------------------------------------ */
-#define R_CPIN_MAX     8
-#define R_CPIN_BUDGET  (64*1024)
-#define R_CPIN_FLOOR   (48*1024)
-
-/* DEFAULT 0 since 2026-08-14, and the reason is arithmetic, not taste.  Shipped ON, it yielded on
-   essentially every build: seven captures read `pn0/1` .. `pn0/25` -- zero KB held, the ring released
-   again and again -- because row-11 `lg` sits at 24-38 KB against the 48 KB floor.  The zone cannot
-   spare a 48 KB run, so the pin never engages; worse, `lg` already dips BELOW the ~35 KB a sky/face
-   patch needs, so relaxing the floor would trade a real crash risk for a pin that still barely holds.
-   Same wall as the 1p slab (`lf60`), reached from the other side.  The chord and the yield counter
-   stay as the witness -- if a future change frees real contiguous zone, `pn` will say so. */
-int			sat_cpin_on   = 0;   /* live A/B, pad L+Left */
-int			r_cpin_kb     = 0;   /* overlay row 22 `pn<kb>/<yields>` */
-int			r_cpin_yield  = 0;   /* times the ring was released under pressure */
-static int		r_cpin_tex[R_CPIN_MAX];
-static byte*		r_cpin_ptr[R_CPIN_MAX];
-static int		r_cpin_sz [R_CPIN_MAX];
-static int		r_cpin_n     = 0;
-static int		r_cpin_bytes = 0;
-
-static void R_CPinDrop (int i)
-{
-    /* Only retag if the composite is still OURS.  After a level change Z_FreeTags has already freed
-       the block and NULLed texturecomposite[tex], so the compare fails and we just drop the slot --
-       no touch, no leak, self-healing without a per-level hook. */
-    if (texturecomposite[r_cpin_tex[i]] == r_cpin_ptr[i])
-	Z_ChangeTag (r_cpin_ptr[i], PU_CACHE);
-    r_cpin_bytes -= r_cpin_sz[i];
-    for (; i < r_cpin_n - 1; i++)
-    {
-	r_cpin_tex[i] = r_cpin_tex[i+1];
-	r_cpin_ptr[i] = r_cpin_ptr[i+1];
-	r_cpin_sz [i] = r_cpin_sz [i+1];
-    }
-    r_cpin_n--;
-    if (r_cpin_bytes < 0) r_cpin_bytes = 0;
-    r_cpin_kb = r_cpin_bytes >> 10;
-}
-
-void R_CompositePinFlush (void)
-{
-    while (r_cpin_n)
-	R_CPinDrop (0);
-    r_cpin_bytes = 0;
-    r_cpin_kb    = 0;
-}
-
-static void R_CPinAdd (int texnum, byte *block, int size)
-{
-    int i;
-
-    if (size <= 0 || size > R_CPIN_BUDGET)
-	return;				/* one composite bigger than the whole budget: never pin it */
-
-    for (i = 0; i < r_cpin_n; i++)	/* rebuilt in place -> refresh its slot, do not double-count */
-	if (r_cpin_tex[i] == texnum) { R_CPinDrop (i); break; }
-
-    while (r_cpin_n && (r_cpin_n >= R_CPIN_MAX || r_cpin_bytes + size > R_CPIN_BUDGET))
-	R_CPinDrop (0);			/* oldest out first */
-
-    r_cpin_tex[r_cpin_n] = texnum;
-    r_cpin_ptr[r_cpin_n] = block;
-    r_cpin_sz [r_cpin_n] = size;
-    r_cpin_n++;
-    r_cpin_bytes += size;
-    r_cpin_kb = r_cpin_bytes >> 10;
-    Z_ChangeTag (block, PU_LEVEL);
-}
+/* (SATURN COMPOSITE PIN -- DELETED 2026-08-17.  Not "measured dead": UNREACHABLE BY CONSTRUCTION.
+   `sat_cpin_on` was initialised to 0 and nothing anywhere ever wrote it -- pad L+Left, its only
+   writer, was retargeted to the patch-lump pin the same day -- so R_CPinAdd could not run even if
+   someone wanted it to.  It was already inert before that: its 48 KB floor stood against a measured
+   `lg` of 17-32 KB, and seven captures read `pn0/1`..`pn0/25`, i.e. zero KB held, all summer.
+   Its lesson is not lost, it is CASHED: the pin shape -- no contiguous run needed, the blocks
+   already exist and merely stop being purge victims -- is exactly what the patch-lump pin below is
+   built on, and that one holds 57-127 KB on hardware.  What is deleted is 500 bytes of code that
+   could never execute, on a target where dead code costs the TLSF pool 1:1 and the pre-flight had
+   just refused the build at 4.88 KB. */
 
 /* ------------------------------------------------------------------------------------------------
    🔴 SATURN 2026-08-17 -- THE PATCH-LUMP PIN.  The chain closed on this date, one measurement per link:
@@ -327,7 +250,12 @@ static void R_CPinAdd (int texnum, byte *block, int size)
    floor clears it with headroom against the measured `lg`.  The flatten bought no fps; it bought
    THIS.
    ------------------------------------------------------------------------------------------------ */
-#define R_LPIN_MAX     16          /* 12 -> 16: what the 128 KB rung can actually hold             */
+/* 🔴 16 -> 32 (2026-08-17): the ARRAY size, i.e. the ceiling of the live slot rung below.  The 128 KB
+   run failed while capped at 16 slots, and 122 KB across 16 slots is a 7,6 KB average -- so the SLOT
+   COUNT, not the budget, was the plausible binding limit and the run could not tell them apart.
+   Making both move together on the same chord is what closes that in ONE console pass instead of
+   two, which is the whole point after a day of console budget was spent on an unreadable A/B. */
+#define R_LPIN_MAX     32
 /* 🔴 2026-08-17, FOURTH hardware run (64 s of TNT MAP11 on console) -- the budget is now a LIVE
    3-WAY A/B on pad L+Left, because the two numbers that decide it point opposite ways and only the
    console can arbitrate:
@@ -407,11 +335,20 @@ void R_LumpPinFlush (void)
     r_lpin_kb    = 0;
 }
 
-/* The live rung behind pad L+Left.  A function, not a variable, so the only writer of the A/B state
-   stays `sat_lpin_on` -- one flag, one subject. */
+/* The live rung behind pad L+Left.  Functions, not variables, so the only writer of the A/B state
+   stays `sat_lpin_on` -- one flag, one subject ([[code-coherence-challenge]]).
+   The rung moves BOTH limits together, because the previous run proved they cannot be told apart
+   one at a time: rung 2 held 122 KB in at most 16 slots and it was never knowable whether the
+   budget or the slot count was what bound it.
+     rung 1 = 64 KB / 16 slots   (default, the known-good pair)
+     rung 2 = 128 KB / 32 slots  (the capacity test, done properly this time) */
 static int R_LPinBudget (void)
 {
     return (sat_lpin_on >= 2) ? (128*1024) : (64*1024);
+}
+static int R_LPinSlots (void)
+{
+    return (sat_lpin_on >= 2) ? R_LPIN_MAX : (R_LPIN_MAX / 2);
 }
 
 /* Called ONLY after a fault (the lump was not resident and we just read it from the disc), so the
@@ -442,7 +379,7 @@ static void R_LPinAdd (int lump, byte *block, int size)
 
     /* Counted HERE, not inside R_LPinDrop: the flush and the floor guard also drop entries and they
        are different events.  This one means "the ring was full and something had to go". */
-    while (r_lpin_n && (r_lpin_n >= R_LPIN_MAX || r_lpin_bytes + size > budget))
+    while (r_lpin_n && (r_lpin_n >= R_LPinSlots () || r_lpin_bytes + size > budget))
     {
 	r_lpin_evict++;
 	R_LPinDrop (0);				/* oldest out first */
@@ -697,18 +634,9 @@ void R_GenerateComposite (int texnum)
     }
 
     // Now that the texture is built it is purgable from the zone.
-    /* SATURN 2026-08-14: PIN instead of demote, while the zone can still hand out a 48 KB run.
-       Z_CanAllocate early-exits on the first run that fits, so the healthy case is cheap (`zw`
-       measures it: ~0,2 ms a frame).  The moment it cannot, release the WHOLE ring in one go and
-       fall back to the classic purgeable composite -- the pin yields before it can starve the
-       ~35 KB sky/face patches, which is exactly what the 1p slab could not do. */
-    if (sat_cpin_on && Z_CanAllocate (R_CPIN_FLOOR))
-	R_CPinAdd (texnum, block, texturecompositesize[texnum]);
-    else
-    {
-	if (r_cpin_n) { R_CompositePinFlush (); r_cpin_yield++; }
-	Z_ChangeTag (block, PU_CACHE);
-    }
+    /* (the composite-pin branch that stood here went with the pin itself -- it was gated on a flag
+       nothing could set.  What remains is the classic demote, which is what actually ran.) */
+    Z_ChangeTag (block, PU_CACHE);
 
     // SATURN R4: unpin the directory -- purgeable again.
     Z_ChangeTag (texturecolumnlump[texnum], PU_CACHE);

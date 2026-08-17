@@ -735,7 +735,20 @@ static void rp_slave_wrapper(void *arg) { (void)arg; rp_slave_body(); }
    never starts (the SGL slave-scheduler-after-idle quirk: e.g. an M7->M4 mode switch re-arming the
    masked-split -- the reported freeze).  Bound by the FRT (real wall clock) instead.  rp_timeout_count
    (shown on the overlay) tallies every fallback, so a persistently-dead slave is visible, not silent. */
-#define RP_WAIT_TIMEOUT_FRT 5376u   /* ~24ms @ ~224 FRT ticks/ms: > any live slave half, << a frame-hang */
+/* 🔴 24 ms -> 100 ms, 2026-08-17.  "> any live slave half" was written when a frame was a few tens
+   of milliseconds.  Console frames now run 200-550 ms, the slave's masked half scales with them, and
+   `to0:0090` -> `to2:0090` says the MASKED site (and only that site) is firing: cumulative 9+, live
+   rate 2.  Every one of those is a frame of masked sprites deliberately NOT drawn (see RP_WaitMasked
+   -- the fallback is cosmetic BY DESIGN and must stay that way).  So the timeout was almost certainly
+   cutting off a slave that was merely SLOW, not dead, and paying for it in dropped sprites.
+   100 ms still does the one job this constant exists for -- never a 26 s wedge -- and stays well
+   under the 293 ms at which the 16-bit FRT delta wraps and would read as an INSTANT timeout.
+   ⚠ Raising it means a genuinely dead slave now costs 100 ms per site instead of 24.  That trade is
+   only defensible because the next line MEASURES the wait: `mw` on row 5 is the max any site waited
+   this window.  `mw` ~30 => the old 24 ms was marginal and this fixed real dropped sprites; `mw`
+   pinned at 100 => the slave really is dying and that is a different bug, now visible instead of
+   hidden behind a counter that only said "it happened". */
+#define RP_WAIT_TIMEOUT_FRT 22400u  /* ~100 ms @ ~224 FRT ticks/ms */
 /* SATURN 2026-07-31: rp_timeout_count is a SINGLE aggregate over five call sites and is NEVER
    reset, so "it climbs" could not distinguish a level-load burst from a steady leak, and could not
    say WHICH wait failed -- it cannot support any conclusion on its own.  Tally per site too; the
@@ -758,19 +771,30 @@ int rp_to_site[RP_TO_SITES] = { 0, 0, 0, 0 };
    drops from millions/s to ~140k/s.  A job already finished still returns on the FIRST test, so
    the common case (the clear, joined late) pays literally nothing. */
 #define RP_SPIN_PAUSE 64
+/* 🔴 HOW LONG the master actually waited, max over the window, all sites (row 5 `mw`, ms).  `to`
+   only ever said "a wait hit the ceiling" -- it could not say whether the ceiling was 1 ms too low
+   or 200, which is exactly the question raising it asks.  Recorded on the SUCCESS path too: a wait
+   that returns at 30 ms tells us more than one that times out, because it proves the slave lives. */
+unsigned short rp_wait_mx = 0;
 static int rp_wait(volatile int *flag, int site)
 {
     unsigned short t0 = rp_frt();
-    while (!*flag) {
+    unsigned short el;
+    for (;;) {
         int k;
-        if ((unsigned short)(rp_frt() - t0) >= RP_WAIT_TIMEOUT_FRT) {
+        el = (unsigned short)(rp_frt() - t0);
+        if (*flag) {
+            if (el > rp_wait_mx) rp_wait_mx = el;
+            return 1;
+        }
+        if (el >= RP_WAIT_TIMEOUT_FRT) {
+            rp_wait_mx = el;                 /* the ceiling itself -- always the window max */
             rp_timeout_count++;
             if ((unsigned int)site < (unsigned int)RP_TO_SITES) rp_to_site[site]++;
             return 0;
         }
         for (k = RP_SPIN_PAUSE ; k > 0 ; k--) __asm__ volatile ("nop");
     }
-    return 1;
 }
 
 /* TEST (2026-06-15): 0 = disable the manual GBR+72 reset, to confirm it is what
@@ -2651,7 +2675,12 @@ static void rp_p3_prof_show(void)
        (Replaces the old DERIVED SLVi 'i', which used a different base (render, not MST) and assumed
        the slave was busy through all of P -> it never summed to 100 with b and misled.) */
     if (sat_dbg_overlay_mode == 0) {
-        snprintf(p, sizeof p, "SLV b%u%% id%u%% Pb%u%% w%u.%u ", busy_pct, idle_pct, pb_pct, w10/10, w10%10);
+        /* `mw` = the LONGEST the master waited for the slave this window, ms, any site.  Read it
+           against RP_WAIT_TIMEOUT_FRT (100 ms): pinned at the ceiling = a dying slave, well under =
+           the ceiling is doing no harm.  It is what `to` could never say. */
+        snprintf(p, sizeof p, "SLV b%u%% id%u%% Pb%u%% w%u.%u mw%u  ",
+                 busy_pct, idle_pct, pb_pct, w10/10, w10%10, (unsigned int)(rp_wait_mx / 224u));
+        rp_wait_mx = 0;
         dbg_print(0, 5, p);
         /* row 20 -- the Bp DECOMPOSITION, all of it describing the frame that set `PK Bp` on row 4.
            `r` = the per-SEG routing preamble (CPU/VDP1 tier choice, hysteresis, clamp, perspective
