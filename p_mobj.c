@@ -24,7 +24,6 @@
 
 #include "doomdef.h"
 #include "p_local.h"
-#include "r_parallel.h"   /* SATURN: RP_ThkSpawn* -- row 23 `sp` */
 #include "sounds.h"
 
 #include "st_stuff.h"
@@ -503,27 +502,13 @@ void P_MobjThinker (mobj_t* mobj)
 //
 // P_SpawnMobj
 //
-/* SATURN 2026-08-17 (row 23 `sp`): timing wrapper -- the Z_Malloc below is one of the two candidates
-   for the ~69 ms of `mo` that `mv` and `s` do not explain.  Wrapped, not edited, so the body and its
-   return path stay identical. */
-static mobj_t* P_SpawnMobj_impl (fixed_t, fixed_t, fixed_t, mobjtype_t);
-
+/* (SATURN row-23 `sp` REMOVED 2026-08-17, same day it was added, because it ANSWERED: console read
+   `sp0,5/3` .. `sp0,8/4` -- three or four spawns a frame, under a millisecond.  The "Z_Malloc per
+   puff and blood splat" hypothesis is dead and no mobj_t free list is warranted.  The probe is gone
+   rather than left printing a zero: a wrapper on the spawn path is not free, and dead code costs the
+   TLSF pool 1:1 on this target.) */
 mobj_t*
 P_SpawnMobj
-( fixed_t	x,
-  fixed_t	y,
-  fixed_t	z,
-  mobjtype_t	type )
-{
-    mobj_t*	r;
-    RP_ThkSpawnBegin ();
-    r = P_SpawnMobj_impl (x, y, z, type);
-    RP_ThkSpawnEnd ();
-    return r;
-}
-
-static mobj_t*
-P_SpawnMobj_impl
 ( fixed_t	x,
   fixed_t	y,
   fixed_t	z,

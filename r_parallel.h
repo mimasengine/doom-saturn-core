@@ -111,11 +111,13 @@ extern unsigned int sat_thk_n;           /* thinkers RUN -- "many" vs "expensive
 /* round 2: carve the ~69 ms of `mo` that `mv` and `s` do not explain (see r_parallel.c). */
 void RP_ThkPathBegin(void);
 void RP_ThkPathEnd(void);
-void RP_ThkSpawnBegin(void);
-void RP_ThkSpawnEnd(void);
+void RP_ThkSubsecBegin(void);            /* round 3: inside P_CheckPosition -- both SUBSETS of `mv` */
+void RP_ThkSubsecEnd(void);
+void RP_ThkBlkBegin(void);
+void RP_ThkBlkEnd(void);
 extern unsigned int sat_thk_path_frt;    /* P_PathTraverse -- hitscan shots, NOT part of `mv`      */
-extern unsigned int sat_thk_spawn_frt;   /* P_SpawnMobj (the Z_Malloc): puffs, blood, drops        */
-extern unsigned int sat_thk_spawn_n;     /* ...and how many: expensive vs merely frequent          */
+extern unsigned int sat_thk_sub_frt;     /* R_PointInSubsector: the BSP descent inside `mv`        */
+extern unsigned int sat_thk_blk_frt;     /* the THINGS blockmap loop inside `mv`                   */
 extern unsigned int sat_tic_avail;       /* d_loop.c: tics TryRunTics ELECTED to run -- `a` vs `x` says
                                             whether the lost tics were never built or built-then-skipped */
 extern unsigned int sat_tic_built;       /* d_loop.c: tics NetUpdate WANTED (`newtics`) -- row 24 `b` */

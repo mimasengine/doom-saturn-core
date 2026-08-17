@@ -1392,32 +1392,49 @@ void RP_ThkMoveEnd   (void) { sat_thk_move_frt += (unsigned short)(rp_frt() - th
      pt = P_PathTraverse -- the blockmap/BSP traversal behind every HITSCAN shot (P_AimLineAttack,
           P_LineAttack, P_UseLines).  It is NOT inside `mv`: `mv` is P_CheckPosition, which shots
           never call.  A firefight fires several of these per tic per monster.
-     sp = P_SpawnMobj -- every puff, every blood splat, every dropped item, each one a Z_Malloc on a
-          zone holding 164-180 KB free in 22-32 KB runs.  SPAWN only, not P_RemoveMobj: removal does
-          NOT free anything (it flags the thinker and P_RunThinkers' own loop calls Z_Free next tic),
-          so the free already sits in `th - mo`, which measures 11 ms and is not the problem.
-          Counted as well as timed (`sp<ms>/<calls>`), because "expensive" and "merely frequent" need
-          opposite fixes: a fixed-size mobj_t free list kills the first and does nothing for the
-          second.
-   ⚠ `sp` is a SUBSET of `pt` whenever the spawn happens in a shot's callback (P_SpawnPuff), so the
-   two must never be added -- read each against `mo`.
+     sp = P_SpawnMobj -- the Z_Malloc per puff and blood splat.
+   VERDICT, same day, one console run: **`pt` CONFIRMED but minor** (10-13 ms, and exactly 0,0 when
+   not shooting -- the probe is right, the seam is small); **`sp` REFUTED and REMOVED** (`sp0,5/3` ..
+   `sp0,8/4`: three spawns a frame, under a millisecond).  No mobj_t free list is warranted.
+
+   🔴 ROUND 3 -- SPLIT `mv`, because it is now the biggest single item in the WHOLE frame:
+   at 95 s the console read `R66` against `T148` with `mv66,0` -- the blockmap check alone costs as
+   much as the entire renderer.  Two brackets INSIDE P_CheckPosition, so both are subsets of `mv`:
+     sb = R_PointInSubsector -- a full BSP DESCENT, ~10-15 node dereferences into the nodes array,
+          paid once per call before any collision work happens.  Structurally the most suspicious
+          line in the function and never once timed.
+     bt = the THINGS blockmap double loop (P_BlockThingsIterator/PIT_CheckThing) -- the one that
+          walks every corpse and item still linked into the block.
+   `mv - sb - bt` is then the LINES loop, by subtraction.  Three terms, two probes.
+   ⚠ Chosen over guessing on purpose: [[budget-before-mechanism]] -- write the subtraction before
+   naming the cause.  Every hypothesis this session that survived started from a number on screen.
+
    Depth-guarded: only the OUTERMOST call is timed, so a nested traversal can never corrupt the
    accumulator with a stale t0 (the failure that makes a probe quietly print fiction).
+   ⚠ Resolution: one FRT tick is 4,47 us, so a bracket around a call that costs ~15 us carries
+   ±1 tick of truncation.  It averages out over the hundreds of calls summed per frame, but a
+   PER-CALL figure derived from these is good to ~20 %, not better.
    DoomJo-safe: plain C, two timer reads per call. */
-unsigned int sat_thk_path_frt = 0, sat_thk_spawn_frt = 0, sat_thk_spawn_n = 0;
-static unsigned short thk_pt_t0, thk_sp_t0;
-static int            thk_pt_depth = 0, thk_sp_depth = 0;
+unsigned int sat_thk_path_frt = 0, sat_thk_sub_frt = 0, sat_thk_blk_frt = 0;
+static unsigned short thk_pt_t0, thk_sb_t0, thk_bk_t0;
+static int            thk_pt_depth = 0, thk_sb_depth = 0, thk_bk_depth = 0;
 void RP_ThkPathBegin (void) { if (!thk_pt_depth++) thk_pt_t0 = rp_frt(); }
 void RP_ThkPathEnd   (void)
 {
     if (--thk_pt_depth <= 0)
     { thk_pt_depth = 0; sat_thk_path_frt += (unsigned short)(rp_frt() - thk_pt_t0); }
 }
-void RP_ThkSpawnBegin (void) { sat_thk_spawn_n++; if (!thk_sp_depth++) thk_sp_t0 = rp_frt(); }
-void RP_ThkSpawnEnd   (void)
+void RP_ThkSubsecBegin (void) { if (!thk_sb_depth++) thk_sb_t0 = rp_frt(); }
+void RP_ThkSubsecEnd   (void)
 {
-    if (--thk_sp_depth <= 0)
-    { thk_sp_depth = 0; sat_thk_spawn_frt += (unsigned short)(rp_frt() - thk_sp_t0); }
+    if (--thk_sb_depth <= 0)
+    { thk_sb_depth = 0; sat_thk_sub_frt += (unsigned short)(rp_frt() - thk_sb_t0); }
+}
+void RP_ThkBlkBegin (void) { if (!thk_bk_depth++) thk_bk_t0 = rp_frt(); }
+void RP_ThkBlkEnd   (void)
+{
+    if (--thk_bk_depth <= 0)
+    { thk_bk_depth = 0; sat_thk_blk_frt += (unsigned short)(rp_frt() - thk_bk_t0); }
 }
 static unsigned short prof_begin, prof_recend, prof_wait;
 /* SATURN PERF 2.4 Stage 0: split REC into BSP / planes / masked sub-times to
