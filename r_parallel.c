@@ -1929,6 +1929,10 @@ static void RP_RecordSpan(void)
 
 void RP_BeginFrame(void)
 {
+    /* SATURN 2026-08-16: the drawseg budget is PER VIEW, and this is the one call every view makes
+       before its BSP walk -- so a split-screen player cannot inherit the previous view's spend.
+       Outside RP_PROF on purpose: the budget is a shipping feature, not instrumentation. */
+    sat_seg_count = 0;
     /* SATURN PERF 2.3: low-detail (detailshift!=0) now runs through the parallel
        path too (rp_exec dispatches to the *_low executors).  Previously this
        bailed to fully-serial master rendering, so low-detail had no working
@@ -2266,6 +2270,13 @@ static void rp_p3_prof_show(void)
                 sat_gov_debt = GOV_REL10;
         }
         sat_lod_eff = gov_rung[sat_lod_auto_step & 3];
+        /* SATURN 2026-08-16: the SAME rung also bounds the drawseg COUNT.  Sized on the hardware
+           capture that motivated it -- `ds118` at `Bp110,8` -- so rung 1 barely bites on a normal
+           view (measured ds5-30 in open play) and only the crowded frames pay.  0 = unbounded. */
+        {
+            static const int gov_segb[4] = { 0, 96, 64, 40 };
+            sat_seg_budget = gov_segb[sat_lod_auto_step & 3];
+        }
     }
 
     if (rend <= RP_REC_SANE) {

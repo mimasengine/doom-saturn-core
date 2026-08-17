@@ -100,5 +100,17 @@ extern unsigned int sat_tic_total_frt;   /* TryRunTics,    cumulative FRT ticks 
 extern unsigned int sat_tic_think_frt;   /* P_RunThinkers, cumulative FRT ticks */
 extern unsigned int sat_tic_sight_frt;   /* P_CrossBSPNode, cumulative FRT ticks */
 extern unsigned int sat_tic_runs;        /* P_RunThinkers CALLS = tics run; divides `th` into cost x count */
+extern unsigned int sat_tic_avail;       /* d_loop.c: tics TryRunTics ELECTED to run -- `a` vs `x` says
+                                            whether the lost tics were never built or built-then-skipped */
+extern unsigned int sat_tic_built;       /* d_loop.c: tics NetUpdate WANTED (`newtics`) -- row 24 `b` */
+extern int sat_thing_masked_cut;         /* r_things.c: sprites sent back to software for a grate -- `mk` */
+
+/* SATURN 2026-08-16 -- DRAWSEG BUDGET (defined in r_segs.c, driven by the governor in r_parallel.c,
+   spent in R_StoreWallRange, reset per view in RP_BeginFrame).  Bounds the NUMBER of textured segs,
+   which is what `Bp` actually scales with (`ds118` at `Bp110,8`); the area rung bounds their SIZE.
+   Past the budget a seg draws FLAT -- never skipped, or solidsegs would leave a see-through hole. */
+extern int sat_seg_budget;       /* textured segs allowed per view, 0 = unbounded */
+extern int sat_seg_count;        /* segs stored so far this view                  */
+extern int sat_seg_budget_cut;   /* ~1 s tally of segs flattened by the budget    */
 
 #endif

@@ -277,6 +277,12 @@ int sat_wall_lod_near  = 0;
    no manual rung and no chord any more -- the governor is unconditional (owner 2026-08-16). */
 int sat_lod_eff        = 0;
 int sat_lod_auto_step  = 0;     /* 0..3, index into the governor's rung table                   */
+/* SATURN 2026-08-16 -- drawseg budget, the COUNT half of the `B` axis (see R_StoreWallRange).
+   `sat_seg_budget` = textured segs allowed per view, 0 = unbounded.  `sat_seg_count` is reset
+   per view in RP_BeginFrame; `sat_seg_budget_cut` is the ~1 s window tally on row 21 `sb`. */
+int sat_seg_budget     = 0;
+int sat_seg_count      = 0;
+int sat_seg_budget_cut = 0;
 /* SIGNED integral of (render - target) in tenths of a ms: >0 = behind, <0 = ahead.  A single
    accumulator with NO cross-reset -- two counters that reset each other could never fill on a
    bimodal load, which is why the governor never fired before 2026-08-16. */
@@ -1843,6 +1849,27 @@ void R_RenderSegLoop (void)
 	    else
 		sat_wall_lod_near++;
 	}
+    }
+    /* 🔴 SATURN 2026-08-16 -- THE DRAWSEG BUDGET.  The area rung above degrades walls that are
+       SMALL; hardware says the frames that hurt are the ones with MANY (`Bp110,8` over `ds118` =
+       ~0,9 ms per drawseg, on a 181 ms frame).  A rung sized on area cannot see that: 118 walls
+       each above the threshold cost 110 ms and the governor keeps electing an axis that refuses
+       to bite.  So bound the COUNT as well as the size.
+       ⚠ This never removes a wall -- it removes its TEXTURING.  Skipping a solid wall outright
+       would leave solidsegs open and the visplanes behind it unclosed: a see-through hole, not a
+       degradation.  Everything past the budget takes the same `lod_flat` path the area rung
+       already uses and that is already shipped, so the wall is still drawn, still clips, still
+       marks its planes -- flat-shaded instead of textured, which reads as distance haze.
+       Segs arrive front-to-back from the BSP, so a plain counter spends the budget NEAR-FIRST and
+       the far walls are the ones that flatten -- the owner's rule, and the opposite of the mistake
+       that killed the VDP1 wall offload ([[wall-offload-vdp1-slave-dead]]).  The distance floor
+       applies here too: nothing inside sat_lod_mindist ever flattens, however crowded the frame. */
+    sat_seg_count++;
+    if (!lod_flat && sat_seg_budget > 0 && sat_seg_count > sat_seg_budget
+	&& (rw_distance >> FRACBITS) > sat_lod_mindist)
+    {
+	lod_flat = 1;
+	sat_seg_budget_cut++;
     }
     if (lod_flat) sat_wall_lod_hits++;
     int io_flat_mid = midtexture    ? (lod_flat || sat_wall_io_flat (midtexture))    : 0;

@@ -631,6 +631,21 @@ void R_GenerateLookup (int texnum)
 	{
 	    r_patch_ovf++;
 	    Z_Free (patchcount);
+	    /* 🔴 SATURN 2026-08-16 -- "R_EnsureLookup retries on a later frame" WAS NOT TRUE, and it
+	       is the owner's missing wall: *"c'est toujours le même mur qui manque à cet endroit"*.
+	       R_EnsureLookup returns early when BOTH directories are non-NULL -- and they are, it
+	       allocated them itself two lines before calling us.  So this bail left the PRE-SEEDED
+	       directory (collump=-1, colofs=0 = "composite at offset 0") in place with
+	       texturecompositesize still 0, PERMANENTLY: R_GetColumn then took the composite path,
+	       the out-of-range guard refused every column, and the wall drew as the placeholder for
+	       the rest of the level.  Measured `ob26` on three hardware captures out of four,
+	       travelling with `px4` exactly as this path predicts.
+	       Destroy the directory so the retry the comment promised can actually happen -- the
+	       blocks carry registered user pointers, so Z_Free NULLs texturecolumn{lump,ofs}[texnum]
+	       and the next R_EnsureLookup rebuilds from scratch.  (Third instance today of the same
+	       defect shape: LATCHING A FAILURE. The sky did it, sky_loaded_tex did it, this does it.) */
+	    if (texturecolumnlump[texnum]) Z_Free (texturecolumnlump[texnum]);
+	    if (texturecolumnofs[texnum])  Z_Free (texturecolumnofs[texnum]);
 	    RP_StampEnd (1);
 	    return;
 	}
@@ -757,8 +772,11 @@ static void R_EnsureLookup (int tex)
     else
 	Z_ChangeTag (texturecolumnofs[tex],  PU_STATIC);
     R_GenerateLookup (tex);			  // fills both + compositesize; safe while PU_STATIC
-    Z_ChangeTag (texturecolumnlump[tex], PU_CACHE);
-    Z_ChangeTag (texturecolumnofs[tex],  PU_CACHE);
+    /* SATURN 2026-08-16: R_GenerateLookup's garde-PATCH bail now DESTROYS both directories so the
+       failure is not latched (see the note there), so either may be NULL on return -- Z_ChangeTag
+       on NULL is the "block without a ZONEID" fatal this function's own comment above warns about. */
+    if (texturecolumnlump[tex]) Z_ChangeTag (texturecolumnlump[tex], PU_CACHE);
+    if (texturecolumnofs[tex])  Z_ChangeTag (texturecolumnofs[tex],  PU_CACHE);
 }
 
 

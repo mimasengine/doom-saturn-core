@@ -114,6 +114,13 @@ static boolean local_playeringame[NET_MAXPLAYERS];
 static int player_class;
 
 
+/* SATURN: tics TryRunTics elected to run, accumulated; row 24 `a`.  See the note at its update. */
+unsigned int sat_tic_avail = 0;
+/* SATURN: tics NetUpdate WANTED to build (its own `newtics`), accumulated -- row 24 `b`.
+   `b` ~= 0,583*v with `a` far below  ==> BuildNewTic refused them and `lasttime` ate them.
+   `b` ~= `a`, both below 0,583*v      ==> GetAdjustedTime never advanced: the clock, after all. */
+unsigned int sat_tic_built = 0;
+
 // 35 fps clock adjusted by offsetms milliseconds
 
 static int GetAdjustedTime(void)
@@ -264,6 +271,7 @@ void NetUpdate (void)
 
     // build new ticcmds for console player
 
+    sat_tic_built += (unsigned int)(newtics > 0 ? newtics : 0);
     for (i=0 ; i<newtics ; i++)
     {
         if (!BuildNewTic())
@@ -804,6 +812,20 @@ void TryRunTics (void)
 
     if (counts < 1)
 	counts = 1;
+
+    /* 🔴 SATURN 2026-08-16 -- WHERE DO THE TICS GO?  Row 24 `x` says the game advances ~1/3 as fast
+       as it should (x1,3 at 9,7 fps where 35 Hz owes 3,6), and `v6,1` proves the millisecond clock
+       is HEALTHY -- so the tics are being DISCARDED, not mis-timed.  There are exactly two places
+       that can do it, and this counter separates them in one capture:
+         `a` ~= elapsed (0,583 x v) and `x` << `a`  ==> the tics were BUILT and TryRunTics decided
+                                                        to run them, but P_Ticker returned early
+                                                        (paused / menu) -- look there.
+         `a` ~= `x` << elapsed                      ==> they were never BUILT: NetUpdate broke out
+                                                        of its loop on BuildNewTic's +8 cap, and it
+                                                        had ALREADY advanced `lasttime` past them,
+                                                        so they are gone for good.
+       Accumulated raw; the platform divides by the window's frame count. */
+    sat_tic_avail += (unsigned int)counts;
 
     // wait for new tics if needed
 

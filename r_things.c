@@ -185,7 +185,10 @@ int sat_near_sprites = 1;
    Distance is in MAP UNITS and bounds the NON-ENGAGED world only. */
 int sat_thing_role_cull = 1;
 int sat_thing_cull_dist = 1024;
-int sat_thing_role_cut  = 0;    /* sprites dropped by the role cull (~1 s window, row 21 `rc`) */
+int sat_thing_role_cut  = 0;
+/* SATURN: sprites handed back to the software path because a masked midtexture (grate) overlapped
+   them -- VDP1 things and NBG1 midtextures have FIXED relative priority and cannot z-sort.  Row 24 `mk`. */
+int sat_thing_masked_cut = 0;    /* sprites dropped by the role cull (~1 s window, row 21 `rc`) */
 /* SATURN piste-3 (split thing cull, pad L+Left): in a co-op split, drop sprites that PROJECT to
    near-nothing (tiny xscale) -- each of the N views pays vissprite alloc + sort + VDP1/software emit,
    and a sub-few-px sprite in a 96-row quadrant is invisible.  TWO buckets: SHOOTABLE actors AND
@@ -1944,6 +1947,27 @@ void R_EmitWorldThingsVDP1 (void)
 	cy0 = vtop + viewwindowy;
 	cy1 = vbot + viewwindowy;
 
+	/* 🔴 SATURN 2026-08-16 -- GRATES vs MONSTERS, owner-reported: *"quand la grille est derrière
+	   le monstre, on la voit à travers le monstre. Quand la grille est devant le monstre, le
+	   monstre cache la grille."*  Structural, not a rounding bug: world things live on VDP1
+	   (sprite priority 5) while masked midtextures are drawn into the NBG1 software framebuffer
+	   (priority 6).  That order is FIXED in hardware, so the two surfaces cannot z-sort against
+	   each other -- one of the two cases is always wrong, whichever way the priorities are set.
+	   Hand the sprite back to the software path instead: in NBG1 it sits beside the grate and
+	   Doom's own vissprite/drawseg sort decides, which is right in BOTH directions.
+	   ⚠ DELIBERATELY CONSERVATIVE -- x-overlap is enough, no depth test.  The owner's two halves
+	   point opposite ways under the fixed-priority model, so picking a direction here would be
+	   guessing, and guessing the direction IS the bug.  Costs software fill only for sprites that
+	   actually meet a grate; `mk` on row 24 says how many, and if it reads large the depth test
+	   becomes worth the risk. */
+	{
+	    drawseg_t *dsm;
+	    int masked = 0;
+	    for (dsm = ds_p - 1 ; dsm >= drawsegs ; dsm--)
+		if (dsm->maskedtexturecol && dsm->x1 <= spr->x2 && dsm->x2 >= spr->x1)
+		    { masked = 1; break; }
+	    if (masked) { sat_thing_masked_cut++; continue; }   /* vdp1[idx] stays 0 => software draws it */
+	}
 	if (sat_thing_hook (patch, spr->patch, spr->colormap, R_ThingXlat (spr),
 			    x0s, y0s, x1s, y1s, cx0, cy0, cx1, cy1, (int)(spr->xiscale < 0)))
 	    sat_thing_vdp1[idx] = 1;
