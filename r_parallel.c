@@ -1439,15 +1439,35 @@ void RP_ThkMoveEnd   (void) { sat_thk_move_frt += (unsigned short)(rp_frt() - th
    ±1 tick of truncation.  It averages out over the hundreds of calls summed per frame, but a
    PER-CALL figure derived from these is good to ~20 %, not better.
    DoomJo-safe: plain C, two timer reads per call. */
-unsigned int sat_thk_path_frt = 0, sat_thk_sub_frt = 0, sat_thk_blk_frt = 0;
-static unsigned short thk_pt_t0, thk_sb_t0, thk_bk_t0;
-static int            thk_pt_depth = 0, thk_sb_depth = 0, thk_bk_depth = 0;
-void RP_ThkPathBegin (void) { if (!thk_pt_depth++) thk_pt_t0 = rp_frt(); }
-void RP_ThkPathEnd   (void)
+unsigned int sat_thk_phys_frt = 0, sat_thk_state_frt = 0, sat_thk_sect_frt = 0;
+unsigned int sat_thk_sub_frt = 0, sat_thk_blk_frt = 0, sat_r_setup_frt = 0;
+static unsigned short thk_ph_t0, thk_sm_t0, thk_sc_t0, thk_sb_t0, thk_bk_t0, r_su_t0;
+static int            thk_ph_depth = 0, thk_sm_depth = 0, thk_sc_depth = 0,
+                      thk_sb_depth = 0, thk_bk_depth = 0;
+void RP_ThkPhysBegin  (void) { if (!thk_ph_depth++) thk_ph_t0 = rp_frt(); }
+void RP_ThkPhysEnd    (void)
 {
-    if (--thk_pt_depth <= 0)
-    { thk_pt_depth = 0; sat_thk_path_frt += (unsigned short)(rp_frt() - thk_pt_t0); }
+    if (--thk_ph_depth <= 0)
+    { thk_ph_depth = 0; sat_thk_phys_frt += (unsigned short)(rp_frt() - thk_ph_t0); }
 }
+void RP_ThkStateBegin (void) { if (!thk_sm_depth++) thk_sm_t0 = rp_frt(); }
+void RP_ThkStateEnd   (void)
+{
+    if (--thk_sm_depth <= 0)
+    { thk_sm_depth = 0; sat_thk_state_frt += (unsigned short)(rp_frt() - thk_sm_t0); }
+}
+void RP_ThkSectBegin  (void) { if (!thk_sc_depth++) thk_sc_t0 = rp_frt(); }
+void RP_ThkSectEnd    (void)
+{
+    if (--thk_sc_depth <= 0)
+    { thk_sc_depth = 0; sat_thk_sect_frt += (unsigned short)(rp_frt() - thk_sc_t0); }
+}
+/* The one term OUTSIDE the game tic: R_RenderPlayerView's pre-BSP setup (the slave-clear join,
+   R_SetupFrame, R_PostFlatCacheFrame).  Row 1 `R` is DERIVED (MST - T - S - b - dg) while
+   Bw/Bp/P/M are measured, and the two differ by ~11,6 ms.  This says whether that is a real phase
+   or just the slop of a derived number -- the only honest way to close the last gap. */
+void RP_RSetupBegin   (void) { r_su_t0 = rp_frt(); }
+void RP_RSetupEnd     (void) { sat_r_setup_frt += (unsigned short)(rp_frt() - r_su_t0); }
 void RP_ThkSubsecBegin (void) { if (!thk_sb_depth++) thk_sb_t0 = rp_frt(); }
 void RP_ThkSubsecEnd   (void)
 {

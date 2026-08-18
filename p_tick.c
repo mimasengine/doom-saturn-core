@@ -123,7 +123,14 @@ void P_RunThinkers (void)
 		    RP_ThkMobjEnd ();
 		}
 		else
+		{
+		    /* SATURN 2026-08-18 (row 24 `sc`): the SECTOR thinkers -- doors, platforms,
+		       lights.  With this, `th - mo - sc` is the list walk itself plus the Z_Free
+		       of removed thinkers, and nothing in P_RunThinkers is unnamed any more. */
+		    RP_ThkSectBegin ();
 		    currentthinker->function.acp1 (currentthinker);
+		    RP_ThkSectEnd ();
+		}
 	    }
 	}
 	currentthinker = currentthinker->next;

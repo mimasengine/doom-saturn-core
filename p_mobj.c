@@ -24,6 +24,7 @@
 
 #include "doomdef.h"
 #include "p_local.h"
+#include "r_parallel.h"   /* SATURN: RP_ThkPhys / RP_ThkState hooks -- row 23 */
 #include "sounds.h"
 
 #include "st_stuff.h"
@@ -445,7 +446,12 @@ void P_MobjThinker (mobj_t* mobj)
 	|| mobj->momy
 	|| (mobj->flags&MF_SKULLFLY) )
     {
+	/* SATURN 2026-08-18 (row 23 `ph`): PHYSICS.  Bracketed at the CALL SITE inside
+	   P_MobjThinker, not around the function, so `ph` is a guaranteed subset of `mo` --
+	   P_ZMovement is also reached from P_ZMovement-like paths elsewhere. */
+	RP_ThkPhysBegin ();
 	P_XYMovement (mobj);
+	RP_ThkPhysEnd ();
 
 	// FIXME: decent NOP/NULL/Nil function pointer please.
 	if (mobj->thinker.function.acv == (actionf_v) (-1))
@@ -454,7 +460,9 @@ void P_MobjThinker (mobj_t* mobj)
     if ( (mobj->z != mobj->floorz)
 	 || mobj->momz )
     {
+	RP_ThkPhysBegin ();
 	P_ZMovement (mobj);
+	RP_ThkPhysEnd ();
 	
 	// FIXME: decent NOP/NULL/Nil function pointer please.
 	if (mobj->thinker.function.acv == (actionf_v) (-1))
@@ -469,9 +477,19 @@ void P_MobjThinker (mobj_t* mobj)
 	mobj->tics--;
 		
 	// you can cycle through multiple states in a tic
+	/* SATURN 2026-08-18 (row 23 `sm`): the STATE MACHINE and, through it, every action
+	   function -- A_Look/A_Chase (which own `s`, P_CheckSight) and the attacks (which own
+	   the hitscan traversal `pt` measured at 10-13 ms).  So `sm` is the parent of the two
+	   terms already known, and `mo - ph - sm` is what is left: the bare per-call cost. */
 	if (!mobj->tics)
-	    if (!P_SetMobjState (mobj, mobj->state->nextstate) )
+	{
+	    boolean alive;
+	    RP_ThkStateBegin ();
+	    alive = P_SetMobjState (mobj, mobj->state->nextstate);
+	    RP_ThkStateEnd ();
+	    if (!alive)
 		return;		// freed itself
+	}
     }
     else
     {

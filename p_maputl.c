@@ -31,7 +31,6 @@
 #include "doomdef.h"
 #include "doomstat.h"
 #include "p_local.h"
-#include "r_parallel.h"   /* SATURN: RP_ThkPath* -- row 23 `pt` */
 
 
 // State.
@@ -859,29 +858,12 @@ static void InterceptsOverrun(int num_intercepts, intercept_t *intercept)
 // Returns true if the traverser function returns true
 // for all lines.
 //
-/* SATURN 2026-08-17 (row 23 `pt`): timing wrapper, same shape as P_CheckPosition's -- the body keeps
-   its four early returns untouched, which is the whole point of wrapping instead of editing. */
-static boolean P_PathTraverse_impl (fixed_t, fixed_t, fixed_t, fixed_t, int,
-				    boolean (*) (intercept_t *));
-
+/* (SATURN row-23 `pt` RETIRED 2026-08-18: it answered -- 10-13 ms in a firefight, exactly 0,0 when
+   not shooting, so the probe was right and the seam small.  Its parent `sm` (P_SetMobjState + the
+   action functions, which is where every shot originates) now carries it, and a wrapper nobody
+   reads is dead weight on a target where code costs the TLSF pool 1:1. */
 boolean
 P_PathTraverse
-( fixed_t		x1,
-  fixed_t		y1,
-  fixed_t		x2,
-  fixed_t		y2,
-  int			flags,
-  boolean (*trav) (intercept_t *))
-{
-    boolean r;
-    RP_ThkPathBegin ();
-    r = P_PathTraverse_impl (x1, y1, x2, y2, flags, trav);
-    RP_ThkPathEnd ();
-    return r;
-}
-
-static boolean
-P_PathTraverse_impl
 ( fixed_t		x1,
   fixed_t		y1,
   fixed_t		x2,

@@ -1297,6 +1297,11 @@ void R_RenderPlayerView (player_t* player)
        the game tic.  JOIN it HERE -- before the BSP walk writes the first pixel -- so a still-running
        slave clear can never race the master's render.  No-op (returns instantly) when no aux job is
        pending (clear-on-master, DoomJo, or a prior split view already joined it). */
+    /* SATURN 2026-08-18 (row 1 `rs`): everything R_RenderPlayerView does BEFORE the first phase
+       mark.  Row-1 `R` is derived (MST - T - S - b - dg) while Bw/Bp/P/M are measured, and the two
+       differ by ~11,6 ms -- this says whether that gap is a real phase or the slop of a derived
+       number.  It is the last unnamed term in the frame. */
+    RP_RSetupBegin ();
     { extern void RP_AuxWait(void); RP_AuxWait(); }
 
     R_SetupFrame (player);
@@ -1307,6 +1312,7 @@ void R_RenderPlayerView (player_t* player)
        walk re-touches this view's flats -- so "age 0" means exactly "in use by the view being
        drawn" and the LRU can never reuse a slot a queued visplane still points into. */
     R_PostFlatCacheFrame ();
+    RP_RSetupEnd ();
 
     if (sat_xsplit)
     {
