@@ -288,9 +288,20 @@ boolean P_CrossBSPNode (int bspnum)
     }
 		
     bsp = &nodes[bspnum];
-    
+
+    /* 🔴 SATURN 2026-08-18 -- THE TYPE PUN THAT node_t's SHRINK WOULD HAVE BROKEN SILENTLY.
+       Vanilla casts node_t* straight to divline_t*, relying on the first four fields being
+       fixed_t x,y,dx,dy in both.  node_t now stores them as SHORTS (52 -> 28 bytes), so that cast
+       would read two halves of two different fields as one fixed_t and hand P_DivlineSide garbage
+       -- every P_CheckSight silently wrong, with nothing on screen to say so.  Build the divline
+       explicitly through the accessors instead.  Cost: four shifts and a 16-byte stack struct per
+       node visited, on a path measured at 2-14 ms (`s`, row 24). */
+    { divline_t nd;
+      nd.x = NODE_X(bsp);  nd.y = NODE_Y(bsp);
+      nd.dx = NODE_DX(bsp); nd.dy = NODE_DY(bsp);
+
     // decide which side the start point is on
-    side = P_DivlineSide (strace.x, strace.y, (divline_t *)bsp);
+    side = P_DivlineSide (strace.x, strace.y, &nd);
     if (side == 2)
 	side = 0;	// an "on" should cross both sides
 
@@ -299,7 +310,7 @@ boolean P_CrossBSPNode (int bspnum)
 	return false;
 	
     // the partition plane is crossed here
-    if (side == P_DivlineSide (t2x, t2y,(divline_t *)bsp))
+    if (side == P_DivlineSide (t2x, t2y, &nd))
     {
 	// the line doesn't touch the other side
 	return true;
@@ -307,6 +318,7 @@ boolean P_CrossBSPNode (int bspnum)
     
     // cross the ending side		
     return P_CrossBSPNode (bsp->children[side^1]);
+    }
 }
 
 

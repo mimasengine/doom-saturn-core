@@ -299,21 +299,34 @@ sector_t*	SEG_BACKSECTOR (const seg_t *s);
 //
 // BSP node.
 //
+/* 🔴 SATURN 2026-08-18 -- node_t 52 -> 28 BYTES, and lossless for the same reason seg_t was:
+   the WAD's mapnode_t already holds x/y/dx/dy and the two bounding boxes as SHORTS, and P_LoadNodes
+   widened every one of them by <<FRACBITS.  Keep the short, shift at use, get the identical fixed_t.
+   Nuts3's node array goes 132 KB -> 71 KB, under the 110 KB contiguous run the zone can promise.
+   `children` is already 16-bit and stays as it is.
+   NOT d32xr's 16-byte form: that packs the bbox into two uint16 (`encbbox`), which is a lossy
+   re-encoding of the traversal test.  28 bytes clears the wall on every witness map, so there is
+   nothing to buy with the risk.  Renamed fields again -- the compiler is the checklist. */
 typedef struct
 {
-    // Partition line.
-    fixed_t	x;
-    fixed_t	y;
-    fixed_t	dx;
-    fixed_t	dy;
+    // Partition line, as the WAD stores it (fixed_t = value << FRACBITS).
+    short	x16;
+    short	y16;
+    short	dx16;
+    short	dy16;
 
-    // Bounding box for each child.
-    fixed_t	bbox[2][4];
+    // Bounding box for each child, same encoding.
+    short	bbox16[2][4];
 
     // If NF_SUBSECTOR its a subsector.
     unsigned short children[2];
-    
 } node_t;
+
+#define NODE_X(n)	((fixed_t)(n)->x16  << FRACBITS)
+#define NODE_Y(n)	((fixed_t)(n)->y16  << FRACBITS)
+#define NODE_DX(n)	((fixed_t)(n)->dx16 << FRACBITS)
+#define NODE_DY(n)	((fixed_t)(n)->dy16 << FRACBITS)
+#define NODE_BBOX(n,c,e) ((fixed_t)(n)->bbox16[c][e] << FRACBITS)
 
 
 

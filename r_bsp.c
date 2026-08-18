@@ -463,7 +463,11 @@ int	checkcoord[12][4] =
    Keep this note so the idea is not re-derived: the prerequisite for a far clip is a map whose COST
    is in its DISTANCE.  Measure `fc` against fps before writing the clip, not after. */
 
-boolean R_CheckBBox (fixed_t*	bspcoord)
+/* SATURN 2026-08-18: takes the node's SHORT bbox directly (node_t is 28 bytes now).  The four
+   comparisons shift the stored short up rather than the caller shifting all four into a temp --
+   same arithmetic, no copy, and `viewx >> FRACBITS` would NOT be equivalent (it truncates the
+   fractional part of the view position and would flip the test on a boundary). */
+boolean R_CheckBBox (const short*	bspcoord)
 {
     int			boxx;
     int			boxy;
@@ -486,16 +490,16 @@ boolean R_CheckBBox (fixed_t*	bspcoord)
     
     // Find the corners of the box
     // that define the edges from current viewpoint.
-    if (viewx <= bspcoord[BOXLEFT])
+    if (viewx <= ((fixed_t)bspcoord[BOXLEFT]   << FRACBITS))
 	boxx = 0;
-    else if (viewx < bspcoord[BOXRIGHT])
+    else if (viewx < ((fixed_t)bspcoord[BOXRIGHT]  << FRACBITS))
 	boxx = 1;
     else
 	boxx = 2;
 		
-    if (viewy >= bspcoord[BOXTOP])
+    if (viewy >= ((fixed_t)bspcoord[BOXTOP]    << FRACBITS))
 	boxy = 0;
-    else if (viewy > bspcoord[BOXBOTTOM])
+    else if (viewy > ((fixed_t)bspcoord[BOXBOTTOM] << FRACBITS))
 	boxy = 1;
     else
 	boxy = 2;
@@ -504,10 +508,10 @@ boolean R_CheckBBox (fixed_t*	bspcoord)
     if (boxpos == 5)
 	return true;
 	
-    x1 = bspcoord[checkcoord[boxpos][0]];
-    y1 = bspcoord[checkcoord[boxpos][1]];
-    x2 = bspcoord[checkcoord[boxpos][2]];
-    y2 = bspcoord[checkcoord[boxpos][3]];
+    x1 = ((fixed_t)bspcoord[checkcoord[boxpos][0]] << FRACBITS);
+    y1 = ((fixed_t)bspcoord[checkcoord[boxpos][1]] << FRACBITS);
+    x2 = ((fixed_t)bspcoord[checkcoord[boxpos][2]] << FRACBITS);
+    y2 = ((fixed_t)bspcoord[checkcoord[boxpos][3]] << FRACBITS);
     
     // check clip list for an open space
     angle1 = R_PointToAngle (x1, y1) - viewangle;
@@ -668,7 +672,7 @@ void R_RenderBSPNode (int bspnum)
     R_RenderBSPNode (bsp->children[side]); 
 
     // Possibly divide back space.
-    if (R_CheckBBox (bsp->bbox[side^1]))	
+    if (R_CheckBBox (bsp->bbox16[side^1]))	
 	R_RenderBSPNode (bsp->children[side^1]);
 }
 

@@ -323,15 +323,17 @@ void P_LoadNodes (int lump)
     
     for (i=0 ; i<numnodes ; i++, no++, mn++)
     {
-	no->x = SHORT(mn->x)<<FRACBITS;
-	no->y = SHORT(mn->y)<<FRACBITS;
-	no->dx = SHORT(mn->dx)<<FRACBITS;
-	no->dy = SHORT(mn->dy)<<FRACBITS;
+	/* SATURN 2026-08-18: stored exactly as the WAD holds it; the <<FRACBITS moved to the
+	   NODE_* accessors, which makes this a pure copy and the struct 28 bytes instead of 52. */
+	no->x16 = SHORT(mn->x);
+	no->y16 = SHORT(mn->y);
+	no->dx16 = SHORT(mn->dx);
+	no->dy16 = SHORT(mn->dy);
 	for (j=0 ; j<2 ; j++)
 	{
 	    no->children[j] = SHORT(mn->children[j]);
 	    for (k=0 ; k<4 ; k++)
-		no->bbox[j][k] = SHORT(mn->bbox[j][k])<<FRACBITS;
+		no->bbox16[j][k] = SHORT(mn->bbox[j][k]);
 	}
     }
 	
