@@ -518,6 +518,96 @@ void P_MobjThinker (mobj_t* mobj)
 
 
 //
+// SATURN 2026-08-18 -- MOBJ SLAB.
+//
+// SCYTHE MAP30 spawns 1082 mobjs on skill 4 and dies inside P_SpawnMobj with fr0K.  The struct is
+// 156 bytes, but the ZONE charges 180: every mobj carries its own 24-byte memblock_t.  That is
+// 26 KB of pure header on one map -- more than the whole side_t shrink gave back, and it buys
+// nothing, because mobjs are all the same size and all PU_LEVEL.
+//
+// So allocate them 64 at a time and thread a free list through the dead ones' `snext` (dead by
+// then: P_RemoveMobj calls P_UnsetThingPosition before the thinker is reaped).  17 chunks cover
+// MAP30 for 408 bytes of header instead of 26 KB.
+//
+// 64 AND NOT 256 ON PURPOSE.  A chunk is one contiguous Z_Malloc, and contiguity is the wall this
+// whole branch exists to clear -- 256 mobjs would be a 40 KB run, right back in the danger zone.
+// 64 is ~10 KB, under every `lg` this project has ever measured.  And the allocation is GUARDED:
+// if a chunk will not fit, we fall back to the per-mobj Z_Malloc this replaces, so the slab can
+// never turn a level that loads today into one that does not.
+//
+// This does NOT contradict the 2026-08-17 verdict that killed the mobj free list.  That probe
+// measured TIME (`sp0,5/3`: three spawns a frame, under a millisecond) and the conclusion was
+// that spawning is not a CPU problem.  It still isn't.  This is about SPACE.
+//
+#define MOBJ_SLAB_N	64
+
+typedef struct mobjchunk_s
+{
+    struct mobjchunk_s*	next;
+    mobj_t		m[MOBJ_SLAB_N];
+} mobjchunk_t;
+
+static mobjchunk_t*	mobj_chunks   = NULL;
+static mobj_t*		mobj_freelist = NULL;
+
+// Called from P_SetupLevel AFTER Z_FreeTags(PU_LEVEL) -- which has just freed every chunk, so the
+// lists must be dropped on the floor rather than walked.
+void P_MobjSlabReset (void)
+{
+    mobj_chunks   = NULL;
+    mobj_freelist = NULL;
+}
+
+mobj_t* P_MobjAlloc (void)
+{
+    mobjchunk_t*	c;
+    mobj_t*		m;
+    int			i;
+
+    if (mobj_freelist)
+    {
+	m = mobj_freelist;
+	mobj_freelist = m->snext;
+	return m;
+    }
+
+    if (!Z_CanAllocate (sizeof(mobjchunk_t)))
+	return Z_Malloc (sizeof(mobj_t), PU_LEVEL, NULL);	// exactly what vanilla did
+
+    c = Z_Malloc (sizeof(mobjchunk_t), PU_LEVEL, NULL);
+    c->next = mobj_chunks;
+    mobj_chunks = c;
+
+    for (i=1 ; i<MOBJ_SLAB_N ; i++)
+    {
+	c->m[i].snext = mobj_freelist;
+	mobj_freelist = &c->m[i];
+    }
+    return &c->m[0];
+}
+
+// True if this thinker lives in a chunk, in which case it has been recycled and MUST NOT be
+// handed to Z_Free -- that would corrupt the zone.  Callers: p_tick.c and p_saveg.c, the only
+// two places a thinker is reaped.  Mobjs from the fallback path are not owned here and fall
+// through to Z_Free, so the two kinds can coexist in one level.
+boolean P_MobjSlabFree (void* p)
+{
+    mobjchunk_t*	c;
+
+    for (c = mobj_chunks ; c ; c = c->next)
+    {
+	if ((mobj_t *)p >= c->m && (mobj_t *)p < c->m + MOBJ_SLAB_N)
+	{
+	    ((mobj_t *)p)->snext = mobj_freelist;
+	    mobj_freelist = (mobj_t *)p;
+	    return true;
+	}
+    }
+    return false;
+}
+
+
+//
 // P_SpawnMobj
 //
 /* (SATURN row-23 `sp` REMOVED 2026-08-17, same day it was added, because it ANSWERED: console read
@@ -536,7 +626,7 @@ P_SpawnMobj
     state_t*	st;
     mobjinfo_t*	info;
 	
-    mobj = Z_Malloc (sizeof(*mobj), PU_LEVEL, NULL);
+    mobj = P_MobjAlloc ();			// SATURN: slab, not one memblock per mobj
     memset (mobj, 0, sizeof (*mobj));
     info = &mobjinfo[type];
 	

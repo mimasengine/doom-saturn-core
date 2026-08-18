@@ -1633,7 +1633,8 @@ void P_UnArchiveThinkers (void)
 	if (currentthinker->function.acp1 == (actionf_p1)P_MobjThinker)
 	    P_RemoveMobj ((mobj_t *)currentthinker);
 	else
-	    Z_Free (currentthinker);
+	    if (!P_MobjSlabFree (currentthinker))
+		Z_Free (currentthinker);
 
 	currentthinker = next;
     }
@@ -1650,7 +1651,7 @@ void P_UnArchiveThinkers (void)
 			
 	  case tc_mobj:
 	    saveg_read_pad();
-	    mobj = Z_Malloc (sizeof(*mobj), PU_LEVEL, NULL);
+	    mobj = P_MobjAlloc ();
             saveg_read_mobj_t(mobj);
 
 	    mobj->target = NULL;

@@ -111,6 +111,12 @@ P_SpawnMobj
   mobjtype_t	type );
 
 void 	P_RemoveMobj (mobj_t* th);
+/* SATURN 2026-08-18 -- the mobj slab (p_mobj.c): mobjs are all the same size and all PU_LEVEL,
+   so one memblock_t per mobj was 26 KB of pure header on SCYTHE MAP30.  P_MobjSlabFree must be
+   asked BEFORE Z_Free at every site that reaps a thinker. */
+mobj_t*	P_MobjAlloc (void);
+boolean	P_MobjSlabFree (void* p);
+void	P_MobjSlabReset (void);
 mobj_t* P_SubstNullMobj (mobj_t* th);
 boolean	P_SetMobjState (mobj_t* mobj, statenum_t state);
 void 	P_MobjThinker (mobj_t* mobj);

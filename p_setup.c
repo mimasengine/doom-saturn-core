@@ -1110,6 +1110,9 @@ P_SetupLevel
     S_Start ();			
 
     Z_FreeTags (PU_LEVEL, PU_PURGELEVEL-1);
+    /* SATURN: the slab's chunks were PU_LEVEL, so they have just been freed -- drop the lists
+       rather than walk them (p_mobj.c). */
+    P_MobjSlabReset ();
 
     /* (R_ClearTextureCaches DELETED with core/r_cache.c on 2026-08-17.  Its slab needed 96 KB
        CONTIGUOUS and `xc0/0/60` says the carve never found more than 60 -- the pool never existed,
