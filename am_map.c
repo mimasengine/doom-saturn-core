@@ -1127,15 +1127,19 @@ void AM_drawWalls(void)
 
     for (i=0;i<numlines;i++)
     {
-	l.a.x = lines[i].v1->x;
-	l.a.y = lines[i].v1->y;
-	l.b.x = lines[i].v2->x;
-	l.b.y = lines[i].v2->y;
+	const line_t*	ln = &lines[i];
+	const vertex_t*	lv1 = LINE_V1(ln);
+	const vertex_t*	lv2 = LINE_V2(ln);
+
+	l.a.x = lv1->x;
+	l.a.y = lv1->y;
+	l.b.x = lv2->x;
+	l.b.y = lv2->y;
 	if (cheating || (lines[i].flags & ML_MAPPED))
 	{
 	    if ((lines[i].flags & LINE_NEVERSEE) && !cheating)
 		continue;
-	    if (!lines[i].backsector)
+	    if (!LINE_BACKSECTOR (ln))
 	    {
 		AM_drawMline(&l, WALLCOLORS+lightlev);
 	    }
@@ -1150,12 +1154,12 @@ void AM_drawWalls(void)
 		    if (cheating) AM_drawMline(&l, SECRETWALLCOLORS + lightlev);
 		    else AM_drawMline(&l, WALLCOLORS+lightlev);
 		}
-		else if (lines[i].backsector->floorheight
-			   != lines[i].frontsector->floorheight) {
+		else if (LINE_BACKSECTOR (ln)->floorheight
+			   != LINE_FRONTSECTOR (ln)->floorheight) {
 		    AM_drawMline(&l, FDWALLCOLORS + lightlev); // floor level change
 		}
-		else if (lines[i].backsector->ceilingheight
-			   != lines[i].frontsector->ceilingheight) {
+		else if (LINE_BACKSECTOR (ln)->ceilingheight
+			   != LINE_FRONTSECTOR (ln)->ceilingheight) {
 		    AM_drawMline(&l, CDWALLCOLORS+lightlev); // ceiling level change
 		}
 		else if (cheating) {
@@ -1402,24 +1406,24 @@ static void mm_build_scratch(byte* sc, int w, int h)
         int x0, y0, x1, y1, color;
         if (l->flags & ML_DONTDRAW) continue;
         if (!(cheating || (l->flags & ML_MAPPED))) continue;        // fog-of-war
-        if (!l->backsector)
+        if (!LINE_BACKSECTOR (l))
             color = WALLCOLORS;                                     // one-sided solid wall
         else if (l->special == 39)
             color = WALLCOLORS + WALLRANGE / 2;                     // teleporter
         else if (l->flags & ML_SECRET)
             color = cheating ? SECRETWALLCOLORS : WALLCOLORS;       // secret door
-        else if (l->backsector->floorheight != l->frontsector->floorheight)
+        else if (LINE_BACKSECTOR (l)->floorheight != LINE_FRONTSECTOR (l)->floorheight)
             color = FDWALLCOLORS;                                   // floor-height change
-        else if (l->backsector->ceilingheight != l->frontsector->ceilingheight)
+        else if (LINE_BACKSECTOR (l)->ceilingheight != LINE_FRONTSECTOR (l)->ceilingheight)
             color = CDWALLCOLORS;                                   // ceiling-height change
         else if (cheating)
             color = TSWALLCOLORS;                                   // plain two-sided (cheat only)
         else
             continue;                                               // plain two-sided: not drawn
-        x0 = padx + ((((l->v1->x >> FRACBITS) - minx) * s >> 8) / hz);
-        y0 = pady + dh - 1 - (((l->v1->y >> FRACBITS) - miny) * s >> 8);
-        x1 = padx + ((((l->v2->x >> FRACBITS) - minx) * s >> 8) / hz);
-        y1 = pady + dh - 1 - (((l->v2->y >> FRACBITS) - miny) * s >> 8);
+        x0 = padx + ((((LINE_V1(l)->x >> FRACBITS) - minx) * s >> 8) / hz);
+        y0 = pady + dh - 1 - (((LINE_V1(l)->y >> FRACBITS) - miny) * s >> 8);
+        x1 = padx + ((((LINE_V2(l)->x >> FRACBITS) - minx) * s >> 8) / hz);
+        y1 = pady + dh - 1 - (((LINE_V2(l)->y >> FRACBITS) - miny) * s >> 8);
         mm_scratch_line(sc, w, x0, y0, x1, y1, color);
     }
 

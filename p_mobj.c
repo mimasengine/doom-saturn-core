@@ -169,8 +169,8 @@ void P_XYMovement (mobj_t* mo)
 	    {
 		// explode a missile
 		if (ceilingline &&
-		    ceilingline->backsector &&
-		    ceilingline->backsector->ceilingpic == skyflatnum)
+		    LINE_BACKSECTOR (ceilingline) &&
+		    LINE_BACKSECTOR (ceilingline)->ceilingpic == skyflatnum)
 		{
 		    // Hack to prevent missiles exploding
 		    // against the sky.

@@ -57,7 +57,12 @@ static const char *player_colors[] =
 // that neither Saturn port can pass), so captured_stats is DEAD .bss on hardware -- 32 entries x
 // ~200B = 6.4KB.  Trimming to 8 reclaims ~4.8KB of the TLSF boot pool (_end..__heap_end), which the
 // M7 slave plane-split code had pushed under the 4KB boot-loop floor.  DoomJo-safe (dead there too).
-#define MAX_CAPTURES 8
+// SATURN (2026-08-18): 8 -> 1, paying for line_t's shrink.  The 2026-07-18 pass stopped at 8, but
+// its own reasoning goes all the way down: StatCopy's ONLY caller is guarded by
+// M_ParmExists("-statdump"), which cannot be true without an argv, so the array is dead at ANY
+// size.  .bss costs the TLSF boot pool 1:1, and 7 dead entries were ~1.4KB of it.  Kept at 1
+// rather than 0 so the code still compiles and works verbatim if a port ever gains an argv.
+#define MAX_CAPTURES 1
 static wbstartstruct_t captured_stats[MAX_CAPTURES];
 static int num_captured_stats = 0;
 

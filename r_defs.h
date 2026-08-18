@@ -172,43 +172,68 @@ typedef enum
 
 
 
+/* SATURN 2026-08-18 -- line_t 64 -> 24 bytes.  THE term that clears the boot wall: seg_t and
+   node_t together gave back real RAM but ZERO maps.  On every one of the 37 witness maps that
+   cannot load today, LINEDEFS is the LARGEST SINGLE Z_Malloc, so it -- and nothing else -- is
+   the contiguity wall.  At 24 bytes all 37 fit (measured across the 235 maps of wads_temoins).
+
+   Lossless, because the WAD already stores what we keep:
+     v1/v2       pointer -> INDEX      (vertexes[] is loaded before P_LoadLineDefs)
+     bbox        fixed_t -> short      (a bbox corner IS a vertex coord, i.e. a short)
+     slopetype   int     -> 2 bits     (packed with 4 sign bits, see below)
+   Derived, because the source is one warm load away:
+     dx/dy               -> vertexes[v2i] - vertexes[v1i]
+     front/backsector    -> sides[sidenum[i]].sector   -- literally what P_LoadLineDefs did
+   Moved out, because they are MUTABLE (which is also what step 3, the read-in-place WAD, needs):
+     validcount          -> lines_validcount[] side array (only 4 call sites)
+     specialdata         -> DELETED.  line_t's copy is never read or written: all 37 uses of
+                            `specialdata` in core belong to sector_t.
+
+   WHY FOUR SIGN BITS AND NOT TWO.  P_PointOnLineSide and P_BoxOnLineSide only ever want the SIGN
+   of dx/dy on their axis-aligned early-outs, and 75.6 % of all linedefs in the witness set are
+   axis-aligned (Tnt 71.9 %, Doom2 78.7 %, Plutonia 75.1 %).  Caching the sign keeps 3 calls out
+   of 4 from touching vertexes[] at all -- CHEAPER than vanilla, which loads a whole fixed_t just
+   to test its sign.  Two bits would not do it: a degenerate zero-length linedef (dx == 0 && dy
+   == 0) is classed ST_VERTICAL, and vanilla returns 0 from BOTH branches; with a single
+   "negative" bit one branch would return 1.  Storing `> 0` and `< 0` separately reproduces
+   vanilla exactly, degenerate lines included.
+
+   Fields are RENAMED, not retyped, so the compiler enumerates every call site for us -- the same
+   discipline that caught the node_t/divline_t type pun in p_sight.c. */
+
+#define LS_SLOPE	0x03u		/* low 2 bits = slopetype_t */
+#define LS_DXPOS	0x04u
+#define LS_DXNEG	0x08u
+#define LS_DYPOS	0x10u
+#define LS_DYNEG	0x20u
+
 typedef struct line_s
 {
-    // Vertices, from v1 to v2.
-    vertex_t*	v1;
-    vertex_t*	v2;
-
-    // Precalculated v2 - v1 for side checking.
-    fixed_t	dx;
-    fixed_t	dy;
-
-    // Animation related.
-    short	flags;
-    short	special;
-    short	tag;
-
-    // Visual appearance: SideDefs.
-    //  sidenum[1] will be -1 if one sided
-    short	sidenum[2];			
-
-    // Neat. Another bounding box, for the extent
-    //  of the LineDef.
-    fixed_t	bbox[4];
-
-    // To aid move clipping.
-    slopetype_t	slopetype;
-
-    // Front and back sector.
-    // Note: redundant? Can be retrieved from SideDefs.
-    sector_t*	frontsector;
-    sector_t*	backsector;
-
-    // if == validcount, already checked
-    int		validcount;
-
-    // thinker_t for reversable actions
-    void*	specialdata;		
+    unsigned short	v1i;		/* vertex INDEX (was vertex_t*)              */
+    unsigned short	v2i;
+    short		flags;
+    short		special;
+    short		tag;
+    short		sidenum[2];	/* sidenum[1] == -1 if one sided             */
+    short		bbox16[4];	/* fixed_t bbox = bbox16 << FRACBITS (exact) */
+    unsigned char	slope;		/* slopetype_t + the 4 sign bits above       */
 } line_t;
+
+#define LINE_V1(l)		(&vertexes[(l)->v1i])
+#define LINE_V2(l)		(&vertexes[(l)->v2i])
+#define LINE_DX(l)		(vertexes[(l)->v2i].x - vertexes[(l)->v1i].x)
+#define LINE_DY(l)		(vertexes[(l)->v2i].y - vertexes[(l)->v1i].y)
+#define LINE_BBOX(l,e)		((fixed_t)(l)->bbox16[e] << FRACBITS)
+#define LINE_SLOPETYPE(l)	((slopetype_t)((l)->slope & LS_SLOPE))
+#define LINE_VALIDCOUNT(l)	(lines_validcount[(l) - lines])
+
+/* OUT OF LINE (p_maputl.c): sidenum[] may be -1, and inlining the guard at ~45 sites cost ~900
+   bytes of TLSF pool when SEG_BACKSECTOR did it.  Every hot caller reads the result once per
+   LINE into a local, never per column, so the call is free where it matters. */
+sector_t* LINE_FRONTSECTOR (const line_t *l);
+sector_t* LINE_BACKSECTOR  (const line_t *l);
+
+extern int *lines_validcount;	/* p_setup.c: numlines ints, the mutable half of line_t */
 
 
 

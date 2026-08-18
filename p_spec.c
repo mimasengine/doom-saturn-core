@@ -251,13 +251,18 @@ getNextSector
 ( line_t*	line,
   sector_t*	sec )
 {
+    sector_t*	front;
+
     if (!(line->flags & ML_TWOSIDED))
 	return NULL;
-		
-    if (line->frontsector == sec)
-	return line->backsector;
-	
-    return line->frontsector;
+
+    /* SATURN: read each sector ONCE.  GCC inlines getNextSector into ~10 callers in this file,
+       so a redundant LINE_FRONTSECTOR here costs ten copies of the call. */
+    front = LINE_FRONTSECTOR (line);
+    if (front == sec)
+	return LINE_BACKSECTOR (line);
+
+    return front;
 }
 
 
@@ -1298,7 +1303,7 @@ int EV_DoDonut(line_t*	line)
 
 	for (i = 0; i < s2->linecount; i++)
 	{
-	    s3 = s2->lines[i]->backsector;
+	    s3 = LINE_BACKSECTOR (s2->lines[i]);
 
 	    if (s3 == s1)
 		continue;

@@ -71,8 +71,20 @@ subsector_t*	subsectors;
 int		numnodes;
 node_t*		nodes;
 
+/* SATURN 2026-08-18 -- THE BOOT WALL, PINNED.  These three sizes are the whole point of the
+   level-structs work: on a 2 MB Saturn the zone's longest contiguous run at level load is ~110 KB,
+   and LINEDEFS/SEGS/NODES are the only allocations that approach it.  Measured over the 235 maps
+   of wads_temoins, 37 do not fit at the vanilla sizes and all 37 fit at these.  If a field is ever
+   added back, the wall returns silently on the biggest maps only -- so fail the BUILD instead. */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert (sizeof(seg_t)  == 14, "seg_t must stay 14 bytes (was 32) -- see r_defs.h");
+_Static_assert (sizeof(node_t) == 28, "node_t must stay 28 bytes (was 52) -- see r_defs.h");
+_Static_assert (sizeof(line_t) == 24, "line_t must stay 24 bytes (was 64) -- see r_defs.h");
+#endif
+
 int		numlines;
 line_t*		lines;
+int*		lines_validcount;	/* SATURN: mutable half of line_t (r_defs.h) */
 
 int		numsides;
 side_t*		sides;
@@ -413,66 +425,74 @@ void P_LoadLineDefs (int lump)
     numlines = W_LumpLength (lump) / sizeof(maplinedef_t);
     lines = Z_Malloc (numlines*sizeof(line_t),PU_LEVEL,0);	
     memset (lines, 0, numlines*sizeof(line_t));
+    /* SATURN: the MUTABLE half of line_t, split out so lines[] stays pure geometry (r_defs.h).
+       An order of magnitude smaller than the bytes the shrink just gave back, so it cannot
+       reopen the contiguity wall it was made to clear. */
+    lines_validcount = Z_Malloc (numlines*sizeof(int),PU_LEVEL,0);
+    memset (lines_validcount, 0, numlines*sizeof(int));
     data = W_CacheLumpNum (lump,PU_STATIC);
 	
     mld = (maplinedef_t *)data;
     ld = lines;
     for (i=0 ; i<numlines ; i++, mld++, ld++)
     {
+	fixed_t		dx;
+	fixed_t		dy;
+
 	ld->flags = SHORT(mld->flags);
 	ld->special = SHORT(mld->special);
 	ld->tag = SHORT(mld->tag);
-	v1 = ld->v1 = &vertexes[SHORT(mld->v1)];
-	v2 = ld->v2 = &vertexes[SHORT(mld->v2)];
-	ld->dx = v2->x - v1->x;
-	ld->dy = v2->y - v1->y;
-	
-	if (!ld->dx)
-	    ld->slopetype = ST_VERTICAL;
-	else if (!ld->dy)
-	    ld->slopetype = ST_HORIZONTAL;
+	ld->v1i = (unsigned short)SHORT(mld->v1);
+	ld->v2i = (unsigned short)SHORT(mld->v2);
+	v1 = &vertexes[ld->v1i];
+	v2 = &vertexes[ld->v2i];
+	dx = v2->x - v1->x;
+	dy = v2->y - v1->y;
+
+	/* SATURN: slopetype AND the four sign bits, resolved once here so the axis-aligned
+	   early-outs in P_PointOnLineSide / P_BoxOnLineSide -- 3 linedefs out of 4 -- never
+	   touch vertexes[] at run time.  See the LS_* note in r_defs.h. */
+	if (!dx)
+	    ld->slope = ST_VERTICAL;
+	else if (!dy)
+	    ld->slope = ST_HORIZONTAL;
+	else if (FixedDiv (dy , dx) > 0)
+	    ld->slope = ST_POSITIVE;
 	else
-	{
-	    if (FixedDiv (ld->dy , ld->dx) > 0)
-		ld->slopetype = ST_POSITIVE;
-	    else
-		ld->slopetype = ST_NEGATIVE;
-	}
-		
+	    ld->slope = ST_NEGATIVE;
+
+	if (dx > 0)		ld->slope |= LS_DXPOS;
+	else if (dx < 0)	ld->slope |= LS_DXNEG;
+	if (dy > 0)		ld->slope |= LS_DYPOS;
+	else if (dy < 0)	ld->slope |= LS_DYNEG;
+
+	/* A bbox corner is a vertex coordinate, so it round-trips through a short exactly. */
 	if (v1->x < v2->x)
 	{
-	    ld->bbox[BOXLEFT] = v1->x;
-	    ld->bbox[BOXRIGHT] = v2->x;
+	    ld->bbox16[BOXLEFT]  = (short)(v1->x >> FRACBITS);
+	    ld->bbox16[BOXRIGHT] = (short)(v2->x >> FRACBITS);
 	}
 	else
 	{
-	    ld->bbox[BOXLEFT] = v2->x;
-	    ld->bbox[BOXRIGHT] = v1->x;
+	    ld->bbox16[BOXLEFT]  = (short)(v2->x >> FRACBITS);
+	    ld->bbox16[BOXRIGHT] = (short)(v1->x >> FRACBITS);
 	}
 
 	if (v1->y < v2->y)
 	{
-	    ld->bbox[BOXBOTTOM] = v1->y;
-	    ld->bbox[BOXTOP] = v2->y;
+	    ld->bbox16[BOXBOTTOM] = (short)(v1->y >> FRACBITS);
+	    ld->bbox16[BOXTOP]    = (short)(v2->y >> FRACBITS);
 	}
 	else
 	{
-	    ld->bbox[BOXBOTTOM] = v2->y;
-	    ld->bbox[BOXTOP] = v1->y;
+	    ld->bbox16[BOXBOTTOM] = (short)(v2->y >> FRACBITS);
+	    ld->bbox16[BOXTOP]    = (short)(v1->y >> FRACBITS);
 	}
 
 	ld->sidenum[0] = SHORT(mld->sidenum[0]);
 	ld->sidenum[1] = SHORT(mld->sidenum[1]);
-
-	if (ld->sidenum[0] != -1)
-	    ld->frontsector = sides[ld->sidenum[0]].sector;
-	else
-	    ld->frontsector = 0;
-
-	if (ld->sidenum[1] != -1)
-	    ld->backsector = sides[ld->sidenum[1]].sector;
-	else
-	    ld->backsector = 0;
+	/* frontsector/backsector are no longer stored: LINE_FRONTSECTOR/LINE_BACKSECTOR do
+	   exactly the lookup this loop used to bake in. */
     }
 
     W_ReleaseLumpNum(lump);
@@ -579,12 +599,15 @@ void P_GroupLines (void)
     totallines = 0;
     for (i=0 ; i<numlines ; i++, li++)
     {
-	totallines++;
-	li->frontsector->linecount++;
+	sector_t*	fs = LINE_FRONTSECTOR (li);
+	sector_t*	bs = LINE_BACKSECTOR (li);
 
-	if (li->backsector && li->backsector != li->frontsector)
+	totallines++;
+	fs->linecount++;
+
+	if (bs && bs != fs)
 	{
-	    li->backsector->linecount++;
+	    bs->linecount++;
 	    totallines++;
 	}
     }
@@ -609,22 +632,23 @@ void P_GroupLines (void)
 
     for (i=0; i<numlines; ++i)
     { 
+        sector_t*	fs;
+        sector_t*	bs;
+
         li = &lines[i];
+        fs = LINE_FRONTSECTOR (li);
+        bs = LINE_BACKSECTOR (li);
 
-        if (li->frontsector != NULL)
+        if (fs != NULL)
         {
-            sector = li->frontsector;
-
-            sector->lines[sector->linecount] = li;
-            ++sector->linecount;
+            fs->lines[fs->linecount] = li;
+            ++fs->linecount;
         }
 
-        if (li->backsector != NULL && li->frontsector != li->backsector)
+        if (bs != NULL && bs != fs)
         {
-            sector = li->backsector;
-
-            sector->lines[sector->linecount] = li;
-            ++sector->linecount;
+            bs->lines[bs->linecount] = li;
+            ++bs->linecount;
         }
     }
     
@@ -639,8 +663,8 @@ void P_GroupLines (void)
 	{
             li = sector->lines[j];
 
-            M_AddToBox (bbox, li->v1->x, li->v1->y);
-            M_AddToBox (bbox, li->v2->x, li->v2->y);
+            M_AddToBox (bbox, LINE_V1(li)->x, LINE_V1(li)->y);
+            M_AddToBox (bbox, LINE_V2(li)->x, LINE_V2(li)->y);
 	}
 
 	// set the degenmobj_t to the middle of the bounding box

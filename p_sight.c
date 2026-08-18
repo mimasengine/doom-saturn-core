@@ -180,13 +180,13 @@ boolean P_CrossSubsector (int num)
 	line = SEG_LINEDEF(seg);
 
 	// allready checked other side?
-	if (line->validcount == validcount)
+	if (LINE_VALIDCOUNT(line) == validcount)
 	    continue;
 	
-	line->validcount = validcount;
+	LINE_VALIDCOUNT(line) = validcount;
 
-	v1 = line->v1;
-	v2 = line->v2;
+	v1 = LINE_V1(line);
+	v2 = LINE_V2(line);
 	s1 = P_DivlineSide (v1->x,v1->y, &strace);
 	s2 = P_DivlineSide (v2->x, v2->y, &strace);
 
@@ -208,7 +208,7 @@ boolean P_CrossSubsector (int num)
         // Backsector may be NULL if this is an "impassible
         // glass" hack line.
 
-        if (line->backsector == NULL)
+        if (LINE_BACKSECTOR (line) == NULL)
         {
             return false;
         }

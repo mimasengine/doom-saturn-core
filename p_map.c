@@ -208,10 +208,10 @@ static void SpechitOverrun(line_t *ld);
 //
 boolean PIT_CheckLine (line_t* ld)
 {
-    if (tmbbox[BOXRIGHT] <= ld->bbox[BOXLEFT]
-	|| tmbbox[BOXLEFT] >= ld->bbox[BOXRIGHT]
-	|| tmbbox[BOXTOP] <= ld->bbox[BOXBOTTOM]
-	|| tmbbox[BOXBOTTOM] >= ld->bbox[BOXTOP] )
+    if (tmbbox[BOXRIGHT] <= LINE_BBOX(ld,BOXLEFT)
+	|| tmbbox[BOXLEFT] >= LINE_BBOX(ld,BOXRIGHT)
+	|| tmbbox[BOXTOP] <= LINE_BBOX(ld,BOXBOTTOM)
+	|| tmbbox[BOXBOTTOM] >= LINE_BBOX(ld,BOXTOP) )
 	return true;
 
     if (P_BoxOnLineSide (tmbbox, ld) != -1)
@@ -228,7 +228,7 @@ boolean PIT_CheckLine (line_t* ld)
     // so two special lines that are only 8 pixels apart
     // could be crossed in either order.
     
-    if (!ld->backsector)
+    if (!LINE_BACKSECTOR (ld))
 	return false;		// one sided line
 		
     if (!(tmthing->flags & MF_MISSILE) )
@@ -655,13 +655,13 @@ void P_HitSlideLine (line_t* ld)
     fixed_t		newlen;
 	
 	
-    if (ld->slopetype == ST_HORIZONTAL)
+    if (LINE_SLOPETYPE(ld) == ST_HORIZONTAL)
     {
 	tmymove = 0;
 	return;
     }
     
-    if (ld->slopetype == ST_VERTICAL)
+    if (LINE_SLOPETYPE(ld) == ST_VERTICAL)
     {
 	tmxmove = 0;
 	return;
@@ -669,7 +669,7 @@ void P_HitSlideLine (line_t* ld)
 	
     side = P_PointOnLineSide (slidemo->x, slidemo->y, ld);
 	
-    lineangle = R_PointToAngle2 (0,0, ld->dx, ld->dy);
+    lineangle = R_PointToAngle2 (0,0, LINE_DX(ld), LINE_DY(ld));
 
     if (side == 1)
 	lineangle += ANG180;
@@ -901,20 +901,23 @@ PTR_AimTraverse (intercept_t* in)
 	
 	dist = FixedMul (attackrange, in->frac);
 
-        if (li->backsector == NULL
-         || li->frontsector->floorheight != li->backsector->floorheight)
+	{
+	sector_t*	fs = LINE_FRONTSECTOR (li);
+	sector_t*	bs = LINE_BACKSECTOR (li);
+
+	if (bs == NULL || fs->floorheight != bs->floorheight)
 	{
 	    slope = FixedDiv (openbottom - shootz , dist);
 	    if (slope > bottomslope)
 		bottomslope = slope;
 	}
 		
-	if (li->backsector == NULL
-         || li->frontsector->ceilingheight != li->backsector->ceilingheight)
+	if (bs == NULL || fs->ceilingheight != bs->ceilingheight)
 	{
 	    slope = FixedDiv (opentop - shootz , dist);
 	    if (slope < topslope)
 		topslope = slope;
+	}
 	}
 		
 	if (topslope <= bottomslope)
@@ -968,6 +971,8 @@ boolean PTR_ShootTraverse (intercept_t* in)
     fixed_t		frac;
     
     line_t*		li;
+    sector_t*		lfs;		/* SATURN: LINE_FRONTSECTOR/BACKSECTOR, read once */
+    sector_t*		lbs;
     
     mobj_t*		th;
 
@@ -994,7 +999,10 @@ boolean PTR_ShootTraverse (intercept_t* in)
         // e6y: emulation of missed back side on two-sided lines.
         // backsector can be NULL when emulating missing back side.
 
-        if (li->backsector == NULL)
+        lfs = LINE_FRONTSECTOR (li);
+        lbs = LINE_BACKSECTOR (li);
+
+        if (lbs == NULL)
         {
             slope = FixedDiv (openbottom - shootz , dist);
             if (slope > aimslope)
@@ -1006,14 +1014,14 @@ boolean PTR_ShootTraverse (intercept_t* in)
         }
         else
         {
-            if (li->frontsector->floorheight != li->backsector->floorheight)
+            if (lfs->floorheight != lbs->floorheight)
             {
                 slope = FixedDiv (openbottom - shootz , dist);
                 if (slope > aimslope)
                     goto hitline;
             }
 
-            if (li->frontsector->ceilingheight != li->backsector->ceilingheight)
+            if (lfs->ceilingheight != lbs->ceilingheight)
             {
                 slope = FixedDiv (opentop - shootz , dist);
                 if (slope < aimslope)
@@ -1033,14 +1041,14 @@ boolean PTR_ShootTraverse (intercept_t* in)
 	y = trace.y + FixedMul (trace.dy, frac);
 	z = shootz + FixedMul (aimslope, FixedMul(frac, attackrange));
 
-	if (li->frontsector->ceilingpic == skyflatnum)
+	if (lfs->ceilingpic == skyflatnum)
 	{
 	    // don't shoot the sky!
-	    if (z > li->frontsector->ceilingheight)
+	    if (z > lfs->ceilingheight)
 		return false;
 	    
 	    // it's a sky hack wall
-	    if	(li->backsector && li->backsector->ceilingpic == skyflatnum)
+	    if	(lbs && lbs->ceilingpic == skyflatnum)
 		return false;		
 	}
 

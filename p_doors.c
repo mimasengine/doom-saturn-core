@@ -736,7 +736,7 @@ EV_SlidingDoor
 	return;
     
     // Make sure door isn't already being animated
-    sec = line->frontsector;
+    sec = LINE_FRONTSECTOR (line);
     door = NULL;
     if (sec->specialdata)
     {
@@ -768,7 +768,7 @@ EV_SlidingDoor
 	    I_Error("EV_SlidingDoor: Can't use texture for sliding door!");
 			
 	door->frontsector = sec;
-	door->backsector = line->backsector;
+	door->backsector = LINE_BACKSECTOR (line);
 	door->thinker.function = T_SlidingDoor;
 	door->timer = SWAITTICS;
 	door->frame = 0;

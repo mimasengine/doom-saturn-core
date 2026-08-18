@@ -54,6 +54,24 @@ P_AproxDistance
 }
 
 
+/* SATURN 2026-08-18 -- line_t no longer stores its two sectors (r_defs.h); these do exactly the
+   lookup P_LoadLineDefs used to bake in.  Out of line on purpose: ~45 call sites, and every hot
+   one reads the result once per LINE into a local, never per column. */
+sector_t* LINE_FRONTSECTOR (const line_t *l)
+{
+    if (l->sidenum[0] == -1)
+	return (sector_t *)0;
+    return sides[l->sidenum[0]].sector;
+}
+
+sector_t* LINE_BACKSECTOR (const line_t *l)
+{
+    if (l->sidenum[1] == -1)
+	return (sector_t *)0;
+    return sides[l->sidenum[1]].sector;
+}
+
+
 //
 // P_PointOnLineSide
 // Returns 0 or 1
@@ -64,31 +82,35 @@ P_PointOnLineSide
   fixed_t	y,
   line_t*	line )
 {
-    fixed_t	dx;
-    fixed_t	dy;
-    fixed_t	left;
-    fixed_t	right;
-	
-    if (!line->dx)
+    fixed_t		dx;
+    fixed_t		dy;
+    fixed_t		left;
+    fixed_t		right;
+    const vertex_t*	v1 = LINE_V1(line);
+
+    /* SATURN: the two axis-aligned cases -- 3 linedefs out of 4 -- answer from the cached sign
+       bits and never touch v2.  `!line->dx` IS `slopetype == ST_VERTICAL` by construction in
+       P_LoadLineDefs, and only the sign of the other delta was ever wanted here. */
+    if (LINE_SLOPETYPE(line) == ST_VERTICAL)
     {
-	if (x <= line->v1->x)
-	    return line->dy > 0;
-	
-	return line->dy < 0;
+	if (x <= v1->x)
+	    return (line->slope & LS_DYPOS) != 0;
+
+	return (line->slope & LS_DYNEG) != 0;
     }
-    if (!line->dy)
+    if (LINE_SLOPETYPE(line) == ST_HORIZONTAL)
     {
-	if (y <= line->v1->y)
-	    return line->dx < 0;
-	
-	return line->dx > 0;
+	if (y <= v1->y)
+	    return (line->slope & LS_DXNEG) != 0;
+
+	return (line->slope & LS_DXPOS) != 0;
     }
 	
-    dx = (x - line->v1->x);
-    dy = (y - line->v1->y);
+    dx = (x - v1->x);
+    dy = (y - v1->y);
 	
-    left = FixedMul ( line->dy>>FRACBITS , dx );
-    right = FixedMul ( dy , line->dx>>FRACBITS );
+    left = FixedMul ( LINE_DY(line)>>FRACBITS , dx );
+    right = FixedMul ( dy , LINE_DX(line)>>FRACBITS );
 	
     if (right < left)
 	return 0;		// front side
@@ -110,12 +132,12 @@ P_BoxOnLineSide
     int		p1 = 0;
     int		p2 = 0;
 	
-    switch (ld->slopetype)
+    switch (LINE_SLOPETYPE(ld))
     {
       case ST_HORIZONTAL:
-	p1 = tmbox[BOXTOP] > ld->v1->y;
-	p2 = tmbox[BOXBOTTOM] > ld->v1->y;
-	if (ld->dx < 0)
+	p1 = tmbox[BOXTOP] > LINE_V1(ld)->y;
+	p2 = tmbox[BOXBOTTOM] > LINE_V1(ld)->y;
+	if (ld->slope & LS_DXNEG)
 	{
 	    p1 ^= 1;
 	    p2 ^= 1;
@@ -123,9 +145,9 @@ P_BoxOnLineSide
 	break;
 	
       case ST_VERTICAL:
-	p1 = tmbox[BOXRIGHT] < ld->v1->x;
-	p2 = tmbox[BOXLEFT] < ld->v1->x;
-	if (ld->dy < 0)
+	p1 = tmbox[BOXRIGHT] < LINE_V1(ld)->x;
+	p2 = tmbox[BOXLEFT] < LINE_V1(ld)->x;
+	if (ld->slope & LS_DYNEG)
 	{
 	    p1 ^= 1;
 	    p2 ^= 1;
@@ -208,10 +230,10 @@ P_MakeDivline
 ( line_t*	li,
   divline_t*	dl )
 {
-    dl->x = li->v1->x;
-    dl->y = li->v1->y;
-    dl->dx = li->dx;
-    dl->dy = li->dy;
+    dl->x = LINE_V1(li)->x;
+    dl->y = LINE_V1(li)->y;
+    dl->dx = LINE_DX(li);
+    dl->dy = LINE_DY(li);
 }
 
 
@@ -305,8 +327,8 @@ void P_LineOpening (line_t* linedef)
 	return;
     }
 	 
-    front = linedef->frontsector;
-    back = linedef->backsector;
+    front = LINE_FRONTSECTOR (linedef);
+    back = LINE_BACKSECTOR (linedef);
 	
     if (front->ceilingheight < back->ceilingheight)
 	opentop = front->ceilingheight;
@@ -490,10 +512,10 @@ P_BlockLinesIterator
     {
 	ld = &lines[*list];
 
-	if (ld->validcount == validcount)
+	if (LINE_VALIDCOUNT(ld) == validcount)
 	    continue; 	// line has already been checked
 
-	ld->validcount = validcount;
+	LINE_VALIDCOUNT(ld) = validcount;
 		
 	if ( !func(ld) )
 	    return false;
@@ -570,8 +592,8 @@ PIT_AddLineIntercepts (line_t* ld)
 	 || trace.dx < -FRACUNIT*16
 	 || trace.dy < -FRACUNIT*16)
     {
-	s1 = P_PointOnDivlineSide (ld->v1->x, ld->v1->y, &trace);
-	s2 = P_PointOnDivlineSide (ld->v2->x, ld->v2->y, &trace);
+	s1 = P_PointOnDivlineSide (LINE_V1(ld)->x, LINE_V1(ld)->y, &trace);
+	s2 = P_PointOnDivlineSide (LINE_V2(ld)->x, LINE_V2(ld)->y, &trace);
     }
     else
     {
@@ -592,7 +614,7 @@ PIT_AddLineIntercepts (line_t* ld)
     // try to early out the check
     if (earlyout
 	&& frac < FRACUNIT
-	&& !ld->backsector)
+	&& !LINE_BACKSECTOR (ld))
     {
 	return false;	// stop checking
     }
