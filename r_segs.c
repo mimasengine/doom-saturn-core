@@ -832,9 +832,32 @@ void sat_lead_frame_begin (void)   /* once per view, from R_ClearDrawSegs */
     if (!sat_wall_lead_x) return;
     if (!sat_leadh[0])
 	{
-	    for (i = 0 ; i < SAT_LEADH_DEPTH ; i++)
-		sat_leadh[i] = Z_Malloc (sizeof(sat_leadq_t) * SAT_LEADH_MAX, PU_STATIC, NULL);
+	    /* SATURN 2026-08-18 -- ASK, DO NOT DEMAND.  These are LAZY PU_STATIC blocks claimed on
+	       the first rendered frame -- i.e. AFTER the level has taken its share of the zone.  On
+	       SCYTHE MAP30 the level fits and this did not: Z_Malloc I_Errored on 36888 bytes with
+	       fr18K lg11K and killed a level that had loaded perfectly.  A fatal allocation for an
+	       OPTIONAL subsystem is a design fault, not a lack of RAM: sat_lead_record and
+	       sat_lead_span_add both bail on a NULL pointer already, and the header above calls a
+	       missing history "a bounded degradation, never a wrong pixel".  So ask, and stay off if
+	       the answer is no -- the same graceful-sink policy as the visplane, openings, composite
+	       and W_ReadLump guards.
+	       The six rings are now ONE block sliced six ways: all-or-nothing BY CONSTRUCTION, so a
+	       partial success can never leave sat_leadh[0] valid and sat_leadh[5] NULL for
+	       sat_lead_record to write through.  Small block first, then re-ask for the big one --
+	       two Z_CanAllocate calls up front would both pass on a single free run that only fits
+	       one of them. */
+	    sat_leadq_t*	heads;
+
+	    if (!Z_CanAllocate (sizeof(sat_leadq_t) * SAT_LEADH_MAX * SAT_LEADH_DEPTH))
+		return;
+	    heads = Z_Malloc (sizeof(sat_leadq_t) * SAT_LEADH_MAX * SAT_LEADH_DEPTH, PU_STATIC, NULL);
+
+	    if (!Z_CanAllocate (sizeof(sat_leadspan_t) * SAT_LEADSPAN_MAX))
+		{ Z_Free (heads); return; }
 	    sat_lead_spans = Z_Malloc (sizeof(sat_leadspan_t) * SAT_LEADSPAN_MAX, PU_STATIC, NULL);
+
+	    for (i = 0 ; i < SAT_LEADH_DEPTH ; i++)
+		sat_leadh[i] = heads + i * SAT_LEADH_MAX;
 	}
     sat_leadh_cur  = (sat_leadh_cur + 1) % SAT_LEADH_DEPTH;
     sat_leadh_n[sat_leadh_cur] = 0;
@@ -972,6 +995,10 @@ static int sat_dwell_cpu (int segidx, int cpu_now, int first_visit)
     if (!sat_wall_dwell || segidx < 0 || segidx >= SAT_SEG_MAX) return cpu_now;
     if (!sat_seg_dwell)
     {
+	/* SATURN 2026-08-18: same graceful rule as the lead-fill rings above -- this is a
+	   heuristic cache, so a full zone turns it off instead of killing the level. */
+	if (!Z_CanAllocate (SAT_SEG_MAX))
+	    return cpu_now;
 	sat_seg_dwell = Z_Malloc (SAT_SEG_MAX, PU_STATIC, NULL);
 	memset (sat_seg_dwell, 0, SAT_SEG_MAX);
     }
