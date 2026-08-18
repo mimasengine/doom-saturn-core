@@ -80,6 +80,13 @@ node_t*		nodes;
 _Static_assert (sizeof(seg_t)  == 14, "seg_t must stay 14 bytes (was 32) -- see r_defs.h");
 _Static_assert (sizeof(node_t) == 28, "node_t must stay 28 bytes (was 52) -- see r_defs.h");
 _Static_assert (sizeof(line_t) == 24, "line_t must stay 24 bytes (was 64) -- see r_defs.h");
+/* The in-place load below computes its overlap bound from BOTH sides of each conversion, so the
+   on-disc record sizes are load-bearing too.  They are all-short structs, so PACKEDATTR is a
+   no-op for them today -- which is exactly why a silent change here would go unnoticed. */
+_Static_assert (sizeof(mapvertex_t)  ==  4, "mapvertex_t must stay 4 bytes");
+_Static_assert (sizeof(mapseg_t)     == 12, "mapseg_t must stay 12 bytes");
+_Static_assert (sizeof(maplinedef_t) == 14, "maplinedef_t must stay 14 bytes");
+_Static_assert (sizeof(mapnode_t)    == 28, "mapnode_t must stay 28 bytes -- P_LoadNodes reads it IN PLACE over node_t");
 #endif
 
 int		numlines;
@@ -135,12 +142,46 @@ mapthing_t	playerstarts[MAXPLAYERS];
 //
 // P_LoadVertexes
 //
+/* SATURN 2026-08-18 -- IN-PLACE LEVEL LOAD.  Every P_LoadX below used to hold TWO buffers at
+   once: the final Z_Malloc'd array AND W_CacheLumpNum's copy of the raw lump.  Across the four
+   geometry lumps that second buffer is 83 KB of transient peak on Tnt MAP11 and 189 KB on
+   SCYTHE MAP30 -- demanded at the worst possible moment, while the zone is at its most
+   fragmented and P_SetupLevel still has SECTORS, SIDEDEFS, REJECT and BLOCKMAP to place.
+
+   Instead, read the raw records into the TAIL of the final array and expand forward.  Record i
+   is written to [D*i, D*i+D) and read from [off + S*i, ...); since D > S the destination always
+   runs BEHIND the source, except for the last few records, which are copied to a small stack
+   buffer first.  Nothing extra is allocated and NOT ONE BYTE is added to the disc.
+
+   That last clause is why this, and not a pre-baked WAD.  Baking the structs into the lumps
+   (tools/bake_levels.py, written and then rejected) removes the conversion too -- but it costs
+   +16 KB of CD read per map on LINEDEFS and +6 KB on VERTEXES, to save a few ms of CPU.  On a
+   load whose spikes ARE synchronous CD reads that is the wrong direction; only NODES was free,
+   and NODES needs no format change at all because mapnode_t and node_t are already the same
+   28 bytes in the same order.
+
+   `off` is rounded DOWN to a multiple of 4 so W_ReadLump keeps GFS's aligned fast path instead
+   of bouncing through the staging scratch (w_file_saturn.cxx).  Rounding down only ever moves
+   the source EARLIER, so it stays inside the array; it costs at most one more tail record. */
+/* PROVED, not sampled.  With ntail = 16 the last index read from the array is i = n-17, and the
+   no-overwrite condition D*i + D <= off + S*i (with off >= n*(D-S) - 3 after the align-down)
+   reduces to 16*D >= 3 + 17*S -- independent of n.  SEGS 224 >= 207, LINEDEFS 384 >= 241,
+   VERTEXES 128 >= 71.  For n <= 16 every record is stashed, so it holds trivially. */
+#define SAT_INPLACE_TAIL 16
+
+static int P_InPlaceOffset (int n, int dstsize, int srcsize)
+{
+    return (n * (dstsize - srcsize)) & ~3;
+}
+
 void P_LoadVertexes (int lump)
 {
-    byte*		data;
     int			i;
+    int			off;
+    int			ntail;
     mapvertex_t*	ml;
     vertex_t*		li;
+    mapvertex_t		tail[SAT_INPLACE_TAIL];
 
     // Determine number of lumps:
     //  total lump length / vertex record length.
@@ -149,22 +190,24 @@ void P_LoadVertexes (int lump)
     // Allocate zone memory for buffer.
     vertexes = Z_Malloc (numvertexes*sizeof(vertex_t),PU_LEVEL,0);	
 
-    // Load data into cache.
-    data = W_CacheLumpNum (lump, PU_STATIC);
-	
-    ml = (mapvertex_t *)data;
-    li = vertexes;
+    off = P_InPlaceOffset (numvertexes, sizeof(vertex_t), sizeof(mapvertex_t));
+    W_ReadLump (lump, (byte *)vertexes + off);
+    ml = (mapvertex_t *)((byte *)vertexes + off);
+
+    ntail = (numvertexes < SAT_INPLACE_TAIL) ? numvertexes : SAT_INPLACE_TAIL;
+    memcpy (tail, ml + (numvertexes - ntail), ntail*sizeof(mapvertex_t));
 
     // Copy and convert vertex coordinates,
     // internal representation as fixed.
-    for (i=0 ; i<numvertexes ; i++, li++, ml++)
+    li = vertexes;
+    for (i=0 ; i<numvertexes ; i++, li++)
     {
-	li->x = SHORT(ml->x)<<FRACBITS;
-	li->y = SHORT(ml->y)<<FRACBITS;
-    }
+	const mapvertex_t*	m = (i >= numvertexes - ntail)
+				  ? &tail[i - (numvertexes - ntail)] : &ml[i];
 
-    // Free buffer memory.
-    W_ReleaseLumpNum(lump);
+	li->x = SHORT(m->x)<<FRACBITS;
+	li->y = SHORT(m->y)<<FRACBITS;
+    }
 }
 
 //
@@ -191,35 +234,47 @@ sector_t* GetSectorAtNullAddress(void)
 //
 void P_LoadSegs (int lump)
 {
-    byte*		data;
     int			i;
+    int			off;
+    int			ntail;
     mapseg_t*		ml;
     seg_t*		li;
     line_t*		ldef;
     int			linedef;
     int			side;
     int                 sidenum;
+    mapseg_t		tail[SAT_INPLACE_TAIL];
 	
     numsegs = W_LumpLength (lump) / sizeof(mapseg_t);
     segs = Z_Malloc (numsegs*sizeof(seg_t),PU_LEVEL,0);	
     memset (segs, 0, numsegs*sizeof(seg_t));
-    data = W_CacheLumpNum (lump,PU_STATIC);
-	
-    ml = (mapseg_t *)data;
+
+    /* SATURN: in-place expansion, 12 -> 14 bytes (see the note above P_LoadVertexes).  This is
+       the biggest of the four: 33 KB of staging buffer on Tnt MAP11, 71 KB on SCYTHE MAP30. */
+    off = P_InPlaceOffset (numsegs, sizeof(seg_t), sizeof(mapseg_t));
+    W_ReadLump (lump, (byte *)segs + off);
+    ml = (mapseg_t *)((byte *)segs + off);
+
+    ntail = (numsegs < SAT_INPLACE_TAIL) ? numsegs : SAT_INPLACE_TAIL;
+    memcpy (tail, ml + (numsegs - ntail), ntail*sizeof(mapseg_t));
+
     li = segs;
-    for (i=0 ; i<numsegs ; i++, li++, ml++)
+    for (i=0 ; i<numsegs ; i++, li++)
     {
+	const mapseg_t*	m = (i >= numsegs - ntail)
+			  ? &tail[i - (numsegs - ntail)] : &ml[i];
+
 	/* SATURN 2026-08-18: seg_t is now 14 bytes of INDICES (see r_defs.h).  The two shifted
 	   fields are stored exactly as the WAD holds them -- Doom widened them to 32 bits here and
 	   the accessors shift them back at use, so this is a lossless re-encoding, not a rounding. */
-	li->v1i = (unsigned short)SHORT(ml->v1);
-	li->v2i = (unsigned short)SHORT(ml->v2);
+	li->v1i = (unsigned short)SHORT(m->v1);
+	li->v2i = (unsigned short)SHORT(m->v2);
 
-	li->ang16 = (unsigned short)SHORT(ml->angle);
-	li->off16 = (short)SHORT(ml->offset);
-	linedef = SHORT(ml->linedef);
+	li->ang16 = (unsigned short)SHORT(m->angle);
+	li->off16 = (short)SHORT(m->offset);
+	linedef = SHORT(m->linedef);
 	ldef = &lines[linedef];
-	side = SHORT(ml->side);
+	side = SHORT(m->side);
 	li->ldi = (unsigned short)((linedef << 1) | (side & 1));
 	li->fsi = (unsigned short)(sides[ldef->sidenum[side]].sector - sectors);
 
@@ -247,8 +302,6 @@ void P_LoadSegs (int lump)
 	    li->bsi = SEG_NOSECTOR;
         }
     }
-	
-    W_ReleaseLumpNum(lump);
 }
 
 
@@ -319,37 +372,39 @@ void P_LoadSectors (int lump)
 //
 void P_LoadNodes (int lump)
 {
-    byte*	data;
     int		i;
     int		j;
     int		k;
-    mapnode_t*	mn;
     node_t*	no;
 	
     numnodes = W_LumpLength (lump) / sizeof(mapnode_t);
     nodes = Z_Malloc (numnodes*sizeof(node_t),PU_LEVEL,0);	
-    data = W_CacheLumpNum (lump,PU_STATIC);
-	
-    mn = (mapnode_t *)data;
+
+    /* SATURN: the only lump that needs no expansion at all -- mapnode_t and node_t are both 28
+       bytes in the same field order, so the raw records land exactly where they belong and the
+       loop is a pure byteswap over the SAME addresses.  That kills a staging buffer equal to the
+       whole array (22 KB on Tnt MAP11, 53 KB on SCYTHE MAP30): NODES was the worst offender,
+       doubling its own peak. */
+    W_ReadLump (lump, nodes);
+
     no = nodes;
-    
-    for (i=0 ; i<numnodes ; i++, no++, mn++)
+    for (i=0 ; i<numnodes ; i++, no++)
     {
+	mapnode_t*	mn = (mapnode_t *)no;	/* same bytes: read each short, swap, write back */
+
 	/* SATURN 2026-08-18: stored exactly as the WAD holds it; the <<FRACBITS moved to the
-	   NODE_* accessors, which makes this a pure copy and the struct 28 bytes instead of 52. */
+	   NODE_* accessors, which makes this a pure swap and the struct 28 bytes instead of 52. */
 	no->x16 = SHORT(mn->x);
 	no->y16 = SHORT(mn->y);
 	no->dx16 = SHORT(mn->dx);
 	no->dy16 = SHORT(mn->dy);
 	for (j=0 ; j<2 ; j++)
 	{
-	    no->children[j] = SHORT(mn->children[j]);
 	    for (k=0 ; k<4 ; k++)
 		no->bbox16[j][k] = SHORT(mn->bbox[j][k]);
+	    no->children[j] = SHORT(mn->children[j]);
 	}
     }
-	
-    W_ReleaseLumpNum(lump);
 }
 
 
@@ -415,12 +470,14 @@ void P_LoadThings (int lump)
 //
 void P_LoadLineDefs (int lump)
 {
-    byte*		data;
     int			i;
+    int			off;
+    int			ntail;
     maplinedef_t*	mld;
     line_t*		ld;
     vertex_t*		v1;
     vertex_t*		v2;
+    maplinedef_t	tail[SAT_INPLACE_TAIL];
 	
     numlines = W_LumpLength (lump) / sizeof(maplinedef_t);
     lines = Z_Malloc (numlines*sizeof(line_t),PU_LEVEL,0);	
@@ -430,20 +487,28 @@ void P_LoadLineDefs (int lump)
        reopen the contiguity wall it was made to clear. */
     lines_validcount = Z_Malloc (numlines*sizeof(int),PU_LEVEL,0);
     memset (lines_validcount, 0, numlines*sizeof(int));
-    data = W_CacheLumpNum (lump,PU_STATIC);
-	
-    mld = (maplinedef_t *)data;
-    ld = lines;
-    for (i=0 ; i<numlines ; i++, mld++, ld++)
-    {
-	fixed_t		dx;
-	fixed_t		dy;
 
-	ld->flags = SHORT(mld->flags);
-	ld->special = SHORT(mld->special);
-	ld->tag = SHORT(mld->tag);
-	ld->v1i = (unsigned short)SHORT(mld->v1);
-	ld->v2i = (unsigned short)SHORT(mld->v2);
+    /* SATURN: in-place expansion, 14 -> 24 bytes (see the note above P_LoadVertexes). */
+    off = P_InPlaceOffset (numlines, sizeof(line_t), sizeof(maplinedef_t));
+    W_ReadLump (lump, (byte *)lines + off);
+    mld = (maplinedef_t *)((byte *)lines + off);
+
+    ntail = (numlines < SAT_INPLACE_TAIL) ? numlines : SAT_INPLACE_TAIL;
+    memcpy (tail, mld + (numlines - ntail), ntail*sizeof(maplinedef_t));
+
+    ld = lines;
+    for (i=0 ; i<numlines ; i++, ld++)
+    {
+	const maplinedef_t*	m = (i >= numlines - ntail)
+				  ? &tail[i - (numlines - ntail)] : &mld[i];
+	fixed_t			dx;
+	fixed_t			dy;
+
+	ld->flags = SHORT(m->flags);
+	ld->special = SHORT(m->special);
+	ld->tag = SHORT(m->tag);
+	ld->v1i = (unsigned short)SHORT(m->v1);
+	ld->v2i = (unsigned short)SHORT(m->v2);
 	v1 = &vertexes[ld->v1i];
 	v2 = &vertexes[ld->v2i];
 	dx = v2->x - v1->x;
@@ -489,13 +554,11 @@ void P_LoadLineDefs (int lump)
 	    ld->bbox16[BOXTOP]    = (short)(v1->y >> FRACBITS);
 	}
 
-	ld->sidenum[0] = SHORT(mld->sidenum[0]);
-	ld->sidenum[1] = SHORT(mld->sidenum[1]);
+	ld->sidenum[0] = SHORT(m->sidenum[0]);
+	ld->sidenum[1] = SHORT(m->sidenum[1]);
 	/* frontsector/backsector are no longer stored: LINE_FRONTSECTOR/LINE_BACKSECTOR do
 	   exactly the lookup this loop used to bake in. */
     }
-
-    W_ReleaseLumpNum(lump);
 }
 
 
