@@ -116,15 +116,15 @@ R_RenderMaskedSegRange
     //   for horizontal / vertical / diagonal. Diagonal?
     // OPTIMIZE: get rid of LIGHTSEGSHIFT globally
     curline = ds->curline;
-    frontsector = curline->frontsector;
-    backsector = curline->backsector;
-    texnum = texturetranslation[curline->sidedef->midtexture];
+    frontsector = SEG_FRONTSECTOR(curline);
+    backsector = SEG_BACKSECTOR(curline);
+    texnum = texturetranslation[SEG_SIDEDEF(curline)->midtexture];
 	
     lightnum = (frontsector->lightlevel >> LIGHTSEGSHIFT)+extralight;
 
-    if (curline->v1->y == curline->v2->y)
+    if (SEG_V1(curline)->y == SEG_V2(curline)->y)
 	lightnum--;
-    else if (curline->v1->x == curline->v2->x)
+    else if (SEG_V1(curline)->x == SEG_V2(curline)->x)
 	lightnum++;
 
     if (lightnum < 0)		
@@ -142,7 +142,7 @@ R_RenderMaskedSegRange
     mceilingclip = ds->sprtopclip;
     
     // find positioning
-    if (curline->linedef->flags & ML_DONTPEGBOTTOM)
+    if (SEG_LINEDEF(curline)->flags & ML_DONTPEGBOTTOM)
     {
 	dc_texturemid = frontsector->floorheight > backsector->floorheight
 	    ? frontsector->floorheight : backsector->floorheight;
@@ -154,7 +154,7 @@ R_RenderMaskedSegRange
 	    ? frontsector->ceilingheight : backsector->ceilingheight;
 	dc_texturemid = dc_texturemid - viewz;
     }
-    dc_texturemid += curline->sidedef->rowoffset;
+    dc_texturemid += SEG_SIDEDEF(curline)->rowoffset;
 			
     if (fixedcolormap)
 	dc_colormap = fixedcolormap;
@@ -1314,7 +1314,7 @@ void R_RenderSegLoop (void)
     /* DEBUG PAINT bit1 (r_data.c sat_wall_paint): paint EVERY CPU wall, doors and switches too --
        the point is to see which path owns each wall, and an exception would read as a hole. */
     sat_gc_site = 2;   /* SATURN row 16 `GCS`: everything up to the column loop is the PREAMBLE */
-    sat_wall_textured = (sat_wall_paint & 2) ? 0 : (curline->linedef->special != 0);
+    sat_wall_textured = (sat_wall_paint & 2) ? 0 : (SEG_LINEDEF(curline)->special != 0);
     /* SATURN PERF (step 2): a plain opaque wall in Potato mode is drawn as one
        solid colour by rp_exec_col (it reads cm->f3 + cm->cmap, NEVER cm->src) ->
        skip R_GetColumn (the memory-bound texture composite = the bulk of wall-prep
@@ -1380,7 +1380,7 @@ void R_RenderSegLoop (void)
 	   across it, small enough never to hold a genuinely magnified wall on VDP1 (where it squishes). */
 	magnified = (sx * 4 > mdu * (SAT_WALL_CPU_MAG * 4 - (seg_hyst ? 2 : 0)));
 
-	if (midtexture && !curline->backsector)
+	if (midtexture && !SEG_BACKSECTOR(curline))
 	{
 	    int s1 = (bottomfrac - topfrac) >> HEIGHTBITS;
 	    int s2 = ((bottomfrac + bottomstep * n) - (topfrac + topstep * n)) >> HEIGHTBITS;
@@ -1430,7 +1430,7 @@ void R_RenderSegLoop (void)
 	    {
 	    }
 	}
-	else if (curline->backsector)
+	else if (SEG_BACKSECTOR(curline))
 	{
 	    /* doors: upper/lower are SHORT bands -> the span test never trips them even up close, but
 	       they squish at the edge when magnified.  Route the whole seg (both tiers) to CPU on span
@@ -1503,8 +1503,8 @@ void R_RenderSegLoop (void)
     if (sat_wall_nocpu && !sat_wall_textured && SAT_WALL_VDP1_OK && sat_wall_skip && rw_stopx > rw_x)
     {
 	sat_sw_mid = sat_sw_up = sat_sw_lo = 0;
-	if (midtexture && !curline->backsector) sat_v1_mid = 1;
-	if (curline->backsector)
+	if (midtexture && !SEG_BACKSECTOR(curline)) sat_v1_mid = 1;
+	if (SEG_BACKSECTOR(curline))
 	{
 	    sat_v1_up = toptexture    ? 1 : 0;
 	    sat_v1_lo = bottomtexture ? 1 : 0;
@@ -1514,7 +1514,7 @@ void R_RenderSegLoop (void)
     /* SATURN VDP1 world renderer (Step 2): one-sided (solid) walls -> the platform as
        a quad.  The 4 screen corners come from the same topfrac/bottomfrac the loop
        below steps; midtexture = the full-height wall texture. */
-    if (sat_wall_hook && SAT_WALL_VDP1_OK && midtexture && !curline->backsector && rw_stopx > rw_x && (sat_v1_mid || sat_v1_mid_sub || sat_v1_mid_edge))
+    if (sat_wall_hook && SAT_WALL_VDP1_OK && midtexture && !SEG_BACKSECTOR(curline) && rw_stopx > rw_x && (sat_v1_mid || sat_v1_mid_sub || sat_v1_mid_edge))
     {
 	int n   = rw_stopx - 1 - rw_x;
 	int yl1 = (topfrac + HEIGHTUNIT - 1) >> HEIGHTBITS;
@@ -1652,7 +1652,7 @@ void R_RenderSegLoop (void)
        (bottomtexture) quads into the SAME painter list as the one-sided walls, so a
        NEAR two-sided frame correctly draws over a FAR one-sided wall seen through the
        opening (the gap between upper/lower has no texture -> the far wall shows there). */
-    if (sat_wall_hook && SAT_WALL_VDP1_OK && curline->backsector && rw_stopx > rw_x)
+    if (sat_wall_hook && SAT_WALL_VDP1_OK && SEG_BACKSECTOR(curline) && rw_stopx > rw_x)
     {
 	int n   = rw_stopx - 1 - rw_x;
 	int a1 = (rw_centerangle + xtoviewangle[rw_x])        >> ANGLETOFINESHIFT;
@@ -2288,21 +2288,21 @@ R_StoreWallRange_impl
 	I_Error ("Bad R_RenderWallRange: %i to %i", start , stop);
 #endif
     
-    sidedef = curline->sidedef;
-    linedef = curline->linedef;
+    sidedef = SEG_SIDEDEF(curline);
+    linedef = SEG_LINEDEF(curline);
 
     // mark the segment as visible for auto map
     linedef->flags |= ML_MAPPED;
     
     // calculate rw_distance for scale calculation
-    rw_normalangle = curline->angle + ANG90;
+    rw_normalangle = SEG_ANGLE(curline) + ANG90;
     offsetangle = abs(rw_normalangle-rw_angle1);
     
     if (offsetangle > ANG90)
 	offsetangle = ANG90;
 
     distangle = ANG90 - offsetangle;
-    hyp = R_PointToDist (curline->v1->x, curline->v1->y);
+    hyp = R_PointToDist (SEG_V1(curline)->x, SEG_V1(curline)->y);
     sineval = finesine[distangle>>ANGLETOFINESHIFT];
     rw_distance = FixedMul (hyp, sineval);
 		
@@ -2331,8 +2331,8 @@ R_StoreWallRange_impl
 	    fixed_t		trx,try;
 	    fixed_t		gxt,gyt;
 
-	    trx = curline->v1->x - viewx;
-	    try = curline->v1->y - viewy;
+	    trx = SEG_V1(curline)->x - viewx;
+	    try = SEG_V1(curline)->y - viewy;
 			
 	    gxt = FixedMul(trx,viewcos); 
 	    gyt = -FixedMul(try,viewsin); 
@@ -2536,7 +2536,7 @@ R_StoreWallRange_impl
 	if (rw_normalangle-rw_angle1 < ANG180)
 	    rw_offset = -rw_offset;
 
-	rw_offset += sidedef->textureoffset + curline->offset;
+	rw_offset += sidedef->textureoffset + SEG_OFFSET(curline);
 	rw_centerangle = ANG90 + viewangle - rw_normalangle;
 	
 	// calculate light table
@@ -2547,9 +2547,9 @@ R_StoreWallRange_impl
 	{
 	    lightnum = (frontsector->lightlevel >> LIGHTSEGSHIFT)+extralight;
 
-	    if (curline->v1->y == curline->v2->y)
+	    if (SEG_V1(curline)->y == SEG_V2(curline)->y)
 		lightnum--;
-	    else if (curline->v1->x == curline->v2->x)
+	    else if (SEG_V1(curline)->x == SEG_V2(curline)->x)
 		lightnum++;
 
 	    if (lightnum < 0)		

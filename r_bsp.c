@@ -79,6 +79,19 @@ void RP_FlushWalls (void);
 
 
 
+/* SATURN 2026-08-18: the one out-of-line resolver for seg_t's 16-bit backsector index.
+   SEG_NOSECTOR = one-sided (NULL, which no index can express); SEG_NULLSECTOR = the vanilla
+   "glass hack" static sector, which lives outside sectors[] and so needs a sentinel of its own
+   rather than being folded into one-sided -- that would change what the renderer draws. */
+sector_t* SEG_BACKSECTOR (const seg_t *s)
+{
+    if (s->bsi == SEG_NOSECTOR)
+	return (sector_t *)0;
+    if (s->bsi == SEG_NULLSECTOR)
+	return GetSectorAtNullAddress ();
+    return &sectors[s->bsi];
+}
+
 //
 // R_ClearDrawSegs
 //
@@ -329,8 +342,8 @@ void R_AddLine (seg_t*	line)
     curline = line;
 
     // OPTIMIZE: quickly reject orthogonal back sides.
-    angle1 = R_PointToAngle (line->v1->x, line->v1->y);
-    angle2 = R_PointToAngle (line->v2->x, line->v2->y);
+    angle1 = R_PointToAngle (SEG_V1(line)->x, SEG_V1(line)->y);
+    angle2 = R_PointToAngle (SEG_V2(line)->x, SEG_V2(line)->y);
     
     // Clip to view edges.
     // OPTIMIZE: make constant out of 2*clipangle (FIELDOFVIEW).
@@ -378,7 +391,7 @@ void R_AddLine (seg_t*	line)
     if (x1 == x2)
 	return;				
 	
-    backsector = line->backsector;
+    backsector = SEG_BACKSECTOR(line);
 
     // Single sided line?
     if (!backsector)
@@ -402,7 +415,7 @@ void R_AddLine (seg_t*	line)
     if (backsector->ceilingpic == frontsector->ceilingpic
 	&& backsector->floorpic == frontsector->floorpic
 	&& backsector->lightlevel == frontsector->lightlevel
-	&& curline->sidedef->midtexture == 0)
+	&& SEG_SIDEDEF(curline)->midtexture == 0)
     {
 	return;
     }

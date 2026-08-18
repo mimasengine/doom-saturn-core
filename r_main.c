@@ -221,11 +221,11 @@ R_PointOnSegSide
     fixed_t	left;
     fixed_t	right;
 	
-    lx = line->v1->x;
-    ly = line->v1->y;
-	
-    ldx = line->v2->x - lx;
-    ldy = line->v2->y - ly;
+    lx = SEG_V1(line)->x;
+    ly = SEG_V1(line)->y;
+
+    ldx = SEG_V2(line)->x - lx;
+    ldy = SEG_V2(line)->y - ly;
 	
     if (!ldx)
     {

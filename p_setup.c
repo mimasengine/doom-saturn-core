@@ -197,17 +197,19 @@ void P_LoadSegs (int lump)
     li = segs;
     for (i=0 ; i<numsegs ; i++, li++, ml++)
     {
-	li->v1 = &vertexes[SHORT(ml->v1)];
-	li->v2 = &vertexes[SHORT(ml->v2)];
+	/* SATURN 2026-08-18: seg_t is now 14 bytes of INDICES (see r_defs.h).  The two shifted
+	   fields are stored exactly as the WAD holds them -- Doom widened them to 32 bits here and
+	   the accessors shift them back at use, so this is a lossless re-encoding, not a rounding. */
+	li->v1i = (unsigned short)SHORT(ml->v1);
+	li->v2i = (unsigned short)SHORT(ml->v2);
 
-	li->angle = (SHORT(ml->angle))<<16;
-	li->offset = (SHORT(ml->offset))<<16;
+	li->ang16 = (unsigned short)SHORT(ml->angle);
+	li->off16 = (short)SHORT(ml->offset);
 	linedef = SHORT(ml->linedef);
 	ldef = &lines[linedef];
-	li->linedef = ldef;
 	side = SHORT(ml->side);
-	li->sidedef = &sides[ldef->sidenum[side]];
-	li->frontsector = sides[ldef->sidenum[side]].sector;
+	li->ldi = (unsigned short)((linedef << 1) | (side & 1));
+	li->fsi = (unsigned short)(sides[ldef->sidenum[side]].sector - sectors);
 
         if (ldef-> flags & ML_TWOSIDED)
         {
@@ -221,16 +223,16 @@ void P_LoadSegs (int lump)
 
             if (sidenum < 0 || sidenum >= numsides)
             {
-                li->backsector = GetSectorAtNullAddress();
+                li->bsi = SEG_NULLSECTOR;
             }
             else
             {
-                li->backsector = sides[sidenum].sector;
+                li->bsi = (unsigned short)(sides[sidenum].sector - sectors);
             }
         }
         else
         {
-	    li->backsector = 0;
+	    li->bsi = SEG_NOSECTOR;
         }
     }
 	
@@ -567,7 +569,7 @@ void P_GroupLines (void)
     for (i=0 ; i<numsubsectors ; i++, ss++)
     {
 	seg = &segs[ss->firstline];
-	ss->sector = seg->sidedef->sector;
+	ss->sector = SEG_SIDEDEF(seg)->sector;
     }
 
     // count number of lines in each sector
@@ -893,15 +895,9 @@ static void P_StageBSP (void)
     segs_hw       = P_StageTake (&p, &left, segs_lw,       gb);
 #endif
 
-    if (segs_hw && vertexes_hw)         /* staged segs read staged vertexes */
-    {
-        int i;
-        for (i = 0; i < numsegs; i++)
-        {
-            segs_hw[i].v1 = vertexes_hw + (segs_lw[i].v1 - vertexes_lw);
-            segs_hw[i].v2 = vertexes_hw + (segs_lw[i].v2 - vertexes_lw);
-        }
-    }
+    /* (the staged-segs pointer fix-up is GONE: seg_t now holds vertex INDICES, which are
+       position-independent, so a staged copy needs no patching at all.  One of the small dividends
+       of indices over pointers.) */
     sat_bsp_stage_used = (int)(p - sat_bsp_stage_buf);
 
     P_BspStageApply (sat_bsp_stage_on);

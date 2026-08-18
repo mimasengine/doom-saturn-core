@@ -177,7 +177,7 @@ boolean P_CrossSubsector (int num)
 
     for ( ; count ; seg++, count--)
     {
-	line = seg->linedef;
+	line = SEG_LINEDEF(seg);
 
 	// allready checked other side?
 	if (line->validcount == validcount)
@@ -219,8 +219,8 @@ boolean P_CrossSubsector (int num)
 	    return false;
 	
 	// crosses a two sided line
-	front = seg->frontsector;
-	back = seg->backsector;
+	front = SEG_FRONTSECTOR(seg);
+	back = SEG_BACKSECTOR(seg);
 
 	// no wall to block sight with?
 	if (front->floorheight == back->floorheight

@@ -233,25 +233,66 @@ typedef struct subsector_s
 //
 // The LineSeg.
 //
+/* 🔴 SATURN 2026-08-18 -- seg_t 32 -> 14 BYTES.  The boot wall is CONTIGUITY: P_LoadSegs asks
+   Z_Malloc for numsegs*sizeof(seg_t) in ONE run, and the zone's longest run at level load is
+   ~110 KB.  Measured offline over 161 witness maps: 35 of them demand more than that TODAY (TNT
+   MAP31 180 KB, SCYTHE MAP30 245 KB, Nuts3 210 KB) -- and TNT MAP19, the map already known not to
+   boot, is one of them.  At 14 bytes NONE of the 161 does.
+
+   The shrink is LOSSLESS, not a compromise, because the WAD already stores all of it in 16 bits:
+     offset  fixed_t   <- mapseg_t.offset is a short, loaded as (short)<<FRACBITS
+     angle   angle_t   <- mapseg_t.angle  is a short, loaded as (short)<<16
+   so storing the short and shifting at USE is bit-identical to what Doom kept in 32 bits.
+   v1/v2/linedef/front/back become INDICES: a pointer costs 4 bytes to say what 2 can.
+
+   WHY sidedef IS DERIVED BUT front/backsector ARE NOT.  d32xr derives all three and reaches 6
+   bytes.  `sidedef` is read 6 times in the whole engine, so deriving it is free.  `frontsector`
+   and `backsector` are read 54 times, on the renderer's hottest path -- deriving them turns one
+   load into THREE DEPENDENT loads (line -> sidenum -> side -> sector), which on a memory-bound
+   machine is exactly the trade this project keeps losing.  They stay as one indexed load.
+   14 vs 6 bytes changes nothing about the wall (62 KB vs 26 KB on the worst map, both far under
+   110), so the safe form wins.  Going to 6 stays available if RAM ever gets tight.
+
+   Fields are RENAMED, deliberately: every old `seg->v1` must become a compile error so the
+   compiler -- not my reading -- is the checklist of call sites. */
+#define SEG_NOSECTOR	0xffffu		/* backsector index meaning "one-sided"            */
+/* The "glass hack" (OTTAWAU.WAD): a two-sided line whose back sidenum is out of range.  Vanilla
+   hands back a STATIC sector that lives outside sectors[], so an index cannot name it -- it gets a
+   sentinel of its own rather than being silently folded into one-sided, which would change what the
+   renderer draws on those lines. */
+#define SEG_NULLSECTOR	0xfffeu
+
 typedef struct
 {
-    vertex_t*	v1;
-    vertex_t*	v2;
-    
-    fixed_t	offset;
-
-    angle_t	angle;
-
-    side_t*	sidedef;
-    line_t*	linedef;
-
-    // Sector references.
-    // Could be retrieved from linedef, too.
-    // backsector is NULL for one sided lines
-    sector_t*	frontsector;
-    sector_t*	backsector;
-    
+    unsigned short	v1i;		/* vertex INDEX  (was vertex_t*)                  */
+    unsigned short	v2i;
+    unsigned short	ldi;		/* linedef INDEX, SIDE PACKED IN BIT 0            */
+    unsigned short	fsi;		/* frontsector INDEX                              */
+    unsigned short	bsi;		/* backsector INDEX, or SEG_NOSECTOR              */
+    short		off16;		/* fixed_t offset  = off16 << FRACBITS  (exact)    */
+    unsigned short	ang16;		/* angle_t angle   = ang16 << 16       (exact)    */
 } seg_t;
+
+/* Accessors.  Read-only by construction: nothing in the engine writes a seg after P_LoadSegs, which
+   is what makes step 3 (a WAD-resident, never-copied seg array) possible later. */
+/* No externs here: r_state.h already declares vertexes/lines/sides/sectors, and a macro is only
+   expanded at its USE site, which is always after that header. */
+#define SEG_V1(s)		(&vertexes[(s)->v1i])
+#define SEG_V2(s)		(&vertexes[(s)->v2i])
+#define SEG_OFFSET(s)		((fixed_t)(s)->off16 << FRACBITS)
+#define SEG_ANGLE(s)		((angle_t)(s)->ang16 << 16)
+#define SEG_LINEDEF(s)		(&lines[(s)->ldi >> 1])
+#define SEG_SIDE(s)		((s)->ldi & 1)
+#define SEG_SIDEDEF(s)		(&sides[SEG_LINEDEF(s)->sidenum[SEG_SIDE(s)]])
+#define SEG_FRONTSECTOR(s)	(&sectors[(s)->fsi])
+/* A FUNCTION, not a macro, and deliberately so.  The first version inlined a two-way conditional at
+   all 54 call sites and cost ~900 B of .text -- which on this target is 900 B of TLSF pool, and the
+   pre-flight refused the build.  One out-of-line copy is smaller than 54 inlined ones, and the cost
+   is nil where it matters: every hot user (R_AddLine, R_StoreWallRange, R_RenderMaskedSegRange)
+   reads it ONCE per seg into a local, never per column.  Not `static inline` in the header for the
+   same reason -- that would put it back in every translation unit. */
+sector_t*	GetSectorAtNullAddress (void);   /* p_setup.c -- the vanilla glass hack */
+sector_t*	SEG_BACKSECTOR (const seg_t *s);
 
 
 
