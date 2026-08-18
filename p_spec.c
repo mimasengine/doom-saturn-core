@@ -221,7 +221,7 @@ getSector
   int		line,
   int		side )
 {
-    return sides[ (sectors[currentSector].lines[line])->sidenum[side] ].sector;
+    return SIDE_SECTOR (&sides[ (sectors[currentSector].lines[line])->sidenum[side] ]);
 }
 
 

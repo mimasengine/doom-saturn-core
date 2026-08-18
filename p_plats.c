@@ -174,7 +174,7 @@ EV_DoPlat
 	{
 	  case raiseToNearestAndChange:
 	    plat->speed = PLATSPEED/2;
-	    sec->floorpic = sides[line->sidenum[0]].sector->floorpic;
+	    sec->floorpic = SIDE_SECTOR (&sides[line->sidenum[0]])->floorpic;
 	    plat->high = P_FindNextHighestFloor(sec,sec->floorheight);
 	    plat->wait = 0;
 	    plat->status = up;
@@ -186,7 +186,7 @@ EV_DoPlat
 	    
 	  case raiseAndChange:
 	    plat->speed = PLATSPEED/2;
-	    sec->floorpic = sides[line->sidenum[0]].sector->floorpic;
+	    sec->floorpic = SIDE_SECTOR (&sides[line->sidenum[0]])->floorpic;
 	    plat->high = sec->floorheight + amount*FRACUNIT;
 	    plat->wait = 0;
 	    plat->status = up;

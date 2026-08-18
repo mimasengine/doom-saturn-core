@@ -80,6 +80,13 @@ node_t*		nodes;
 _Static_assert (sizeof(seg_t)  == 14, "seg_t must stay 14 bytes (was 32) -- see r_defs.h");
 _Static_assert (sizeof(node_t) == 28, "node_t must stay 28 bytes (was 52) -- see r_defs.h");
 _Static_assert (sizeof(line_t) == 24, "line_t must stay 24 bytes (was 64) -- see r_defs.h");
+_Static_assert (sizeof(side_t) == 16, "side_t must stay 16 bytes (was 20) -- see r_defs.h");
+/* SATURN 2026-08-18 -- the level's BIGGEST consumer, pinned so the analysis quotes the compiler
+   and not my field count.  SCYTHE MAP30 spawns 1082 mobjs on skill 4; the zone charges
+   156 + sizeof(memblock_t) = 180 bytes for each (the figure the failing Z_Malloc reported), so
+   190 KB -- of which 26 KB is BLOCK HEADER, one per mobj.  That header, not the struct, is the
+   cheapest thing to attack next. */
+_Static_assert (sizeof(mobj_t) == 156, "mobj_t is 156 bytes; the zone charges 180 with its header");
 /* The in-place load below computes its overlap bound from BOTH sides of each conversion, so the
    on-disc record sizes are load-bearing too.  They are all-short structs, so PACKEDATTR is a
    no-op for them today -- which is exactly why a silent change here would go unnoticed. */
@@ -276,7 +283,7 @@ void P_LoadSegs (int lump)
 	ldef = &lines[linedef];
 	side = SHORT(m->side);
 	li->ldi = (unsigned short)((linedef << 1) | (side & 1));
-	li->fsi = (unsigned short)(sides[ldef->sidenum[side]].sector - sectors);
+	li->fsi = sides[ldef->sidenum[side]].seci;
 
         if (ldef-> flags & ML_TWOSIDED)
         {
@@ -294,7 +301,7 @@ void P_LoadSegs (int lump)
             }
             else
             {
-                li->bsi = (unsigned short)(sides[sidenum].sector - sectors);
+                li->bsi = sides[sidenum].seci;
             }
         }
         else
@@ -586,7 +593,14 @@ void P_LoadSideDefs (int lump)
 	sd->toptexture = R_TextureNumForName(msd->toptexture);
 	sd->bottomtexture = R_TextureNumForName(msd->bottomtexture);
 	sd->midtexture = R_TextureNumForName(msd->midtexture);
-	sd->sector = &sectors[SHORT(msd->sector)];
+	{   /* SATURN: index, not pointer (r_defs.h).  Vanilla indexed sectors[] with whatever the
+	       WAD said; an out-of-range value used to build a wild pointer, and now it would build
+	       a wild INDEX -- same bug, so clamp it once here where it costs nothing. */
+	    int	secnum = SHORT(msd->sector);
+	    if (secnum < 0 || secnum >= numsectors)
+		secnum = 0;
+	    sd->seci = (unsigned short)secnum;
+	}
     }
 
     W_ReleaseLumpNum(lump);
@@ -654,7 +668,7 @@ void P_GroupLines (void)
     for (i=0 ; i<numsubsectors ; i++, ss++)
     {
 	seg = &segs[ss->firstline];
-	ss->sector = SEG_SIDEDEF(seg)->sector;
+	ss->sector = SIDE_SECTOR(SEG_SIDEDEF(seg));
     }
 
     // count number of lines in each sector

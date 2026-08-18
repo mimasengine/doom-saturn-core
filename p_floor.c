@@ -403,7 +403,7 @@ EV_DoFloor
 	    {
 		if ( twoSided(secnum, i) )
 		{
-		    if (getSide(secnum,i,0)->sector-sectors == secnum)
+		    if (getSide(secnum,i,0)->seci == secnum)
 		    {
 			sec = getSector(secnum,i,1);
 

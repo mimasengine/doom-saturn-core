@@ -61,14 +61,14 @@ sector_t* LINE_FRONTSECTOR (const line_t *l)
 {
     if (l->sidenum[0] == -1)
 	return (sector_t *)0;
-    return sides[l->sidenum[0]].sector;
+    return SIDE_SECTOR (&sides[l->sidenum[0]]);
 }
 
 sector_t* LINE_BACKSECTOR (const line_t *l)
 {
     if (l->sidenum[1] == -1)
 	return (sector_t *)0;
-    return sides[l->sidenum[1]].sector;
+    return SIDE_SECTOR (&sides[l->sidenum[1]]);
 }
 
 

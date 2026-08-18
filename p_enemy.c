@@ -128,10 +128,10 @@ P_RecursiveSound
 	if (openrange <= 0)
 	    continue;	// closed door
 	
-	if ( sides[ check->sidenum[0] ].sector == sec)
-	    other = sides[ check->sidenum[1] ] .sector;
+	if ( SIDE_SECTOR (&sides[ check->sidenum[0] ]) == sec)
+	    other = SIDE_SECTOR (&sides[ check->sidenum[1] ]);
 	else
-	    other = sides[ check->sidenum[0] ].sector;
+	    other = SIDE_SECTOR (&sides[ check->sidenum[0] ]);
 	
 	if (check->flags & ML_SOUNDBLOCK)
 	{

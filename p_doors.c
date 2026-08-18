@@ -392,7 +392,7 @@ EV_VerticalDoor
     }
 	
     // if the sector has an active thinker, use it
-    sec = sides[ line->sidenum[side^1]] .sector;
+    sec = SIDE_SECTOR (&sides[ line->sidenum[side^1] ]);
 
     if (sec->specialdata)
     {

@@ -151,10 +151,16 @@ typedef struct
     short	bottomtexture;
     short	midtexture;
 
-    // Sector the SideDef is facing.
-    sector_t*	sector;
-    
+    /* SATURN 2026-08-18 -- side_t 20 -> 16 bytes.  With line_t/seg_t/node_t shrunk, SIDEDEFS
+       became the LARGEST single level allocation on the worst maps (SCYTHE MAP30: 5393 sides,
+       105 KB) -- so the same lossless trick applies here.  Only the sector pointer can go:
+       textureoffset and rowoffset stay fixed_t because scrolling specials ADD to them every tic
+       and would overflow a short.  4 bytes x numsides = 21 KB back on MAP30. */
+    unsigned short	seci;		/* sector INDEX (was sector_t*) */
+
 } side_t;
+
+#define SIDE_SECTOR(s)	(&sectors[(s)->seci])
 
 
 
