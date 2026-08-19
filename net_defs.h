@@ -42,7 +42,13 @@
 
 // Networking and tick handling related.
 
-#define BACKUPTICS 128
+// SATURN 2026-08-19: 128 -> 32.  BACKUPTICS sizes the ticcmd ring (d_loop.c ticdata[] =
+// BACKUPTICS x MAXPLAYERS ticcmds + flags, ~12-15 KB of HWRAM .bss) for a NETWORK lookahead
+// this port does not have: the network transport is removed (local/split play only), and the
+// engine's own catch-up cap bounds maketic at gametic+8 (d_loop.c maketic clamp), so the ring
+// span can never exceed 8+ticdup.  32 keeps a 4x margin over that bound.  Recovered ~13 KB of
+// HWRAM = TLSF pool headroom (the boot pre-flight floor is 4.8 KB and the pool sat at 3.97).
+#define BACKUPTICS 32
 
 typedef struct _net_module_s net_module_t;
 typedef struct _net_packet_s net_packet_t;
