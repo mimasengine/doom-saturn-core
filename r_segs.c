@@ -658,7 +658,13 @@ extern int sat_dc_solid;   /* r_draw.c: this colfunc() call is an opaque WALL co
    (seg << 2 | tier).  Z_Malloc'd on first use so it lives in the Doom heap (LWRAM) and costs the
    HWRAM TLSF pool nothing.  Walls past SAT_LEADH_MAX in a frame simply get no history (they draw
    as before) -- a bounded degradation, never a wrong pixel. */
-int sat_wall_lead_x = 1;   /* 0 = off, else compare against the quad emitted X frames ago (pad R+A) */
+/* SATURN 2026-08-19: PARKED, boot default 0 (was 1).  The stale pair this repainted no longer
+   exists: the platform present is now the manual VBE-timed swap (dg_saturn.cxx sat_mp_*), which
+   commits the VDP1 wall list and the software picture on the same field -- the set difference
+   below is empty by construction.  Owner-validated on Ymir (holes gone, +1.5-5 fps with the
+   lead-fill off).  The whole mechanism stays intact and dormant (every entry point early-outs on
+   sat_wall_lead_x == 0); set > 0 to revive for an A/B.  No pad chord re-arms it any more. */
+int sat_wall_lead_x = 0;   /* 0 = off, else compare against the quad emitted X frames ago */
 int sat_lead_cols   = 0;   /* diagnostic: extra software column-spans drawn, per overlay window     */
 /* DIFFERENCE-SPAN DRAW MODE (pad R+Right, row-13 `L<X><m>/<spans>`).
      0 = '-' master, TEXTURED -- the reference.
