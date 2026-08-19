@@ -1684,29 +1684,33 @@ void R_SlaveDrawMasked (int x0, int x1)
    THING_MIN_SCREEN_PCT = min sprite area as a percent of the view area (excludes tiny pickups).
    THING_TEX_TRACK      = max distinct (lump,cmap) textures tracked per frame for the slot grant.
    THING_EMIT_MAX       = HARD max THINGS emitted to VDP1 per frame (array bound + outdoor ceiling).
-     This is the VDP1 RASTER bound, NOT the VRAM/texture bound: the VDP1 (1-cycle-auto) plots the
-     whole command list in one frame and DROPS the tail if it overruns -- and a dropped thing
-     VANISHES (the software fill was already skipped when the platform accepted it) = enemy flicker.
-     The walls SHARE that raster, and their share varies wildly (open outdoor = few segs, spare VDP1;
-     tech room = dense architecture = VDP1 already near full -- flickered at only th4!).  So the
-     ACTUAL per-frame cap is sat_thing_emit_cap, which the platform AIMD-adapts on the real overrun
-     signal (grow when the plot finished, back off when it overran): it climbs outdoors and shrinks
-     below the flicker threshold in the tech room automatically.  THING_EMIT_MAX just bounds the top
-     end (and the selection scratch arrays); the rest stay software = drawn correctly, no flicker. */
-#define THING_MIN_SCREEN_PCT 2
+     This is the VDP1 RASTER bound, NOT the VRAM/texture bound.  SATURN 2026-08-19: under the
+     platform's manual present the old 1-cycle guillotine (tail DROPPED at the field end -> enemy
+     flicker) no longer exists -- the swap waits for the plot, and an overrun instead shows as
+     frame-time lost (the fence gate spin), which the platform budget backs off on.  The walls
+     still SHARE the plot time and their share varies wildly, so the ACTUAL per-frame cap remains
+     sat_thing_emit_cap, AIMD-adapted by the platform on that live signal.  THING_EMIT_MAX just
+     bounds the top end (and the selection scratch arrays); the rest stay software = drawn
+     correctly, never dropped. */
+/* SATURN 2026-08-19 (step 1, with the manual present shipped): floors 2%->1% / 5pm->2pm, EMIT_MAX
+   16->32 (lockstep with platform THING_ADAPT_MAX), boot cap 4->8.  The plot window grew from
+   "one field minus the walls" to "the whole frame", so the old floors were rejecting sprites the
+   raster can now absorb -- PASS 1 rejected them before the platform hook ever saw them.  The
+   AIMD + the VRAM slot grant still bound the real load per scene.  DoomJo: constants only. */
+#define THING_MIN_SCREEN_PCT 1
 /* SATURN: shootable ACTORS (monsters + barrels) route to VDP1 at a MUCH lower on-screen floor than
    decorations/pickups -- per-mille of the view, so an approaching monster becomes a crisp prio-7
    VDP1 sprite well before it is close (in low-res M7 the software leftovers are half-res, so the
-   sooner a monster leaves the software fill the better it looks).  5/1000 = 0.5% ~= a 16px monster;
-   decorations still wait for the 2% THING_MIN_SCREEN_PCT floor.  Actors also outrank decorations in
+   sooner a monster leaves the software fill the better it looks).  2/1000 = 0.2% ~= a 10px monster;
+   decorations still wait for the 1% THING_MIN_SCREEN_PCT floor.  Actors also outrank decorations in
    both the texture grant and the emit budget below. */
-#define THING_ACTOR_SCREEN_PM 5
+#define THING_ACTOR_SCREEN_PM 2
 #define THING_TEX_TRACK      32
-#define THING_EMIT_MAX       16
+#define THING_EMIT_MAX       32
 
 /* Per-frame VDP1 things budget -- AIMD-adapted by the platform on the VDP1 overrun signal
    (sat_walls_kick), clamped to [0, THING_EMIT_MAX] by PASS 1.  Shared with the platform. */
-int sat_thing_emit_cap = 4;
+int sat_thing_emit_cap = 8;
 
 /* SATURN: the other players' colour remap (MF_TRANSLATION -> indigo/brown/red marine), NULL for
    everything else.  Same table the software R_DrawTranslatedColumn indexes; the platform applies it
