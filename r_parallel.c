@@ -922,6 +922,17 @@ static void master_cache_purge(void)
  * local spanstart_l[SCREENHEIGHT] ~0.9KB).                                                      *
  * ------------------------------------------------------------------------------------------ */
 int sat_plane_parallel = 0;              /* set by the Mimas platform (src/main.cxx) */
+/* SATURN 2026-08-20: allow the slave shares (plane-split here, masked-split in r_things.c) in
+   SPLIT co-op too.  The `sat_local_players <= 1` gates were the 2026-07-20 freeze guard, kept
+   after the mechanism they guarded was hardened away (RP_WaitPlanes FRT-bounded + idempotent
+   fallback, RP_WaitMasked 100 ms timeout with the cosmetic no-draw fallback) -- re-enabled for
+   1p on 2026-07-30 and simply never retested in MP (owner, 2026-08-20).  HW 2p/3p/4p captures
+   read SLV b0% across entire sessions while the per-view render sums ran 50-140 ms: a whole
+   CPU idle in exactly the modes that need it most.  1 = both shares follow the 1p rules in
+   split (each view's dispatch joins inside its own R_DrawPlanes / R_DrawMasked, so no
+   cross-view state is ever live on the slave); 0 = the old MP-off behaviour (platform chord
+   pad R+B, togglable from the 1p menu side and persistent into the split session). */
+int sat_mp_slave = 1;
 extern void R_DrawPlaneWorklist(int from, int to);
 
 static volatile int rp_plane_done = 1;
@@ -1121,14 +1132,16 @@ void RP_PlaneJoin(void)
 void RP_DrawPlanesSplit(int n)
 {
     int m = n - 1;
-    if (rp_plane_dead) { R_DrawPlaneWorklist(0, n); return; }   /* self-healed to master-only */
+    if (rp_plane_dead) { RP_MPlaneEnter(); R_DrawPlaneWorklist(0, n); RP_MPlaneLeave(); return; }   /* self-healed to master-only */
     rp_plane_disp_n = n;
     rp_sgl_workptr_reset();                  /* GBR-creep guard + joins aux AND any outstanding plane job */
     PLANE_DONE = 0;                          /* AFTER the join above -- it waits on this very flag */
     for (int i = 0; i < n; i++) rp_plane_lock[i] = 0;         /* arm claims (write-through to RAM) */
     slSlaveFunc(rp_plane_tas_body, (void *)(unsigned int)n);  /* slave claims UP from 0 */
     rp_plane_pending = 1;                    /* a record is now live -> must be joined before any rewind */
+    RP_MPlaneEnter();
     while (m >= 0) { if (!rp_tas_claim(m)) break; R_DrawPlaneWorklist(m, m + 1); m--; }  /* master DOWN */
+    RP_MPlaneLeave();                        /* row 5 `Pm`: the master's fill share of the steal */
     /* m<0 => the master's meet-in-the-middle steal claimed+drew EVERY plane before the slave got
        scheduled => there is no WORK to wait for, so we do not block here.  The record is still live
        though: rp_plane_pending leaves it to the deferred join (rp_sgl_workptr_reset).  Only block now
@@ -1149,7 +1162,7 @@ void RP_WaitPlanes(void)
     /* slave stalled mid-draw (claimed planes it never finished): idempotently redraw the whole
        worklist.  Opaque flats -> the redraw writes the SAME pixels, so no missing planes, no double
        image; the only cost is the redundant draw of the ones already done (a slow frame, not a hang). */
-    if (!ok) R_DrawPlaneWorklist(0, rp_plane_disp_n);
+    if (!ok) { RP_MPlaneEnter(); R_DrawPlaneWorklist(0, rp_plane_disp_n); RP_MPlaneLeave(); }
     master_cache_purge();                     /* read the slave's drawn plane pixels before the blit */
 }
 
@@ -1568,6 +1581,12 @@ static unsigned int   prof_flatalloc;   /* W_CacheLumpNum/Release per visplane c
 static unsigned short prof_fc_t0;
 static unsigned int   prof_makespans;   /* R_MakeSpans walk + R_MapPlane span math c P */
 static unsigned short prof_ms_t0;
+/* SATURN 2026-08-19 (plane-fill accounting, VDP1-planes verdict probe): the MASTER's share of the
+   worklist drain -- the TAS steal loop, the rp_plane_dead fallback, the timeout redraw and the
+   r_plane.c master-only branch.  Row 5 `Pm` = (prof_mplane + prof_makespans)/224 ms; the slave
+   twin `Ps` is slave_pbusy's per-frame delta (already accumulated, was never printed in ms). */
+static unsigned int   prof_mplane;
+static unsigned short prof_mp_t0;
 /* SATURN PERF (RBG0 candidate sizing): per-frame floor/ceiling FILL accounting.
    pix = total non-sky span pixels (the P fill workload); dom = the largest single
    (picnum,height) flat group's pixels (the RBG0 offload prize); n = non-sky
@@ -1579,6 +1598,28 @@ static unsigned int   prof_plane_n;
 static unsigned int   prof_pp_cur_sum;
 static int            prof_pp_cur_pic;
 static int            prof_pp_cur_h;
+/* SATURN 2026-08-19 (piecewise-quad plane probe v2, RESIDENT in the full overlay): quadn =
+   straight RUNS >= RPQ_MINW cols of visplane silhouette (per-column top/bottom steps confined
+   to two adjacent values) = the would-be VDP1 command count; quadpx = their pixels.  Surfaced
+   as row 8 `Q<n>/<pct>`: runs / their share of all software plane pixels.  v1 (whole-plane
+   one-quad test, armed by pad L+B) read Q0/0 everywhere -- silhouette corners; that zero was
+   data, not a bug. */
+static unsigned int   prof_plane_quadn;
+static unsigned int   prof_plane_quadpx;
+int sat_plane_quad_n   = 0;             /* per-frame publish for the platform overlay (row 8) */
+int sat_plane_quad_pct = 0;
+/* SATURN 2026-08-19 (probe inc-1, "le budget avant le mécanisme"): the run count is an
+   OPTIMISTIC bound -- an emitted run must be BANDED (FLOOR_HBAND rows, anti-swim) and TILED
+   (a 64x64 flat cannot wrap on VDP1), so the real bill is sum(bands x u-tiles), not 1/run.
+   Owner's level-1 TNT round: Q 1-23 runs / 77-99% pixel coverage -> the deciding numbers for
+   increment 0 (emit the TOP-4 runs) are that set's REAL command bill + its pixel share.
+   prof_q4_px/cmd = the frame's 4 largest runs by pixels + each one's banded-tile cost
+   (FLOOR_HBAND/FLOOR_MAXTILES arithmetic, same as the removed ftex estimator).
+   Row 8 `E<cmds>/<pct>`. */
+static unsigned int   prof_q4_px[4];
+static unsigned int   prof_q4_cmd[4];
+int sat_plane_q4cmd = 0;                /* top-4 runs: real VDP1 command bill (banded+tiled) */
+int sat_plane_q4pct = 0;                /* top-4 runs: % of all software plane pixels        */
 /* SATURN (VDP1-floor inc-0): for each non-sky regular flat (= the surfaces that would
    be deported to VDP1 affine strips -- other-height floors + ceilings; the RBG0 view-
    sector floor is already `continue`d before RP_PlanePixels, so it is excluded), estimate
@@ -1736,6 +1777,16 @@ void RP_MakeSpansLeave(void) {
     prof_makespans += (unsigned short)(rp_frt() - prof_ms_t0);
 #endif
 }
+void RP_MPlaneEnter(void) {
+#if RP_PROF
+    prof_mp_t0 = rp_frt();
+#endif
+}
+void RP_MPlaneLeave(void) {
+#if RP_PROF
+    prof_mplane += (unsigned short)(rp_frt() - prof_mp_t0);
+#endif
+}
 
 /* SATURN sprite-cost profiler (SCU-DSP feasibility study, deliverable #1): isolate
    sprite PROJECTION (R_ProjectSprite -- folded into Bw during the BSP walk today)
@@ -1801,35 +1852,135 @@ void RP_SprStats(int *proj10, int *fill10, int *nproj, int *ndraw) {
    depth/slope.  Redundant-but-legal externs keep this profiler self-contained. */
 extern fixed_t basexscale, baseyscale, viewz, yslope[];
 extern int     sat_vdp2_floor;
+
+/* Close one straight run of the piecewise-quad probe: count it (>= RPQ_MINW cols), then price
+   it the way the emitter would pay -- FLOOR_HBAND bands over the run's own y-extent, u-tiles
+   per band from the depth at the band's midline (same arithmetic as the legacy whole-plane
+   estimator below, scoped to the run's bbox) -- and fold it into the frame's top-4-by-pixels
+   set (prof_q4_*).  wcols = run width in columns. */
+#define RPQ_MINW 8
+static void rpq_close(int wcols, unsigned int rpix, int rymin, int rymax, int height)
+{
+    unsigned int tiles = 0u;
+    fixed_t ph;
+    int yb;
+    if (wcols < RPQ_MINW) return;
+    prof_plane_quadn++;
+    prof_plane_quadpx += rpix;
+    ph = (height >= viewz) ? ((fixed_t)height - viewz) : (viewz - (fixed_t)height);
+    for (yb = rymin; yb <= rymax; yb += FLOOR_HBAND)
+    {
+        fixed_t dist, xs, ys, axs, ays;
+        unsigned int du, dv, span;
+        int t;
+        int ym = yb + (FLOOR_HBAND >> 1);
+        if (ym > rymax) ym = rymax;
+        if (ym < 0) ym = 0; else if (ym >= viewheight) ym = viewheight - 1;
+        dist = FixedMul(ph, yslope[ym]);
+        xs = FixedMul(dist, basexscale); axs = (xs < 0) ? -xs : xs;
+        ys = FixedMul(dist, baseyscale); ays = (ys < 0) ? -ys : ys;
+        du = ((unsigned int)axs >> 8) * (unsigned int)wcols >> 8;   /* texels across the run */
+        dv = ((unsigned int)ays >> 8) * (unsigned int)wcols >> 8;
+        span = (du > dv) ? du : dv;
+        t = (int)(span / 64u) + 1;
+        if (t > FLOOR_MAXTILES) t = FLOOR_MAXTILES;
+        tiles += (unsigned int)t;
+    }
+    {   /* top-4 insertion by pixel mass (4 slots: increment-0's candidate set) */
+        int i, j;
+        for (i = 0; i < 4; i++)
+            if (rpix > prof_q4_px[i])
+            {
+                for (j = 3; j > i; j--)
+                { prof_q4_px[j] = prof_q4_px[j-1]; prof_q4_cmd[j] = prof_q4_cmd[j-1]; }
+                prof_q4_px[i] = rpix; prof_q4_cmd[i] = tiles;
+                break;
+            }
+    }
+}
 #endif
 void RP_PlanePixels(int picnum, int height, int minx, int maxx,
                     const unsigned char *top, const unsigned char *bottom)
 {
 #if RP_PROF
     unsigned int pix = 0u, vq = 0u;
-    /* SATURN: this per-visplane, per-column rescan is a pure floor-SIZER stat (FLR/CLS) that is
-       off the default overlay and inflates the P it measures.  Skip it unless the sizer is armed
-       AND the overlay is in full mode -- reclaims the rescan every frame in normal play. */
-    if (!sat_prof_planepix || sat_dbg_overlay_mode != 0) return;
+    /* SATURN 2026-08-19 v2 (owner: "pourquoi un toggle si la sonde ne change rien ?"): the QUAD
+       probe below is RESIDENT in the full overlay -- one fused O(width) pass, byte reads only
+       (~0.5-1 ms worst plane-heavy frame; the historical "inflates P" tax, accepted until the
+       planes verdict lands, then this whole probe goes).  Only the LEGACY floor-sizer estimate
+       (the FixedMul band loop, consumers = the cut FLT row) still hides behind sat_prof_planepix
+       (pad L+B).  Overlay fps-only/off still skips everything: no measurement, no tax. */
+    if (sat_dbg_overlay_mode != 0) return;
     int x, ymin = 255, ymax = -1;
-    for (x = minx; x <= maxx; x++)
+    /* v1 counted visplanes that are ONE screen quad (top[]+bottom[] linear over the whole span)
+       and read Q0/0 on every owner capture.  ⚠ That zero was never a measurement: the publish
+       sat in RP_EndFrame's rp_active block, which the shipping config (rp_disabled) never
+       reaches -- found on the owner's THIRD all-zero round, fixed in rp_p3_prof_show.  The
+       "silhouette corners" reading of those zeros was a rationalisation of a dead pipe; corners
+       are real, but v1 was never actually tried.  v2 measures the better population anyway --
+       what a VDP1 plane path would actually emit:
+       maximal RUNS of columns whose top[] and bottom[] per-column steps each stay confined to
+       two adjacent values {k,k+1} (= a rasterised straight line; a corner breaks the pair).
+       Each run >= RPQ_MINW cols counts as ONE would-be VDP1 command (distorted sprite) into
+       prof_plane_quadn, its pixels into prof_plane_quadpx (row 8 `Q<n>/<pct>`).  OPTIMISTIC by
+       design (a gentle corner drifting < 1 px/col inside a run is missed): if even this upper
+       bound is small, the VDP1-planes burial is final. */
     {
-        unsigned int t = top[x];
-        if (t != 0xffu)
+        int runx = -1;                    /* current run start col, -1 = closed */
+        unsigned int rpix = 0u;           /* pixels inside the current run      */
+        int pt = 0, pb = 0;               /* previous column's top/bottom       */
+        int rymin = 0, rymax = 0;         /* the run's own screen-y bbox (tile pricing) */
+        int tmin = 0, tmax = 0, bmin = 0, bmax = 0, seeded = 0;
+        for (x = minx; x <= maxx; x++)
         {
+            unsigned int t = top[x];
             unsigned int b = bottom[x];
-            if (b >= t)
+            if (t != 0xffu && b >= t)
             {
-                pix += b - t + 1u;
+                unsigned int span = b - t + 1u;
+                pix += span;
                 if ((int)t < ymin) ymin = (int)t;     /* visplane screen-y extent */
                 if ((int)b > ymax) ymax = (int)b;
+                if (runx < 0)
+                { runx = x; rpix = span; seeded = 0; rymin = (int)t; rymax = (int)b; }
+                else
+                {
+                    int st = (int)t - pt, sb = (int)b - pb;
+                    if (!seeded) { tmin = tmax = st; bmin = bmax = sb; seeded = 1; }
+                    else
+                    {
+                        if (st < tmin) tmin = st; else if (st > tmax) tmax = st;
+                        if (sb < bmin) bmin = sb; else if (sb > bmax) bmax = sb;
+                    }
+                    if (tmax - tmin >= 2 || bmax - bmin >= 2)
+                    {   /* corner at x: close [runx,x-1], reopen AT x */
+                        rpq_close(x - runx, rpix, rymin, rymax, height);
+                        runx = x; rpix = span; seeded = 0;
+                        rymin = (int)t; rymax = (int)b;
+                    }
+                    else
+                    {
+                        rpix += span;
+                        if ((int)t < rymin) rymin = (int)t;
+                        if ((int)b > rymax) rymax = (int)b;
+                    }
+                }
+                pt = (int)t; pb = (int)b;
+            }
+            else if (runx >= 0)           /* empty column: close [runx,x-1] */
+            {
+                rpq_close(x - runx, rpix, rymin, rymax, height);
+                runx = -1;
             }
         }
+        if (runx >= 0)
+            rpq_close(maxx + 1 - runx, rpix, rymin, rymax, height);
     }
     /* VDP1-floor quad estimate (inc-0): bbox-clamped affine strips.  Split [ymin,ymax]
        into FLOOR_HBAND bands; per band the flat wraps every 64 texels across the bbox
-       width -> tiles = u-span/64 + 1.  Mirrors what the emitter would produce. */
-    if (ymax >= ymin)
+       width -> tiles = u-span/64 + 1.  Mirrors what the emitter would produce.
+       LEGACY sizer (cut FLT row consumers) -- the only part still behind pad L+B. */
+    if (sat_prof_planepix && ymax >= ymin)
     {
         fixed_t ph = (height >= viewz) ? (height - viewz) : (viewz - height);
         int width = maxx - minx + 1;
@@ -1853,6 +2004,8 @@ void RP_PlanePixels(int picnum, int height, int minx, int maxx,
             vq += (unsigned int)tiles;
         }
     }
+    /* (v1 whole-plane NATURAL-QUAD test removed same day: silhouette corners make one-quad
+       visplanes near-nonexistent -- Q0/0 on every capture.  The piecewise-run pass above is v2.) */
     prof_plane_pix += pix;
     prof_floor_vq  += vq;
     /* interior = does NOT touch the near screen edge (bottom for a floor, top for a ceiling) */
@@ -2124,6 +2277,7 @@ void RP_BeginFrame(void)
        ONE reset site, both paths.  Anything per-frame added below MUST go here. */
     prof_wallprep = 0;                                                   /* Bp accumulator */
     prof_segloop = prof_segrout = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
+    prof_mplane = 0;                                                     /* row 5 `Pm` (master plane drain) */
     prof_seg_cols = prof_seg_fill = prof_seg_px = prof_lead_px = 0;      /* row 14 `SEG` -- lp sizing */
     prof_gc_st[0] = prof_gc_st[1] = prof_gc_st[2] = prof_gc_st[3] = 0;   /* row 16 `GCS` -- who calls */
     prof_gc_sn[0] = prof_gc_sn[1] = prof_gc_sn[2] = prof_gc_sn[3] = 0;
@@ -2134,6 +2288,9 @@ void RP_BeginFrame(void)
     { extern int z_walk_blocks; z_walk_blocks = 0; }                     /* zone blocks walked / frame */
     /* (r_lookup_rebuilds reset REMOVED 2026-08-10 with row-20 `e` -- see core/r_data.c:507) */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
+    prof_plane_quadn = prof_plane_quadpx = 0;                            /* piecewise-quad probe (row 8 Q) */
+    prof_q4_px[0] = prof_q4_px[1] = prof_q4_px[2] = prof_q4_px[3] = 0u;  /* top-4 runs (row 8 E) */
+    prof_q4_cmd[0] = prof_q4_cmd[1] = prof_q4_cmd[2] = prof_q4_cmd[3] = 0u;
     prof_pp_cur_sum = prof_pp_cur_vq = 0;
     prof_pp_cur_pic = -2147483647;   /* sentinel: no flat group open yet */
     prof_pp_cur_h   = 0;
@@ -2379,7 +2536,7 @@ static void rp_p3_prof_show(void)
     (void)idle;                                             /* derived SLVi retired: b/id/Pb are all MEASURED */
     unsigned int busy_pct = rp_master_ms ? (sb_d * 100u / (224u * rp_master_ms)) : 0u;
     if (busy_pct > 999u) busy_pct = 999u;                   /* first-frame baseline / glitch clamp */
-    unsigned int idle_pct = busy_pct < 100u ? 100u - busy_pct : 0u;
+    /* (idle_pct dropped 2026-08-19 with the row-5 `id` field: it was 100-b, pure redundancy) */
     unsigned int pb_pct   = p10 ? (pb_d * 1000u / (224u * (unsigned)p10)) : 0u;  /* plane-phase balance */
     if (pb_pct > 999u) pb_pct = 999u;
 
@@ -2689,17 +2846,23 @@ static void rp_p3_prof_show(void)
     }
     /* w = master idle waiting for the slave at the plane barrier (master FRT): w~0 => balanced.
        (b/id/Pb are computed above, before the fold, so the peak snapshot can record them.) */
-    /* row 5: MEASURED slave occupancy.  b = busy% of MST, id = idle% of MST (= 100-b, the offload
-       HEADROOM), Pb = the slave's share of the plane phase P (~50% balanced, <50% master-heavy on a
-       dominant flat), w = master idle waiting for the slave at the plane barrier.  Full mode only.
-       (Replaces the old DERIVED SLVi 'i', which used a different base (render, not MST) and assumed
-       the slave was busy through all of P -> it never summed to 100 with b and misled.) */
+    /* row 5: MEASURED slave occupancy + the plane-fill ms split (2026-08-19, VDP1-planes verdict
+       probe).  b = slave busy% of MST; Pb = the slave's share of the plane phase P (~50% balanced);
+       Pm = MASTER plane-fill ms (worklist drain: TAS steal + fallbacks + the inline makespans
+       path) -- THE number a VDP1-planes offload would recover; Ps = SLAVE plane-fill ms (incl. its
+       cache purge + claim overhead) -- rides an otherwise idle CPU; w = master idle at the plane
+       barrier.  Full mode only.  (`id` dropped 2026-08-19: it was 100-b, pure redundancy.) */
     if (sat_dbg_overlay_mode == 0) {
         /* `mw` = the LONGEST the master waited for the slave this window, ms, any site.  Read it
            against RP_WAIT_TIMEOUT_FRT (100 ms): pinned at the ceiling = a dying slave, well under =
            the ceiling is doing no harm.  It is what `to` could never say. */
-        snprintf(p, sizeof p, "SLV b%u%% id%u%% Pb%u%% w%u.%u mw%u  ",
-                 busy_pct, idle_pct, pb_pct, w10/10, w10%10, (unsigned int)(rp_wait_mx / 224u));
+        unsigned int mp10 = (prof_mplane + prof_makespans) * 10u / 224u;
+        unsigned int ps10 = pb_d * 10u / 224u;
+        if (mp10 > 999u) mp10 = 999u;
+        if (ps10 > 999u) ps10 = 999u;
+        snprintf(p, sizeof p, "SLV b%u%% Pb%u%% Pm%u.%u Ps%u.%u w%u.%u mw%u ",
+                 busy_pct, pb_pct, mp10/10, mp10%10, ps10/10, ps10%10,
+                 w10/10, w10%10, (unsigned int)(rp_wait_mx / 224u));
         rp_wait_mx = 0;
         dbg_print(0, 5, p);
         /* row 20 -- the Bp DECOMPOSITION, all of it describing the frame that set `PK Bp` on row 4.
@@ -2804,6 +2967,20 @@ static void rp_p3_prof_show(void)
         snprintf(p, sizeof p, "FLAT Vs%u Vp%u Vi%u      ",
                  vsec, prof_floor_vq_peak, prof_floor_vq_int_peak);
         (void)p;   /* FLAT string parked; Vs/Vp + dom%/n now surfaced by the platform (row 17) */
+        /* SATURN 2026-08-19 (4th build of the day): the row-8 `Q` publish MUST live HERE -- this
+           P3 path is the only one that runs in the shipping config (rp_disabled).  The first
+           THREE probe builds published only from the rp_active block below (two near-identical
+           FLAT blocks; the setter landed in the dead one), so the owner read Q0/0 on every
+           capture regardless of scene or arming: the probe never published.  Same trap as
+           [[rp-disabled-kills-flat-wall-modes]] and the 2026-08-08 reset-site rot -- when a
+           stat has consumers, grep BOTH copies of the block before believing a zero. */
+        sat_plane_quad_n   = (int)prof_plane_quadn;
+        sat_plane_quad_pct = prof_plane_pix ? (int)(prof_plane_quadpx * 100u / prof_plane_pix) : 0;
+        {   /* inc-1: increment-0's decision pair -- top-4 runs' real command bill + pixel share */
+            unsigned int q4px = prof_q4_px[0] + prof_q4_px[1] + prof_q4_px[2] + prof_q4_px[3];
+            sat_plane_q4cmd = (int)(prof_q4_cmd[0] + prof_q4_cmd[1] + prof_q4_cmd[2] + prof_q4_cmd[3]);
+            sat_plane_q4pct = prof_plane_pix ? (int)(q4px * 100u / prof_plane_pix) : 0;
+        }
     }
     /* pari A sizing -> globals (platform shows on row 20). */
     if (prof_ss_q > prof_ss_q_peak) prof_ss_q_peak = prof_ss_q;
@@ -2897,6 +3074,16 @@ void RP_EndFrame(void)
             snprintf(p, sizeof p, "FLAT d%u%% n%u Vt%u Vs%u Vp%u   ",
                      pct, prof_plane_n, vqtot, vsec, prof_floor_vq_peak);
             (void)p;   /* FLAT (parked VDP1-floor telemetry) cut from overlay -- VDP1_FLOOR_PLAN.md */
+            /* Row-8 `Q`/`E` publish, rp_active MIRROR only: the LIVE setter is in rp_p3_prof_show
+               (rp_disabled ships and returns before reaching here -- the first three probe
+               builds published ONLY from this dead block, hence the owner's Q0/0 rounds). */
+            sat_plane_quad_n   = (int)prof_plane_quadn;
+            sat_plane_quad_pct = (tot > 0u) ? (int)(prof_plane_quadpx * 100u / tot) : 0;
+            {
+                unsigned int q4px = prof_q4_px[0] + prof_q4_px[1] + prof_q4_px[2] + prof_q4_px[3];
+                sat_plane_q4cmd = (int)(prof_q4_cmd[0] + prof_q4_cmd[1] + prof_q4_cmd[2] + prof_q4_cmd[3]);
+                sat_plane_q4pct = (tot > 0u) ? (int)(q4px * 100u / tot) : 0;
+            }
         }
         /* Row 18: MST (master frame ms, set by dg_saturn.cxx fps_update -- the
            synchronous bottleneck; the standalone MST row 15 was dropped) + the slave

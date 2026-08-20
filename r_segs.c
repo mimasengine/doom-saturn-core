@@ -1888,8 +1888,15 @@ void R_RenderSegLoop (void)
        exactly the case that went wrong: at scale FRACUNIT/4 a 128-unit tier is ~32 px tall, so a
        20-column sliver scores 640 and flattens while a 100-column facade scores 3200 and keeps its
        texture.  Threshold is in PIXELS; 0 = off (pad L+B cycles it). */
+    /* SATURN 2026-08-20 (owner): SPECIALS BLOCKER.  A linedef with a special (door, switch,
+       exit, teleport, lift...) must NEVER draw flat: a flat-shaded door face or switch is
+       invisible as an interactive element -> the level becomes unplayable.  Gates BOTH flatten
+       rules below (distance LOD + drawseg budget) AND the io-budget path: for a special we
+       always texture, even when that costs the synchronous disc read the budget exists to
+       avoid -- specials are a tiny fraction of segs and the texture self-heals resident. */
+    int keep_tex = SEG_LINEDEF(curline)->special != 0;
     int lod_flat = 0;
-    if (sat_lod_eff > 0)
+    if (sat_lod_eff > 0 && !keep_tex)
     {
 	/* ⚠ HEIGHTBITS, not FRACBITS.  R_StoreWallRange already does `worldtop >>= 4` before this
 	   loop, so FixedMul(world, rw_scale) lands in 1/2^12 pixel units -- the same scale the tier
@@ -1931,7 +1938,7 @@ void R_RenderSegLoop (void)
        that killed the VDP1 wall offload ([[wall-offload-vdp1-slave-dead]]).  The distance floor
        applies here too: nothing inside sat_lod_mindist ever flattens, however crowded the frame. */
     sat_seg_count++;
-    if (!lod_flat && sat_seg_budget > 0 && sat_seg_count > sat_seg_budget
+    if (!lod_flat && !keep_tex && sat_seg_budget > 0 && sat_seg_count > sat_seg_budget
 	&& (rw_distance >> FRACBITS) > sat_lod_mindist)
     {
 	lod_flat = 1;
@@ -1939,9 +1946,9 @@ void R_RenderSegLoop (void)
 	sat_gov_act_w++;
     }
     if (lod_flat) sat_wall_lod_hits++;
-    int io_flat_mid = midtexture    ? (lod_flat || sat_wall_io_flat (midtexture))    : 0;
-    int io_flat_up  = toptexture    ? (lod_flat || sat_wall_io_flat (toptexture))    : 0;
-    int io_flat_lo  = bottomtexture ? (lod_flat || sat_wall_io_flat (bottomtexture)) : 0;
+    int io_flat_mid = midtexture    ? (!keep_tex && (lod_flat || sat_wall_io_flat (midtexture)))    : 0;
+    int io_flat_up  = toptexture    ? (!keep_tex && (lod_flat || sat_wall_io_flat (toptexture)))    : 0;
+    int io_flat_lo  = bottomtexture ? (!keep_tex && (lod_flat || sat_wall_io_flat (bottomtexture))) : 0;
     int io_col_mid  = io_flat_mid ? sat_wall_flat_color (midtexture)    : 0;
     int io_col_up   = io_flat_up  ? sat_wall_flat_color (toptexture)    : 0;
     int io_col_lo   = io_flat_lo  ? sat_wall_flat_color (bottomtexture) : 0;
@@ -2209,13 +2216,19 @@ void R_RenderSegLoop (void)
 	rw_scale += rw_scalestep;
 	topfrac += topstep;
 	bottomfrac += bottomstep;
-	/* LEAD-FILL: step each armed tier's OLD quad edges one column, like the wedge edges above. */
-	if (sat_lead_mid.on) { sat_lead_mid.ylf += sat_lead_mid.ylstep; sat_lead_mid.yhf += sat_lead_mid.yhstep; }
-	if (sat_lead_up.on)  { sat_lead_up.ylf  += sat_lead_up.ylstep;  sat_lead_up.yhf  += sat_lead_up.yhstep;  }
-	if (sat_lead_lo.on)  { sat_lead_lo.ylf  += sat_lead_lo.ylstep;  sat_lead_lo.yhf  += sat_lead_lo.yhstep;  }
-	if (sat_lead_mid.on2){ sat_lead_mid.ylfb += sat_lead_mid.ylstepb; sat_lead_mid.yhfb += sat_lead_mid.yhstepb; }
-	if (sat_lead_up.on2) { sat_lead_up.ylfb  += sat_lead_up.ylstepb;  sat_lead_up.yhfb  += sat_lead_up.yhstepb;  }
-	if (sat_lead_lo.on2) { sat_lead_lo.ylfb  += sat_lead_lo.ylstepb;  sat_lead_lo.yhfb  += sat_lead_lo.yhstepb;  }
+	/* LEAD-FILL: step each armed tier's OLD quad edges one column, like the wedge edges above.
+	   SATURN 2026-08-19: hoisted under ONE parked-check -- with the lead-fill parked
+	   (sat_wall_lead_x == 0, no tier ever arms) these were 6 always-false tests per column
+	   on the hottest loop in the game (~0.1-0.8 ms/frame of pure branch overhead). */
+	if (sat_wall_lead_x)
+	{
+	    if (sat_lead_mid.on) { sat_lead_mid.ylf += sat_lead_mid.ylstep; sat_lead_mid.yhf += sat_lead_mid.yhstep; }
+	    if (sat_lead_up.on)  { sat_lead_up.ylf  += sat_lead_up.ylstep;  sat_lead_up.yhf  += sat_lead_up.yhstep;  }
+	    if (sat_lead_lo.on)  { sat_lead_lo.ylf  += sat_lead_lo.ylstep;  sat_lead_lo.yhf  += sat_lead_lo.yhstep;  }
+	    if (sat_lead_mid.on2){ sat_lead_mid.ylfb += sat_lead_mid.ylstepb; sat_lead_mid.yhfb += sat_lead_mid.yhstepb; }
+	    if (sat_lead_up.on2) { sat_lead_up.ylfb  += sat_lead_up.ylstepb;  sat_lead_up.yhfb  += sat_lead_up.yhstepb;  }
+	    if (sat_lead_lo.on2) { sat_lead_lo.ylfb  += sat_lead_lo.ylstepb;  sat_lead_lo.yhfb  += sat_lead_lo.yhstepb;  }
+	}
     }
 }
 

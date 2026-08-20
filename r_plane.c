@@ -60,7 +60,10 @@ planefunction_t		ceilingfunc;
 #ifndef MAXVISPLANES
 #define MAXVISPLANES	512
 #endif
-static visplane_t	*visplanes;
+/* SATURN 2026-08-19 (VDP1 floors inc-0): de-static'd -- the platform's kick-time claim
+   pass (dg_saturn vdp1_floors_flush) walks [visplanes, lastvisplane) after the BSP walk,
+   before R_DrawPlanes.  Pure C, no behaviour change; DoomJo links it unused. */
+visplane_t	*visplanes;
 /* SATURN: peak visplane count per frame, exposed for the debug overlay. */
 int r_visplane_peak = 0;
 /* SATURN VALIDATION (#1 sizing): peak SUM of live-plane column-spans per frame =
@@ -1082,6 +1085,11 @@ int sat_plane_fill_mode = 0;
    texels); for a CEILING the split mirrors ([top..edge] punched, [edge+1..bottom] software).
    NULL (DoomJo / not armed) => return 2 degrades to a full claim. */
 short *sat_floor_punch_edge = NULL;
+short *sat_floor_punch_near = NULL;  /* SATURN inc-0d (VDP1 floor rect-bands): per-column punch
+                                        BOTTOM row, same contract as _edge (platform-owned, NULL =
+                                        legacy single-row sat_floor_punch_nrow).  With both arrays
+                                        the punched band is fully per-column: [edge[x]..near[x]],
+                                        edge[x] = 0x7fff marks an unpunched (all-software) column. */
 int sat_floor_punch_nrow = 0;   /* SATURN partial claim, NEAR tile limit (a single screen row --
                                    the near boundary is horizon-parallel): rows nearer the eye
                                    than it are handed to the SOFTWARE spans (VDP1 magnified tiles
@@ -1597,10 +1605,15 @@ void R_DrawPlanes (void)
 	/* SATURN (VDP1 floor, inc-1): the platform owns this secondary floor/ceiling on the VDP1
 	   affine-strip layer -> leave it index 0 (the strips fill it below NBG1, like the walls)
 	   and SKIP the software span draw.  Placed AFTER RP_PlanePixels so the inc-0 profiler still
-	   counts it; releases the flat lock it would otherwise leak.  Hook NULL / flag 0 on
-	   DoomJo + the normal build => unchanged. */
+	   counts it; releases the flat lock it would otherwise leak.  Hook NULL on DoomJo + the
+	   normal build => unchanged.
+	   ⚠ DECOUPLED from sat_vdp1_floor (2026-08-20, owner round 2): that flag is the DEPORTED-ftex
+	   master switch and ALSO wakes the r_segs.c cross_hi wall cuts + wedges, built for one-frame-
+	   late ceiling quads that no longer exist -- setting it for same-frame kick-time claims cut
+	   walls against a phantom ceiling line (the owner's "murs coupés / trous").  The hook install
+	   is the platform opt-in; an empty claim table already means "draw everything in software". */
 	{
-	int fclaim = (sat_vdp1_floor && sat_floor_vdp1_hook)
+	int fclaim = (sat_floor_vdp1_hook)
 	    ? sat_floor_vdp1_hook(pl->picnum, (int)pl->height, pl->minx, pl->maxx,
 				  pl->top, pl->bottom, pl->lightlevel)
 	    : 0;
@@ -1648,6 +1661,12 @@ void R_DrawPlanes (void)
 	       are trimmed to the SOFTWARE leftover (far field + chunk-clip wedges) which then
 	       falls through to the normal span draw below -- real texels, aligned latency. */
 	    int partial = (fclaim == 2 && sat_floor_punch_edge != NULL);
+	    /* SATURN inc-0d: the motion border + swept band exist for quads presented a frame
+	       LATE (the old ftex tiles).  The rect-band claims are plotted the SAME frame under
+	       the manual present, and their software residual is drawn at mask latency by the
+	       trims below -- painting potato borders over them would re-create the round-1
+	       "bords flat" artefact.  Punch clean, always. */
+	    if (partial) swept = 0;
 	    for (x = pl->minx ; x <= pl->maxx ; x++)
 	    {
 		int yl = pl->top[x];
@@ -1740,6 +1759,8 @@ void R_DrawPlanes (void)
 		       FAR residue (few rows past the mip clamp) is drawn here per-pixel. */
 		    int pe = (int)sat_floor_punch_edge[x];
 		    int pn = sat_floor_punch_nrow;
+		    if (sat_floor_punch_near)                 /* inc-0d: per-column punch bottom */
+			pn = (int)sat_floor_punch_near[x];
 		    int f0, f1;                                       /* far residue -> texels */
 		    if (is_ceil)
 		    {
@@ -1851,13 +1872,14 @@ void R_DrawPlanes (void)
 			}
 		    }
 		}
-		else if (B <= 0)
+		else if (B <= 0 || partial)
 		{
 		    /* SATURN CONTRACT (Mimas): pure punch at rest -- the platform memsets the
 		       view rows to 0 after EVERY blit and visplane regions exclude wall columns,
 		       so the punched interior is ALREADY index 0.  The old zero loops re-wrote
 		       10-30K px/frame for nothing (the biggest single master-P bite after the
-		       slave F-build offload).  DoomJo never claims (hook NULL) -> never here. */
+		       slave F-build offload).  DoomJo never claims (hook NULL) -> never here.
+		       (inc-0d: partial claims always take this path -- see the swept note above.) */
 		}
 		else
 		{
@@ -1966,6 +1988,7 @@ void R_DrawPlanes (void)
        the deferred flat locks (no-op on the cart, where W_CacheLumpNum is a direct pointer). */
     {
         extern int sat_plane_parallel, sat_local_players;
+        extern int sat_mp_slave;         /* r_parallel.c: slave shares allowed in split (2026-08-20) */
         extern void RP_DrawPlanesSplit(int n);
         int n = plane_worklist_n, i;
         /* SATURN M7 (2026-07-17): draw the queued planes MASTER-ONLY in lowres.  The slave
@@ -1985,7 +2008,11 @@ void R_DrawPlanes (void)
            the reported freeze.  In the parked-M7 world split is always master-only anyway, so this
            only makes it explicit + race-proof.  (Un-parked M4 co-op would lose dual-CPU planes here --
            acceptable, flagged: M7 split is already >= M4 split on HW.) */
-        if (sat_plane_parallel && n > 1 && sat_local_players <= 1)
+        /* SATURN 2026-08-20: `sat_local_players <= 1` relaxed behind sat_mp_slave -- the freeze
+           this gate guarded (RP_WaitPlanes unbounded spin on a mid-menu count flip) was hardened
+           away long before (FRT-bounded + idempotent fallback); the MP-off just outlived it.
+           Each view's dispatch JOINS inside this call, so no slave work crosses a view switch. */
+        if (sat_plane_parallel && n > 1 && (sat_local_players <= 1 || sat_mp_slave))
             RP_DrawPlanesSplit(n);           /* master+slave: static half-split or work-steal (pad Y).
                                                 SATURN M7 2026-07-30: the `!sat_lowres` hard-off is GONE --
                                                 HW-validated as the shipped default (SLV b23% Pb59%, to=0,
@@ -1995,7 +2022,12 @@ void R_DrawPlanes (void)
                                                 on both CPUs so the disjoint visplanes write byte-correct.
                                                 The masked-split (r_things.c) primes SGL slave scheduling. */
         else
+        {
+            extern void RP_MPlaneEnter(void), RP_MPlaneLeave(void);   /* row 5 `Pm` bracket */
+            RP_MPlaneEnter();
             R_DrawPlaneWorklist(0, n);       /* MP / single plane / DoomJo: MASTER-ONLY */
+            RP_MPlaneLeave();
+        }
         for (i = 0; i < n; i++)
             if (plane_worklist[i].lumpnum >= 0)      /* -1 = never cached (load budget) */
                 W_ReleaseLumpNum(plane_worklist[i].lumpnum);

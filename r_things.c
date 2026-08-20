@@ -1711,6 +1711,21 @@ void R_SlaveDrawMasked (int x0, int x1)
 /* Per-frame VDP1 things budget -- AIMD-adapted by the platform on the VDP1 overrun signal
    (sat_walls_kick), clamped to [0, THING_EMIT_MAX] by PASS 1.  Shared with the platform. */
 int sat_thing_emit_cap = 8;
+/* SATURN 2026-08-20: per-texture floor-hysteresis state (see the PASS-1 note at the grant
+   block below).  prev = lumps granted LAST frame (union of the split views), cur =
+   accumulating this frame; swapped on the first view of each frame. */
+#define THING_HY_MAX (4 * 12)
+/* SATURN 2026-08-21 (owner, 1p: "flick vdp1/cpu sur des things (tonneau explosif)"): the sticky
+   floor was keyed on the EXACT patch lump, but an animated thing CHANGES its lump every few tics
+   (BAR1 A<->B, a walking monster A->B->C->D) -- each animation flip landed on a lump absent from
+   hy_prev and repaid the FULL floor, so a borderline thing blinked VDP1/CPU at the animation
+   rate.  Frames of one sprite family are CONTIGUOUS lumps in the S_START namespace (rotation
+   groups included, ~5 lumps per frame letter), so match hy_prev within +/-THING_HY_SIB lumps:
+   the sibling inherits the sticky half-floor.  A false positive (an unrelated neighbour lump)
+   merely halves that sprite's floor too -- benign, it still needs fl/2. */
+#define THING_HY_SIB 8
+static int hy_prev[THING_HY_MAX], hy_prev_n = 0;
+static int hy_cur [THING_HY_MAX], hy_cur_n = 0;
 
 /* SATURN: the other players' colour remap (MF_TRANSLATION -> indigo/brown/red marine), NULL for
    everything else.  Same table the software R_DrawTranslatedColumn indexes; the platform applies it
@@ -1791,6 +1806,31 @@ void R_EmitWorldThingsVDP1 (void)
 	char          tk_actor[THING_TEX_TRACK];       /* 1 = texture belongs to a shootable actor (monster/barrel) */
 	char          tk_grant[THING_TEX_TRACK];
 	int           ntk = 0, i, g;
+	/* SATURN 2026-08-20 (owner, Ymir 4p: "les sprites des objets sautent"): per-TEXTURE floor
+	   HYSTERESIS.  The floor test uses the raw screen area, which pulses with the animation
+	   frame / view bob -- a sprite sitting AT the floor flips eligible/ineligible every few
+	   frames and visibly alternates crisp-VDP1 / packed-CPU (the THp `r` churn: 48-120/window
+	   with l0 g0 b0 = the floor is the only active gate).  Remember the LUMPS granted last
+	   frame; they pass the floor at HALF height this frame -- crossing is sticky (enter at fl,
+	   leave at fl/2), so the boundary case converges instead of oscillating.  Keyed by lump
+	   alone (xlat/cmap vary with light and player colour; the flap is a per-item-TYPE effect).
+	   Split: hy_prev is the union of ALL views' grants of the previous frame -- a lump crisp
+	   in one view may stay crisp in the view beside it, which is the wanted behaviour. */
+	{
+	    extern int framecount;
+	    extern int sat_split_active, sat_split_view;
+	    static int hy_frame = -1;
+	    /* ⚠ framecount advances PER VIEW (R_SetupFrame), not per frame: swap only on the
+	       frame's FIRST view, so hy_prev is the whole previous FRAME's union and not just
+	       the previous view's grants. */
+	    if (framecount != hy_frame && (!sat_split_active || sat_split_view == 0))
+	    {
+		hy_frame = framecount;
+		memcpy (hy_prev, hy_cur, (size_t)hy_cur_n * sizeof hy_cur[0]);
+		hy_prev_n = hy_cur_n;
+		hy_cur_n  = 0;
+	    }
+	}
 
 	/* fold every above-floor sprite into its distinct-texture record (keep the max area) */
 	for (spr = vsprsortedhead.next ; spr != &vsprsortedhead ; spr = spr->next)
@@ -1800,6 +1840,11 @@ void R_EmitWorldThingsVDP1 (void)
 	    long fl       = is_actor ? actor_floor : area_floor;
 	    const unsigned char *xl = R_ThingXlat (spr);
 	    int  j;
+	    for (j = 0 ; j < hy_prev_n ; j++)
+	    {
+		int dh = hy_prev[j] - spr->patch;
+		if (dh >= -THING_HY_SIB && dh <= THING_HY_SIB) { fl >>= 1; break; }   /* sticky: this lump or an animation sibling granted last frame */
+	    }
 	    if (area < fl) continue;                     /* ineligible (-1) or below the floor -> software */
 	    for (j = 0 ; j < ntk ; j++)
 		if (tk_lump[j] == spr->patch && tk_cmap[j] == spr->colormap && tk_xlat[j] == xl) break;
@@ -1824,6 +1869,15 @@ void R_EmitWorldThingsVDP1 (void)
 	    if (best < 0) break;
 	    tk_grant[best] = 1;
 	}
+	/* hysteresis: publish this frame's granted lumps (deduped union across split views) */
+	for (i = 0 ; i < ntk ; i++)
+	{
+	    int h, dup = 0;
+	    if (!tk_grant[i]) continue;
+	    if (hy_cur_n >= THING_HY_MAX) break;
+	    for (h = 0 ; h < hy_cur_n ; h++) if (hy_cur[h] == tk_lump[i]) { dup = 1; break; }
+	    if (!dup) hy_cur[hy_cur_n++] = tk_lump[i];
+	}
 	/* mark eligible the emax highest-RANKED sprites among the granted textures (rank = actors over
 	   decorations, then area), where emax is the platform's adaptive VDP1-raster budget
 	   (sat_thing_emit_cap, clamped to THING_EMIT_MAX).  Top-N insertion by rank key; the rest stay
@@ -1843,10 +1897,18 @@ void R_EmitWorldThingsVDP1 (void)
 		long key, fl = is_actor ? actor_floor : area_floor;
 		const unsigned char *xl = R_ThingXlat (spr);
 		if (idx < 0 || idx >= MAXVISSPRITES) continue;
-		if (area < fl) continue;
+		{ int h, dh; for (h = 0 ; h < hy_prev_n ; h++)
+		  { dh = hy_prev[h] - spr->patch;
+		    if (dh >= -THING_HY_SIB && dh <= THING_HY_SIB) { fl >>= 1; break; } } }   /* sticky floor (hysteresis, animation siblings included) */
+		/* SATURN 2026-08-20: count the PASS-1 refusals -- they were INVISIBLE (the platform's
+		   THp `d` counters only see sprites that reached the emit hook), so "THp n0 on HW" could
+		   not be split between "area floor rejects" and "texture slot starvation".  Window
+		   counters, reset by the overlay row that prints them (THp `r`/`g`). */
+		if (area < fl) { extern int sat_thing_floor_rej; sat_thing_floor_rej++; continue; }
 		for (j = 0 ; j < ntk ; j++)
 		    if (tk_lump[j] == spr->patch && tk_cmap[j] == spr->colormap && tk_xlat[j] == xl) break;
-		if (j >= ntk || !tk_grant[j]) continue;   /* texture not granted -> software */
+		if (j >= ntk || !tk_grant[j])
+		{ extern int sat_thing_grant_rej; sat_thing_grant_rej++; continue; }   /* texture not granted -> software */
 		/* rank key: shootable actors sit above ALL decorations (bit 20 >> max sprite area ~64000).
 		   SATURN: rank actors by DISTANCE (spr->scale), NOT on-screen area -- the area pulses with
 		   the animation frame (attack pose wider than idle), which made the VDP1 slot HOP between
@@ -2017,7 +2079,8 @@ void R_DrawMasked (void)
 	   master when the AIMD cap declines, e.g. ec0 -> th0 -> every sprite software).  Was gated off
 	   (!sat_things_emitted) as a shipping shortcut when world-things landed; measured slave busy%
 	   showed the slave sitting ~90% idle while M ran master-only -> re-enabled 2026-07-09. */
-	if (sat_masked_parallel && sat_local_players <= 1)   /* SATURN 2026-07-20: never slave-split in MP -- a New-Game-into-coop from a 1p pause renders one split frame with sat_lowres still 0, which used to dispatch the slave into a split it was never set up for -> wedge/freeze (see r_plane.c).  SATURN M7 2026-07-30: the `!sat_lowres` hard-off is GONE (shipped default) now that R_SlaveDrawVisSprite writes packed-160 (the !sat_lowres drawer guard above). */
+	{ extern int sat_mp_slave;   /* r_parallel.c (2026-08-20): slave shares allowed in split */
+	if (sat_masked_parallel && (sat_local_players <= 1 || sat_mp_slave))   /* SATURN 2026-07-20: never slave-split in MP -- a New-Game-into-coop from a 1p pause renders one split frame with sat_lowres still 0, which used to dispatch the slave into a split it was never set up for -> wedge/freeze (see r_plane.c).  SATURN M7 2026-07-30: the `!sat_lowres` hard-off is GONE (shipped default) now that R_SlaveDrawVisSprite writes packed-160 (the !sat_lowres drawer guard above).  SATURN 2026-08-20: MP-off relaxed behind sat_mp_slave -- the wedge this guarded is hardened away (RP_WaitMasked 100 ms timeout + cosmetic no-draw fallback); HW 2p/3p/4p read SLV b0% all session while sprites piled on the master. */
 	{   /* SATURN: the two CPUs draw DISJOINT packed columns -- master [0,g_mask_x1=half), slave
 	       [half,viewwidth) -- and columnofs[x]=x is packed in lowres, so their fb writes never overlap.
 	       (Pre-2026-07-29 the slave upsampled its half to 320 = the mismatch that gated lowres off.) */
@@ -2045,7 +2108,7 @@ void R_DrawMasked (void)
 	    sat_masked_inflight = 1;
 	    RP_DispatchMasked (half, viewwidth);   /* slave: vissprites in [half, viewwidth) */
 	    g_mask_x1 = half;                       /* master: vissprites in [0, half)       */
-	}
+	} }   /* (outer brace = the sat_mp_slave extern scope) */
 	// draw all vissprites back to front
 	for (spr = vsprsortedhead.next ;
 	     spr != &vsprsortedhead ;

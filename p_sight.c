@@ -55,6 +55,13 @@ extern int	leveltime;
 typedef struct { void *t1, *t2; int tic; byte result; byte valid; } sightcache_t;
 static sightcache_t	sight_cache[SIGHT_CACHE_N];
 int		sat_sight_cache = 1;	// runtime toggle (default on); its effect shows as a drop in the overlay 'walk' count
+// SATURN 2026-08-21 (owner + RESOURCE_BUDGETS mention): the validity WINDOW is now runtime
+// (pad L+A cycles 4/8/16, TIC row `ca`).  What the trade IS: a longer window skips more full
+// BSP sight walks (TIC `s` drops on thinker-heavy maps) at the price of monsters acting on a
+// verdict up to N tics old -- at 8/16 that is 230/460 ms of AI reaction latency worst case.
+// At the low fps where the gain matters a frame already spans 3-8 tics, so 8 reads close to
+// the shipped feel; 16 is the aggressive probe.  4 = the shipped default, byte-identical.
+int		sat_sight_cache_tics = SIGHT_CACHE_TICS;
 int		sat_sight_cachehit = 0;	// telemetry (cumulative cache hits)
 int		sat_sight_maxdist = 0;	// distance early-out in map units, 0 = off (behaviour-changing; opt-in A/B)
 
@@ -367,7 +374,7 @@ P_CheckSight
     {
 	sightcache_t *c = &sight_cache[SIGHT_HASH(t1, t2)];
 	if (c->valid && c->t1 == (void*)t1 && c->t2 == (void*)t2
-	    && (unsigned)(leveltime - c->tic) < (unsigned)SIGHT_CACHE_TICS)
+	    && (unsigned)(leveltime - c->tic) < (unsigned)sat_sight_cache_tics)
 	{
 	    sat_sight_cachehit++;
 	    return c->result;

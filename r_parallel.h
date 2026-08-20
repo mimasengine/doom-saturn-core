@@ -57,6 +57,9 @@ void RP_FlatCacheEnter(void);
 void RP_FlatCacheLeave(void);
 void RP_MakeSpansEnter(void);
 void RP_MakeSpansLeave(void);
+void RP_MPlaneEnter(void);   /* SATURN: master worklist-drain bracket (row 5 `Pm`) -- r_plane.c
+                                master-only branch; the TAS/timeout/dead paths bracket internally */
+void RP_MPlaneLeave(void);
 
 /* SATURN PERF (RBG0 candidate sizing, profiler): R_DrawPlanes hands each regular
    (non-sky) visplane here.  The hook tallies its span pixels and tracks the

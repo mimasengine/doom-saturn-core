@@ -982,7 +982,7 @@ void sat_setup_view_p1 (void)
    aligned by construction), in a border exactly as wide as that sideways offset -- i.e. the horizontal
    screen shift over the last sat_plane_lag frames.  0 at rest (no yaw -> no offset -> no border -> no
    cost); grows with turn speed.  sat_plane_lag is owner-tunable (the "nombre de frame de decalage").
-   DoomJo never sets sat_vdp1_floor, so R_DrawPlanes never reads sat_plane_border there. */
+   DoomJo never installs sat_floor_vdp1_hook, so R_DrawPlanes never reads sat_plane_border there. */
 int sat_plane_border   = 0;    /* HORIZONTAL fill border px (from yaw)  -> L/R silhouette edge   */
 int sat_plane_border_v = 0;    /* VERTICAL   fill border px (fwd+viewz) -> top/bottom edge       */
 int sat_plane_lag      = 2;    /* N = frames VDP1 trails NBG1 (owner-tunable)                    */
