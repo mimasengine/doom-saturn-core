@@ -62,6 +62,10 @@ int		sat_sight_cache = 1;	// runtime toggle (default on); its effect shows as a 
 // At the low fps where the gain matters a frame already spans 3-8 tics, so 8 reads close to
 // the shipped feel; 16 is the aggressive probe.  4 = the shipped default, byte-identical.
 int		sat_sight_cache_tics = SIGHT_CACHE_TICS;
+// SATURN 2026-08-21: 1 = the window follows the LIVE SHOOTABLE count (p_tick.c P_RunThinkers
+// ladder 4/8/16 at 120/300 live monsters+barrels, hysteresis bands) -- the staleness is spent
+// exactly where the sight bill is big and the crowd hides it.  0 = manual (pad L+A fixed window).
+int		sat_sight_cache_auto = 1;
 int		sat_sight_cachehit = 0;	// telemetry (cumulative cache hits)
 int		sat_sight_maxdist = 0;	// distance early-out in map units, 0 = off (behaviour-changing; opt-in A/B)
 

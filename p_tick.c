@@ -95,6 +95,14 @@ void P_AllocateThinker (thinker_t*	thinker)
 void P_RunThinkers (void)
 {
     thinker_t*	currentthinker;
+    int		nshoot = 0;	/* SATURN 2026-08-21: LIVE SHOOTABLE count -> sight-cache governor.
+				   ⚠ Round 2 (owner: "300 me semble gigantesque -- c'est le nombre
+				   d'ennemis ?"): round 1 counted ALL mobj thinkers (corpses, items,
+				   decorations, projectiles included) with thresholds read off the
+				   overlay THK `n` -- which is a PER-FRAME sum, inflated by the 2-3
+				   tics each frame runs.  Now: MF_SHOOTABLE only = live monsters +
+				   barrels + players (death clears the flag), the population the
+				   sight bill actually scales with (A_Chase/P_LookForPlayers). */
 
     /* SATURN 2026-08-16: the thinker half of the game-tic split (row 24 `TIC`).  See r_parallel.c
        -- on hardware `T` is ~40 % of the frame and nothing inside it had ever been timed. */
@@ -119,6 +127,9 @@ void P_RunThinkers (void)
 	    {
 		if (currentthinker->function.acp1 == (actionf_p1)P_MobjThinker)
 		{
+		    /* thinker_t is mobj_t's first member (vanilla layout) -> the cast is exact */
+		    if (((mobj_t *)currentthinker)->flags & MF_SHOOTABLE)
+			nshoot++;
 		    RP_ThkMobjBegin ();
 		    currentthinker->function.acp1 (currentthinker);
 		    RP_ThkMobjEnd ();
@@ -138,6 +149,35 @@ void P_RunThinkers (void)
     }
 
     RP_ThinkEnd ();
+
+    /* SATURN 2026-08-21 (owner: "SIGHT_CACHE_TICS pourrait être décidé par le gouverneur en
+       fonction du nombre d'ennemis ?  s'il y en a plein... ça se remarque moins"): the sight-cache
+       window follows the LIVE SHOOTABLE population.  The two curves move together by construction
+       -- the sight bill is (awake lookers x walks) so it grows with the crowd, and the
+       per-monster staleness is least visible exactly when the crowd is large.
+       Thresholds (round 2): shareware UV maps carry ~50-90 monsters, crowded Doom II/TNT maps
+       150-400+ -- so 4 below 120 live shootables (shareware never leaves the shipped default),
+       8 from 120, 16 from 300; down-edges 100/260 (hysteresis bands, no boundary flap).
+       These are calibration STARTING POINTS -- the console falsifier is TIC `ca` stepping up on
+       a crowded TNT map while `s` (sight ms) drops and the AI still feels right.
+       This is a dedicated tic-side law, NOT the render governor: that one is per-view/fill-
+       calibrated (and blind in split) -- wiring an AI-latency knob to render debt would degrade
+       the AI in scenes where the sight bill is small.  sat_sight_cache_auto = 1 is the boot
+       default; pad L+A cycles auto -> 4 -> 8 -> 16 (TIC `ca`, `a` suffix = auto). */
+    {
+	extern int sat_sight_cache_auto, sat_sight_cache_tics;
+	if (sat_sight_cache_auto)
+	{
+	    int t = sat_sight_cache_tics;
+	    switch (t)
+	    {
+	      case 4:  if (nshoot >= 120) t = 8;                                 break;
+	      case 8:  if (nshoot >= 300) t = 16; else if (nshoot <= 100) t = 4; break;
+	      default: if (nshoot <= 260) t = 8;                                 break;
+	    }
+	    sat_sight_cache_tics = t;
+	}
+    }
 }
 
 
