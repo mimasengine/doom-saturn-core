@@ -1856,18 +1856,38 @@ void R_EmitWorldThingsVDP1 (void)
 	/* grant the cap slots: shootable ACTORS first (monsters get a VDP1 texture slot ahead of any
 	   decoration, so a lone far monster is crisp even in a room full of big near props), then by the
 	   largest sprite within each class (biggest fill per slot; a same-type horde shares one slot). */
-	for (g = 0 ; g < cap ; g++)
+	/* SATURN 2026-08-21 (owner, 1p TNT MAP20: "flick cpu/vdp1 sur des sprites -- un cadavre"):
+	   the slot ELECTION had no hysteresis -- the floor stickiness (fl>>1 above) only shields the
+	   FLOOR test.  With more distinct textures in view than slots, a decoration at the election
+	   boundary (a big corpse vs the other props) was re-ranked from scratch every frame:
+	   granted, evicted, granted -- the THp `g` churn (1..172/window) and the SPR fb0-4 bounce in
+	   the owner's captures.  Same cure as the floor: INCUMBENCY.  A texture granted last frame
+	   (hy_prev, sibling window included so animations keep their moat) competes with its area
+	   DOUBLED -- a challenger must be >2x bigger to take the slot (enter big, leave small -> the
+	   boundary converges).  Actors still outrank decorations unconditionally. */
 	{
-	    int best = -1;
+	    char tk_sticky[THING_TEX_TRACK];
 	    for (i = 0 ; i < ntk ; i++)
 	    {
-		if (tk_grant[i]) continue;
-		if (best < 0) { best = i; continue; }
-		if (tk_actor[i] != tk_actor[best]) { if (tk_actor[i]) best = i; }   /* actor outranks decoration */
-		else if (tk_area[i] > tk_area[best]) best = i;                       /* same class -> larger wins */
+		int h, dh; tk_sticky[i] = 0;
+		for (h = 0 ; h < hy_prev_n ; h++)
+		{ dh = hy_prev[h] - tk_lump[i];
+		  if (dh >= -THING_HY_SIB && dh <= THING_HY_SIB) { tk_sticky[i] = 1; break; } }
 	    }
-	    if (best < 0) break;
-	    tk_grant[best] = 1;
+	    for (g = 0 ; g < cap ; g++)
+	    {
+		int best = -1;
+		for (i = 0 ; i < ntk ; i++)
+		{
+		    if (tk_grant[i]) continue;
+		    if (best < 0) { best = i; continue; }
+		    if (tk_actor[i] != tk_actor[best]) { if (tk_actor[i]) best = i; }   /* actor outranks decoration */
+		    else if ((tk_area[i]    << (tk_sticky[i]    ? 1 : 0)) >
+			     (tk_area[best] << (tk_sticky[best] ? 1 : 0))) best = i;    /* same class -> larger wins; incumbents count double */
+		}
+		if (best < 0) break;
+		tk_grant[best] = 1;
+	    }
 	}
 	/* hysteresis: publish this frame's granted lumps (deduped union across split views) */
 	for (i = 0 ; i < ntk ; i++)

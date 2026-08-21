@@ -2597,9 +2597,41 @@ static void rp_p3_prof_show(void)
 #define GOV_REL10    (-9000)      /* -900 ms integrated -> give quality back                        */
     {
         static const int gov_rung[4] = { 0, 200, 400, 800 };
-        if (rend <= RP_REC_SANE)                      /* never steer on a glitched frame */
+        /* SATURN 2026-08-21 -- PER-FRAME SUM IN SPLIT (owner: "on peut faire le gouverneur par
+           vue, ça me parait plus quick win"; RESOURCE_BUDGETS opp 2).  rp_p3_prof_show runs once
+           per VIEW, and the governor compared ONE view's rend (a quadrant: ~25-45 ms) to a
+           target calibrated on a FULL 1p frame (95 ms) -> the integral only ever paid down, `e`
+           pinned negative, and the emission levers (wall LOD, seg budget) never engaged exactly
+           where the master is the wall (4p render 140 ms/frame).  The law that is right in
+           EVERY mode is "the frame's TOTAL render vs GOV_TARGET10": accumulate B+P+M (and the
+           vote's bp/p/m) across the frame's views, decide ONCE on the last view.  1p degenerates
+           to the old behaviour exactly (sum of one view).  A glitched view poisons the whole
+           frame's decision (the 1p sane-guard, applied frame-wide); the probe/undo then compares
+           frame-sums to frame-sums, and the parole's sector check always samples the SAME (last)
+           view.  Levers stay GLOBAL -- all views degrade together; per-view lever state is the
+           next iteration IF the console A/B asks for it (falsifier: SPL per view drops when
+           `w`/`lb` engage in 4p; SPL immobile = lever dead, undo does its job). */
+        extern int sat_split_active, sat_split_view, sat_local_players;
+        static unsigned int gsum_rend = 0, gsum_bp = 0, gsum_p = 0, gsum_m = 0;
+        static int gsum_bad = 0;
+        unsigned int g_rend = rend, g_bp = bp10, g_p = p10, g_m = m10;
+        int gov_decide = (rend <= RP_REC_SANE);       /* never steer on a glitched frame */
+        if (sat_split_active)
         {
-            int err = (int)rend - GOV_TARGET10;
+            int nv = sat_local_players; if (nv > 4) nv = 4;
+            if (rend > RP_REC_SANE) gsum_bad = 1;
+            else { gsum_rend += rend; gsum_bp += bp10; gsum_p += p10; gsum_m += m10; }
+            if (sat_split_view >= nv - 1)
+            {
+                g_rend = gsum_rend; g_bp = gsum_bp; g_p = gsum_p; g_m = gsum_m;
+                gov_decide = !gsum_bad;
+                gsum_rend = gsum_bp = gsum_p = gsum_m = 0; gsum_bad = 0;
+            }
+            else gov_decide = 0;                      /* mid-frame view: accumulate only */
+        }
+        if (gov_decide)
+        {
+            int err = (int)g_rend - GOV_TARGET10;
             if (err > GOV_BAND10)        sat_gov_debt += err - GOV_BAND10;
             else if (err < -GOV_BAND10)  sat_gov_debt += (err + GOV_BAND10) / 2;   /* half rate */
             /* inside the band: hold the integral.  NEVER reset it -- that was the whole bug. */
@@ -2644,7 +2676,7 @@ static void rp_p3_prof_show(void)
             }
             if (gov_pr_wait > 0 && --gov_pr_wait == 0)
             {
-                if (rend + GOV_PROOF > gov_pr_rend)      /* no measurable gain -> undo + blacklist */
+                if (g_rend + GOV_PROOF > gov_pr_rend)    /* no measurable gain -> undo + blacklist */
                 {
                     /* 🔴 UNWIND THE WHOLE AXIS, not one rung.  First hardware run of the probe read
                        `i1` on ten captures out of eleven -- it correctly proved the `w` axis inert --
@@ -2660,7 +2692,7 @@ static void rp_p3_prof_show(void)
             }
             if (sat_gov_debt >= GOV_FIRE10 && gov_pr_wait == 0)
             {
-                unsigned bp = bp10, p = p10, m = m10;
+                unsigned bp = g_bp, p = g_p, m = g_m;   /* split: frame-sums -> same dominance vote */
                 sat_gov_debt = 0;
                 if (bp >= p && bp >= m)      sat_gov_axis = 'B';
                 else if (p >= bp && p >= m)  sat_gov_axis = 'P';
@@ -2673,7 +2705,7 @@ static void rp_p3_prof_show(void)
                    both large.  Electing an axis you cannot move is the same as not firing.
                    'M' still has no proven live knob (the thing cap is not validated for a
                    controller), so it is only ever REPORTED -- but it must not BLOCK the others. */
-                gov_pr_rend = rend; gov_pr_axis = -1;
+                gov_pr_rend = g_rend; gov_pr_axis = -1;
                 if (sat_gov_axis == 'B' && sat_lod_auto_step < 3 && !(sat_gov_inert & 1))
                     { sat_lod_auto_step++; gov_pr_axis = 0; }
                 else if (sat_gov_axis == 'P' && sat_gov_p_step < 2 && !(sat_gov_inert & 2))
