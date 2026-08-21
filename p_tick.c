@@ -89,6 +89,46 @@ void P_AllocateThinker (thinker_t*	thinker)
 
 
 
+/* SATURN 2026-08-21 -- THE TIC GOVERNOR, part 2 (owner: "fais 1 et 2").  Adaptive decimation of
+   FAR monsters: when the measured per-tic thinker cost (sat_think_last10, r_parallel.c) runs
+   over budget, live monsters far from EVERY player think every 2nd tic (D1), then every 4th
+   (D2).  Deliberately NOT compensated in speed: a far monster walking/attacking at half rate is
+   the least visible artifact there is (nobody clocks a 6-px sprite's gait), where doubled steps
+   would visibly teleport.  Exemptions keep it honest where it could be seen or felt: players,
+   corpses (parked anyway), SKULLFLY (a charging soul must not stutter), MISSILE-flagged
+   shootables, JUSTHIT (a monster that was just shot retaliates at full rate), and anything
+   within SAT_DECIM_DIST of any live player.  The per-mobj phase stagger spreads the skipped
+   population across tics so the load stays flat.  sat_tic_decim is the ladder rung (0/1/2),
+   THK row `dc`. */
+#define SAT_DECIM_DIST  (1536 * FRACUNIT)   /* ~6 px tall sprite at 320w -- decimation invisible past this */
+int sat_tic_decim = 0;        /* current rung: 0 = full rate, 1 = far think 1/2, 2 = far think 1/4 */
+int sat_tic_decim_auto = 1;   /* the measured law below drives the rung (no pad chord yet) */
+int sat_tic_parked = 0;       /* running count of parked (unlinked, kept) corpse/prop thinkers */
+
+static int sat_mobj_decim_skip (mobj_t* mo)
+{
+    int i;
+    unsigned mask = (sat_tic_decim >= 2) ? 3u : 1u;
+    if (!(mo->flags & MF_SHOOTABLE) || mo->player)
+	return 0;
+    if (mo->flags & (MF_SKULLFLY | MF_MISSILE | MF_JUSTHIT | MF_CORPSE))
+	return 0;
+    if (mo->health <= 0)
+	return 0;
+    /* phase first (cheap): this mobj's turn to think this tic? */
+    if (((((unsigned)(long)mo) >> 4) + (unsigned)gametic) % (mask + 1u) == 0)
+	return 0;
+    /* near ANY player -> never decimate (the only per-monster cost: <= 4 approx-distances) */
+    for (i = 0; i < MAXPLAYERS; i++)
+	if (playeringame[i] && players[i].mo)
+	{
+	    if (P_AproxDistance (mo->x - players[i].mo->x,
+				 mo->y - players[i].mo->y) < SAT_DECIM_DIST)
+		return 0;
+	}
+    return 1;
+}
+
 //
 // P_RunThinkers
 //
@@ -119,6 +159,19 @@ void P_RunThinkers (void)
 	    if (!P_MobjSlabFree (currentthinker))
 		Z_Free (currentthinker);
 	}
+	/* SATURN 2026-08-21 -- THE TIC GOVERNOR, part 1: PARKED thinker (-2, set by p_mobj.c on a
+	   settled corpse/prop).  Unlink like a removal but KEEP the memory: the mobj stays in the
+	   sector/blockmap lists, so it still renders, still rides moving floors (P_ThingHeightClip
+	   is sector-driven), the Arch-Vile still finds it (blockmap search) -- it just stops
+	   burning a list walk + a no-op P_MobjThinker call every tic.  A_VileChase re-links it on
+	   raise (p_enemy.c).  ⚠ If SAVEGAMES ever land: P_ArchiveThinkers only walks this list --
+	   parked mobjs must be re-linked (or archived via sector lists) before saving. */
+	else if ( currentthinker->function.acv == (actionf_v)(-2) )
+	{
+	    currentthinker->next->prev = currentthinker->prev;
+	    currentthinker->prev->next = currentthinker->next;
+	    sat_tic_parked++;
+	}
 	else
 	{
 	    /* SATURN 2026-08-17 (row 23 `THK`): bill the MOBJ thinkers separately from the sector
@@ -128,11 +181,15 @@ void P_RunThinkers (void)
 		if (currentthinker->function.acp1 == (actionf_p1)P_MobjThinker)
 		{
 		    /* thinker_t is mobj_t's first member (vanilla layout) -> the cast is exact */
-		    if (((mobj_t *)currentthinker)->flags & MF_SHOOTABLE)
-			nshoot++;
-		    RP_ThkMobjBegin ();
-		    currentthinker->function.acp1 (currentthinker);
-		    RP_ThkMobjEnd ();
+		    mobj_t* mo = (mobj_t *)currentthinker;
+		    if (mo->flags & MF_SHOOTABLE)
+			nshoot++;		/* counted BEFORE any decimation skip: still alive */
+		    if (!(sat_tic_decim && sat_mobj_decim_skip (mo)))
+		    {
+			RP_ThkMobjBegin ();
+			currentthinker->function.acp1 (currentthinker);
+			RP_ThkMobjEnd ();
+		    }
 		}
 		else
 		{
@@ -177,6 +234,40 @@ void P_RunThinkers (void)
 	    }
 	    sat_sight_cache_tics = t;
 	}
+    }
+
+    /* SATURN 2026-08-21 -- the DECIMATION LAW (governor part 2): the same integrator shape as
+       the render governor (r_parallel.c), on the same discipline -- ONE signed accumulator, no
+       cross-reset, asymmetric credit -- but fed by the MEASURED per-tic thinker cost
+       (sat_think_last10; RP_ThinkEnd just ran, so this reads THIS tic).  Constants are console
+       STARTING POINTS from the owner's MAP20 videos (calm ~5 ms/tic, carnage 15-25; Ymir reads
+       8-14 ms a FRAME and must never calibrate this -- ymir-not-a-perf-oracle): target 12 ms,
+       band +/-3, fire at +120 ms integrated (~0.5-1 s of carnage), release at -240 (~3 s of
+       calm).  Falsifier on console: row 23 `mo` drops ~a third when `dc` steps to 1 with the
+       eye seeing nothing; `dc` pumping 0<->1 every second = band too tight, widen it. */
+#define TICGOV_TARGET10  120
+#define TICGOV_BAND10     30
+#define TICGOV_FIRE10   1200
+#define TICGOV_REL10   (-2400)
+    /* ⚠ DEMO GATE: decimation DIVERGES from the vanilla sim (skipped thinks change monster
+       behaviour), so it must never run under a recorded demo -- the attract loop would desync
+       into nonsense on any demo heavy enough to fire the law.  (The corpse PARKING needs no
+       gate: the parked call was a pure no-op, the sim is bit-identical.)  Drop the rung
+       immediately on entering playback; the law stays armed for real play. */
+    if (demoplayback)
+	sat_tic_decim = 0;
+    else if (sat_tic_decim_auto)
+    {
+	extern int sat_think_last10;
+	static int tdebt = 0;
+	int err = sat_think_last10 - TICGOV_TARGET10;
+	if (err > TICGOV_BAND10)        tdebt += err - TICGOV_BAND10;
+	else if (err < -TICGOV_BAND10)  tdebt += (err + TICGOV_BAND10) / 2;   /* credit at half rate */
+	/* the threshold reset doubles as the anti-windup rail: at the top rung a re-fire is a
+	   no-op that re-arms the climb, at the bottom a re-release re-arms the credit -- the
+	   integral never runs away in either direction. */
+	if (tdebt >= TICGOV_FIRE10) { if (sat_tic_decim < 2) sat_tic_decim++; tdebt = 0; }
+	else if (tdebt <= TICGOV_REL10) { if (sat_tic_decim > 0) sat_tic_decim--; tdebt = 0; }
     }
 }
 

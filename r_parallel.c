@@ -1401,8 +1401,17 @@ void RP_TicEnd     (void) { sat_tic_total_frt += (unsigned short)(rp_frt() - tic
    Without this counter `th111` at 3,6 fps and `th18` at 16,5 fps cannot be compared at all: they
    may be the same cost per tic.  One increment per P_RunThinkers call = one per tic, exactly. */
 unsigned int sat_tic_runs = 0;
+/* SATURN 2026-08-21: LAST tic's P_RunThinkers cost in tenths of a ms -- the measured input of
+   the TIC governor (p_tick.c decimation law).  One RP_Think bracket = exactly one tic, so this
+   is already per-tic; no frame-sum ambiguity (the row-23 lesson). */
+int sat_think_last10 = 0;
 void RP_ThinkBegin (void) { sat_tic_runs++; tic_think_t0 = rp_frt(); }
-void RP_ThinkEnd   (void) { sat_tic_think_frt += (unsigned short)(rp_frt() - tic_think_t0); }
+void RP_ThinkEnd   (void)
+{
+    unsigned short d = (unsigned short)(rp_frt() - tic_think_t0);
+    sat_tic_think_frt += d;
+    sat_think_last10 = (int)((unsigned)d * 10u / 224u);
+}
 void RP_SightBegin (void) { tic_sight_t0 = rp_frt(); }
 void RP_SightEnd   (void) { sat_tic_sight_frt += (unsigned short)(rp_frt() - tic_sight_t0); }
 /* 🔴 SATURN 2026-08-17 -- DECOMPOSE THE THINKERS (row 23 `THK`).  Hardware reads `th` at 24-38 ms on

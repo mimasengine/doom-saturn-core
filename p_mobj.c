@@ -493,6 +493,26 @@ void P_MobjThinker (mobj_t* mobj)
     }
     else
     {
+	/* SATURN 2026-08-21 -- TIC GOVERNOR part 1: PARK the settled dead and the static props.
+	   A thing in its final state (tics==-1) with no momentum and nowhere to fall runs this
+	   function as a pure NO-OP 35x/s -- on a TNT MAP20 carnage that is thousands of list
+	   entries (console THK n2600-2900) walked for nothing.  Mark the thinker PARKED (-2):
+	   P_RunThinkers unlinks it WITHOUT freeing -- the mobj keeps rendering (sector lists),
+	   keeps riding lifts (P_ThingHeightClip is sector-driven), the crusher can still gib it
+	   (P_SetMobjState works on a parked mobj; S_GIBS is tics==-1 too), and A_VileChase
+	   re-links it on raise.  Zero sim divergence: everything below this point was
+	   unreachable for these things anyway.  Gates: players (reborn machinery owns them);
+	   COUNTKILL corpses under respawnmonsters (the nightmare countdown below IS their
+	   thinker's job); hanging/floating props park via MF_NOGRAVITY (their z never moves). */
+	if (!mobj->player
+	    && (!(mobj->flags & MF_COUNTKILL) || !respawnmonsters)
+	    && !mobj->momx && !mobj->momy && !mobj->momz
+	    && (mobj->z == mobj->floorz || (mobj->flags & MF_NOGRAVITY)))
+	{
+	    mobj->thinker.function.acv = (actionf_v)(-2);
+	    return;
+	}
+
 	// check for nightmare respawn
 	if (! (mobj->flags & MF_COUNTKILL) )
 	    return;

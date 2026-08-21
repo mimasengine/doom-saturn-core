@@ -1203,6 +1203,14 @@ void A_VileChase (mobj_t* actor)
 		    corpsehit->health = info->spawnhealth;
 		    corpsehit->target = NULL;
 
+		    /* SATURN 2026-08-21: a PARKED corpse (thinker -2, unlinked -- p_mobj.c/p_tick.c)
+		       must re-enter the thinker list or the raise animation never ticks. */
+		    if (corpsehit->thinker.function.acv == (actionf_v)(-2))
+		    {
+			corpsehit->thinker.function.acp1 = (actionf_p1) P_MobjThinker;
+			P_AddThinker (&corpsehit->thinker);
+		    }
+
 		    return;
 		}
 	    }
