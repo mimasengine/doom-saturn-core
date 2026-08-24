@@ -71,7 +71,7 @@ void R_DrawPlanes (void);
    sat_sector_bbox (p_local.h) it gives that surface's EXACT world AABB. */
 #define VPF_SPLIT  1   /* R_CheckPlane forked: this plane is a PIECE of its sector's surface */
 #define VPF_MULTI  2   /* R_FindPlane merged another sector in: not one surface at all       */
-extern short *vp_sector;
+extern short *vp_bbox;    /* 4 shorts per plane: world AABB, union of the sectors in it */
 extern byte  *vp_flags;
 
 visplane_t*

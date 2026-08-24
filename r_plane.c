@@ -320,15 +320,37 @@ extern int   columnofs[];
    inverse-projecting the four corners of a screen bbox.
    PARALLEL arrays, not new fields: visplane_t stays 28 B and byte-identical, so the hash
    walk the pooling change exists to keep cache-friendly is untouched. */
-short *vp_sector = NULL;
+/* inc-A'b (owner's console probe read @9 with 3000 px twice: the MERGE rule was refusing the
+   corridor and the lit zone).  VPF_MULTI is NOT a fragment -- merging is the NORM in Doom,
+   most levels share a floor height/flat/lightlevel across many sectors, and R_FindPlane joins
+   them into one visplane.  Refusing that refused nearly every floor.
+   So carry the plane's own world AABB instead of one sector index: seeded from the creating
+   sector, UNIONED with each sector that merges in.  It stays an exact world bound (never a
+   screen-space reconstruction), just a looser one when several sectors share the plane -- and
+   the claim intersects it with the visible extent, which tightens it back.
+   4 shorts per plane, world units, [BOXTOP, BOXBOTTOM, BOXLEFT, BOXRIGHT]. */
+extern short *sat_sector_bbox;   /* p_setup.c: exact per-sector world bbox (PU_LEVEL) */
+short *vp_bbox   = NULL;
 byte  *vp_flags  = NULL;
+static void vp_bbox_add (int ni, int secnum)
+{
+    const short *sb;
+    short *db;
+    if (!vp_bbox || !sat_sector_bbox || secnum < 0) return;
+    sb = sat_sector_bbox + secnum * 4;
+    db = vp_bbox + ni * 4;
+    if (sb[0] > db[0]) db[0] = sb[0];      /* BOXTOP    = max y */
+    if (sb[1] < db[1]) db[1] = sb[1];      /* BOXBOTTOM = min y */
+    if (sb[2] < db[2]) db[2] = sb[2];      /* BOXLEFT   = min x */
+    if (sb[3] > db[3]) db[3] = sb[3];      /* BOXRIGHT  = max x */
+}
 
 void R_InitPlanes (void)
 {
     /* SATURN: allocate from zone heap (low WRAM) — keeps high WRAM BSS within
        the 1MB limit.  Z_Init runs before R_Init so the heap is ready. */
     visplanes = Z_Malloc(MAXVISPLANES * sizeof(visplane_t), PU_STATIC, 0);
-    vp_sector = Z_Malloc(MAXVISPLANES * sizeof(short), PU_STATIC, 0);
+    vp_bbox   = Z_Malloc(MAXVISPLANES * 4 * sizeof(short), PU_STATIC, 0);
     vp_flags  = Z_Malloc(MAXVISPLANES * sizeof(byte),  PU_STATIC, 0);
     r_visplane_peak = 0;
 #if SAT_VISPLANE_POOL
@@ -570,10 +592,10 @@ R_FindPlane
 	    && picnum == check->picnum
 	    && lightlevel == check->lightlevel)
 	{
-	    /* SATURN: a second sector reaching the same key MERGES into this plane -- it is
-	       then not one surface, and its sector's bbox no longer describes it. */
-	    if (vp_flags && secnum >= 0 && vp_sector[idx] != (short)secnum)
-		vp_flags[idx] |= VPF_MULTI;
+	    /* a second sector reaching the same key MERGES into this plane: widen the plane's
+	       world box to cover it, and record that it is no longer a single sector. */
+	    if (vp_flags && secnum >= 0)
+	    { vp_bbox_add (idx, secnum); vp_flags[idx] |= VPF_MULTI; }
 	    return check;
 	}
     }
@@ -593,8 +615,8 @@ R_FindPlane
     if (check < lastvisplane)
     {
 	int li = (int)(check - visplanes);      /* same merge rule, unhashed path */
-	if (vp_flags && secnum >= 0 && vp_sector[li] != (short)secnum)
-	    vp_flags[li] |= VPF_MULTI;
+	if (vp_flags && secnum >= 0)
+	{ vp_bbox_add (li, secnum); vp_flags[li] |= VPF_MULTI; }
 	return check;
     }
     }
@@ -613,8 +635,10 @@ R_FindPlane
     if (vp_flags)
     {
 	int ni = (int)(check - visplanes);
-	vp_sector[ni] = (short)secnum;
-	vp_flags[ni]  = 0;                       /* whole surface until proven otherwise */
+	short *db = vp_bbox + ni * 4;
+	db[0] = -32767; db[1] = 32767; db[2] = 32767; db[3] = -32767;   /* empty box */
+	vp_bbox_add (ni, secnum);
+	vp_flags[ni]  = 0;                       /* one whole sector until proven otherwise */
     }
 
 #if SAT_VISPLANE_POOL
@@ -729,8 +753,8 @@ R_CheckPlane
        child inherits the sector identity (and any MULTI already on the parent). */
     if (vp_flags)
     {
-	int pi = (int)(pl - visplanes), ci = (int)(lastvisplane - visplanes);
-	vp_sector[ci] = vp_sector[pi];
+	int pi = (int)(pl - visplanes), ci = (int)(lastvisplane - visplanes), q;
+	for (q = 0; q < 4; ++q) vp_bbox[ci*4 + q] = vp_bbox[pi*4 + q];
 	vp_flags[ci]  = (byte)(vp_flags[pi] | VPF_SPLIT);
 	vp_flags[pi] |= VPF_SPLIT;
     }
