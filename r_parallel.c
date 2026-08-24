@@ -1316,6 +1316,10 @@ void RP_WaitWallPrep(void)
    standalone MST row was dropped -- it only pointed at rows 19/20).  Defined
    unconditionally so the platform's extern links even when RP_PROF is off. */
 unsigned int rp_master_ms = 0;
+/* SATURN 2026-08-24: the frame's TOTAL render (Bw+Bp+P+M, all views summed) in TENTHS of a ms --
+   the LOD governor's own decision quantity, exported so the platform's wall-span governor can
+   steer on the same clock instead of the 1 Hz overlay period.  0 until the first sane frame. */
+unsigned int rp_rend10 = 0;
 
 /* SATURN (VDP1-floor inc-0): the floor-quad estimate surfaced to a VISIBLE overlay row.
    Row 13 (FLAT) sits in the split-screen viewport band = unreadable, so the platform
@@ -1585,6 +1589,7 @@ static unsigned short prof_gc_mx;       /* max single-call FRT delta this frame 
    5 = W_CacheLumpNum on that same path.  Both were unbracketed, and row 16 proved the frame's cost
    is exactly there -- see the note at their call sites in r_data.c. */
 static unsigned short prof_st_t0[6], prof_st_mx[6];
+static unsigned int   prof_st_sum[6];   /* SATURN 2026-08-23: the SUM per sub-bracket (global, not peak) */
 static int            prof_in_wp;
 static unsigned int   prof_flatalloc;   /* W_CacheLumpNum/Release per visplane c P  */
 static unsigned short prof_fc_t0;
@@ -1738,6 +1743,7 @@ void RP_StampEnd(int slot)
     if (!prof_in_wp || (unsigned)slot >= 6u) return;
     d = (unsigned short)(rp_frt() - prof_st_t0[slot]);
     if (d > prof_st_mx[slot]) prof_st_mx[slot] = d;
+    prof_st_sum[slot] += d;
 #endif
 }
 
@@ -1756,14 +1762,17 @@ void RP_SegLoopEnter(void)   {
    number could not rank them, and Bp is now the whole frame (ld flat, disc silent). */
 void RP_SegRoutMark(void)    {
 #if RP_PROF
-    unsigned short now = rp_frt();
-    prof_segrout += (unsigned short)(now - prof_sl_t0);
-    prof_sl_t0 = now;
+    if (sat_dbg_overlay_mode == 0) {
+        unsigned short now = rp_frt();
+        prof_segrout += (unsigned short)(now - prof_sl_t0);
+        prof_sl_t0 = now;
+    }
 #endif
 }
 void RP_SegLoopLeave(void)   {
 #if RP_PROF
-    prof_segloop += (unsigned short)(rp_frt() - prof_sl_t0);
+    if (sat_dbg_overlay_mode == 0)
+        prof_segloop += (unsigned short)(rp_frt() - prof_sl_t0);
 #endif
 }
 void RP_FlatCacheEnter(void) {
@@ -2294,6 +2303,8 @@ void RP_BeginFrame(void)
     prof_gc_mx  = 0;                                                     /* worst single call (row 20 `x`) */
     prof_st_mx[0] = prof_st_mx[1] = prof_st_mx[2] = prof_st_mx[3] = 0;   /* row 20 e/a/k    */
     prof_st_mx[4] = prof_st_mx[5] = 0;                                   /* row 20 q/c      */
+    prof_st_sum[0] = prof_st_sum[1] = prof_st_sum[2] = prof_st_sum[3] = 0;
+    prof_st_sum[4] = prof_st_sum[5] = 0;
     { extern int z_walk_blocks; z_walk_blocks = 0; }                     /* zone blocks walked / frame */
     /* (r_lookup_rebuilds reset REMOVED 2026-08-10 with row-20 `e` -- see core/r_data.c:507) */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
@@ -2406,6 +2417,11 @@ void RP_BeginMasked(void)
 int sat_prof_rec_max=0;            /* window max (= p100), tenths-ms */
 int sat_prof_dropped=0;            /* glitch/transition frames excluded from the window */
 int sat_prof_pk_bw=0, sat_prof_pk_bp=0, sat_prof_pk_p=0, sat_prof_pk_m=0;  /* per-phase peaks */
+/* SATURN 2026-08-24: the peak Bp of the CURRENT 1 s overlay window -- what row 20's sub-split
+   describes.  Zeroed by the platform on its window tick, so the row follows the game instead of
+   freezing on the map's post-load record.  Separate from sat_prof_pk_bp on purpose (row 4's peak
+   is the A/B reference and must survive the whole toggle window). */
+int sat_prof_bp_win=0;
 /* SATURN 2026-08-15: the LOD governor's state lives in r_segs.c beside the knob it drives. */
 extern int sat_lod_eff, sat_lod_auto_step, sat_gov_debt;
 extern int sat_lead_mode, sat_wall_lead_x;   /* r_segs.c: the lead-fill's mode and depth */
@@ -2450,6 +2466,20 @@ int sat_gov_inert = 0;      /* bit0 = `w` axis proven inert, bit1 = `p`, bit2 = 
    such count and keeps the ms probe; that is a gap, not an oversight. */
 #define GOV_ACTWAIT 4       /* frames to see at least ONE action from the rung just fired        */
 unsigned int sat_gov_act_w = 0, sat_gov_act_l = 0;
+/* SATURN 2026-08-24 -- THE `p` AXIS FINALLY HAS ONE, and the rung it counts is finally real.
+   Two defects, one cause: the plane rung is applied as a FLOOR over the owner's own SQ
+   (dg_saturn gov_sq[] + max()), and the shipped SQ is already `ld` for BOTH planes -- so rung 1
+   (`ld`) was BIT-IDENTICAL to rung 0.  Every election of `P` spent a fire and 24 probe frames on
+   a no-op, measured no gain, and the unwind then blacklisted the WHOLE axis -- taking rung 2
+   (`flat`, a real memset instead of a textured span) with it.  So:
+     - the election now JUMPS to sat_gov_p_min, the first rung that can actually raise the level
+       above what the owner asked for (published by the platform, which owns gov_sq[]);
+     - and sat_gov_act_p counts PLANES the governor actually degraded, so GOV_ACTWAIT can convict
+       the axis when it truly does nothing -- which is the case in SPLIT, where sat_view_sq_apply
+       rewrites the four flags per view WITHOUT the max() and the governor's floor never lands. */
+unsigned int sat_gov_act_p = 0;
+int sat_gov_p_min = 1;   /* platform-published: first p rung that changes a pixel (1 or 2) */
+int sat_gov_p_bites = 0; /* platform-published: 1 = the plane floor is landing on THIS view       */
 static unsigned int gov_pr_act0 = 0;
 #define GOV_RETEST 256      /* frames a parole must ripen before the next sector change re-arms */
 extern void *sat_view_sector;                                   /* r_main.c, identity token only */
@@ -2640,6 +2670,13 @@ static void rp_p3_prof_show(void)
         }
         if (gov_decide)
         {
+            /* SATURN 2026-08-24 -- PUBLISH THE FRAME'S RENDER CLOCK.  The platform's wall-span
+               governor (dg_saturn.cxx) had no per-frame CPU signal at all: it steered on
+               rp_master_ms, which is the 1 Hz overlay period (MST), so it compared a whole-frame
+               wall-clock average -- tic, sound and blit included -- against a 50 ms threshold the
+               game never sees.  This is the same number THIS governor decides on: render only
+               (B+P+M), tenths of a ms, already summed across the split views. */
+            rp_rend10 = g_rend;
             int err = (int)g_rend - GOV_TARGET10;
             if (err > GOV_BAND10)        sat_gov_debt += err - GOV_BAND10;
             else if (err < -GOV_BAND10)  sat_gov_debt += (err + GOV_BAND10) / 2;   /* half rate */
@@ -2675,10 +2712,11 @@ static void rp_p3_prof_show(void)
             {
                 unsigned int act = (gov_pr_axis == 0) ? sat_gov_act_w
                                  : (gov_pr_axis == 2) ? sat_gov_act_l
-                                 : gov_pr_act0 + 1u;    /* `p` has no action count -> never convicts */
+                                 : sat_gov_act_p;       /* SATURN 2026-08-24: `p` can be convicted too */
                 if (act == gov_pr_act0)
                 {
                     if      (gov_pr_axis == 0) { sat_lod_auto_step = 0; sat_gov_inert |= 1; }
+                    else if (gov_pr_axis == 1) { sat_gov_p_step = 0; sat_gov_p_dirty = 1; sat_gov_inert |= 2; }
                     else if (gov_pr_axis == 2) { sat_gov_lead_step = 0; sat_gov_inert |= 4; }
                     sat_gov_debt = 0; gov_pr_wait = 0; gov_pr_axis = -1;
                 }
@@ -2718,7 +2756,10 @@ static void rp_p3_prof_show(void)
                 if (sat_gov_axis == 'B' && sat_lod_auto_step < 3 && !(sat_gov_inert & 1))
                     { sat_lod_auto_step++; gov_pr_axis = 0; }
                 else if (sat_gov_axis == 'P' && sat_gov_p_step < 2 && !(sat_gov_inert & 2))
-                    { sat_gov_p_step++; sat_gov_p_dirty = 1; gov_pr_axis = 1; }
+                    { sat_gov_p_step = (sat_gov_p_step < sat_gov_p_min)
+                                     ? sat_gov_p_min : sat_gov_p_step + 1;
+                      if (sat_gov_p_step > 2) sat_gov_p_step = 2;
+                      sat_gov_p_dirty = 1; gov_pr_axis = 1; }
                 /* 🔴 THE FALL-THROUGH USED TO IGNORE THE BLACKLIST, and that is why the owner's
                    ratchet SURVIVED the probe.  Four captures read `dB ... w1`/`w2` WITH `i1` set:
                    the first branch correctly refused the inert `w` axis, the second did not match
@@ -2729,7 +2770,10 @@ static void rp_p3_prof_show(void)
                 else if (sat_lod_auto_step < 3 && !(sat_gov_inert & 1))
                     { sat_lod_auto_step++; gov_pr_axis = 0; }
                 else if (sat_gov_p_step < 2 && !(sat_gov_inert & 2))
-                    { sat_gov_p_step++; sat_gov_p_dirty = 1; gov_pr_axis = 1; }
+                    { sat_gov_p_step = (sat_gov_p_step < sat_gov_p_min)
+                                     ? sat_gov_p_min : sat_gov_p_step + 1;
+                      if (sat_gov_p_step > 2) sat_gov_p_step = 2;
+                      sat_gov_p_dirty = 1; gov_pr_axis = 1; }
                 /* 🔴 SATURN 2026-08-17 -- THE LEAD-FILL LADDER, the owner's own proposal: "full quand
                    tout va bien, flat quand ça dégénère, désactivé quand c'est catastrophique".
                    It is LAST on purpose.  The lead-fill is his correction for VDP1's motion lag and
@@ -2738,7 +2782,19 @@ static void rp_p3_prof_show(void)
                    collapsing has to be allowed to trade it.  Step 1 keeps FULL COVERAGE and only
                    drops the texturing (mode 2 = flat spans): no holes, and holes are the one thing
                    that must never appear.  Step 2 is the last resort. */
-                else if (sat_gov_lead_step < 2 && !(sat_gov_inert & 4))
+                /* 🔴 SATURN 2026-08-24 -- GATED ON THE MECHANISM BEING ARMED AT ALL.
+                   The lead-fill is PARKED: sat_wall_lead_x is 0 at boot (r_segs.c) and no pad chord
+                   re-arms it any more, so sat_lead_arm always returns .on = 0 and SAT_LEAD_EMIT is
+                   unreachable -- the fill cannot draw a single pixel.  The LADDER, however, was
+                   still live: every fire that reached this rung spent GOV_FIRE10 of debt and
+                   GOV_ACTWAIT frames of probe blackout on a lever with no effect, then convicted
+                   itself, and on release burned the FIRST quality step on this dead axis before
+                   giving anything back to `w`/`p`.  Worse, sat_lead_mode is an A/B window key
+                   (dg_saturn RP_ProfReset): each 1->2->1 cycle wiped the REC p50/p95 histogram.
+                   Testing sat_wall_lead_x instead of deleting the rung keeps the documented
+                   revival hook honest -- re-arm the fill and the governor axis comes back with it,
+                   with no second place to remember. */
+                else if (sat_wall_lead_x > 0 && sat_gov_lead_step < 2 && !(sat_gov_inert & 4))
                     { sat_gov_lead_step++; gov_pr_axis = 2; }
                 /* ARM THE PROBE ONLY IF A RUNG ACTUALLY MOVED.  Arming it unconditionally spent
                    GOV_PROBE frames of blackout -- during which no further fire can happen -- on a
@@ -2747,7 +2803,8 @@ static void rp_p3_prof_show(void)
                 {
                     gov_pr_wait = GOV_PROBE;
                     gov_pr_act0 = (gov_pr_axis == 0) ? sat_gov_act_w
-                                : (gov_pr_axis == 2) ? sat_gov_act_l : 0u;
+                                : (gov_pr_axis == 2) ? sat_gov_act_l
+                                : (gov_pr_axis == 1) ? sat_gov_act_p : 0u;
                 }
             }
             else if (sat_gov_debt <= GOV_REL10)
@@ -2796,12 +2853,34 @@ static void rp_p3_prof_show(void)
             static const int gov_segb[4] = { 0, 96, 64, 40 };
             sat_seg_budget = gov_segb[sat_lod_auto_step & 3];
         }
+        /* SATURN 2026-08-24 -- THE SUBDIVISION SKIP IS A RUNG OF THIS SAME AXIS (owner: *"le skip
+           subdivision devrait aussi etre une option du gouverneur, pas la norme"*).  It belongs on
+           `B`/`w` and nowhere else: the SAT_VROWS divides it removes are billed to Bp, and the N-1
+           VDP1 commands it also removes are the same budget the seg rung is defending.
+           Rung 1 already, not 3 -- it is the CHEAPEST of the three: the area rung and the seg
+           budget both replace a texture with a flat colour, while this one keeps the texture and
+           only lets it swim on a wall you are standing in front of.  Degrade the picture last.
+           r_segs.c bumps sat_gov_act_w every time the skip actually takes a wall off the
+           subdivided path, so GOV_ACTWAIT convicts this rung like any other if it never bites. */
+        {
+            static const int gov_sub[4] = { 0, 1, 1, 1 };
+            sat_wall_subdiv_skip = gov_sub[sat_lod_auto_step & 3];
+        }
     }
 
     if (rend <= RP_REC_SANE) {
         if (bw10 > (unsigned)sat_prof_pk_bw) sat_prof_pk_bw = (int)bw10;
-        if (bp10 > (unsigned)sat_prof_pk_bp) {
-            sat_prof_pk_bp = (int)bp10;
+        if (bp10 > (unsigned)sat_prof_pk_bp) sat_prof_pk_bp = (int)bp10;
+        /* SATURN 2026-08-24 -- THE SUB-SPLIT NOW RIDES A 1-SECOND PEAK, NOT THE SESSION PEAK.
+           It used to latch on sat_prof_pk_bp, which RP_ProfReset only clears on a map or toggle
+           change: once the post-load frame set the record, row 20 froze on it and answered
+           "what was the worst frame of this map" instead of "where is the time going NOW".
+           sat_prof_bp_win is the same peak over the platform's 1 s overlay window (dg_saturn
+           zeroes it on the window tick), so the row stays a WORST-frame view -- single frames
+           jitter far too much at 5-10 fps to read -- but a RECENT one.  Row 4's PK Bp keeps its
+           session semantics untouched: that peak is what the A/B toggles compare. */
+        if (bp10 > (unsigned)sat_prof_bp_win) {
+            sat_prof_bp_win = (int)bp10;
             /* SATURN 2026-08-08: latch the Bp SUB-SPLIT of THIS SAME FRAME.  Three independent
                maxima would describe three different frames and prove nothing -- the lesson row 20
                already taught with `c`/`n` against `e`.  So the split always describes the frame
@@ -2849,12 +2928,21 @@ static void rp_p3_prof_show(void)
                 if (prof_bp_g_x > 99999u) prof_bp_g_x = 99999u;
                 /* e/a/k in MILLISECONDS: the question is which third carries ~46, and a sub-ms
                    third reading 0 is the answer, not a loss of resolution. */
-                prof_bp_g_e = prof_st_mx[0] / 224u;
-                prof_bp_g_a = prof_st_mx[1] / 224u;
-                prof_bp_g_k = prof_st_mx[2] / 224u;
-                prof_bp_g_z = prof_st_mx[3] / 224u;
-                prof_bp_g_q = prof_st_mx[4] / 224u;   /* the garde (W_LumpResident + Z_CanAllocate) */
-                prof_bp_g_c = prof_st_mx[5] / 224u;   /* W_CacheLumpNum on the single-patch path    */
+                /* SATURN 2026-08-24 -- TENTHS, not whole ms.  Whole milliseconds were the right
+                   unit when the question was "which third carries the 46 ms"; they are the wrong
+                   one now that the same brackets are being read on YMIR, where the identical work
+                   costs 0,1-0,4 ms and every field truncates to a confident `0`.  One FRT tick is
+                   4,47 us, 224 of them ~= 1,0 ms, so `x10u/224u` = tenths and the printed width is
+                   unchanged in the common case (1,4 ms prints `14` where it printed `1`).
+                   Clamp at 999 = 99,9 ms; a bracket past that is a `B!` frame anyway. */
+#define BP_T10(v) (((v) * 10u / 224u) > 999u ? 999u : ((v) * 10u / 224u))
+                prof_bp_g_e = BP_T10(prof_st_mx[0]);
+                prof_bp_g_a = BP_T10(prof_st_mx[1]);
+                prof_bp_g_k = BP_T10(prof_st_mx[2]);
+                prof_bp_g_z = BP_T10(prof_st_mx[3]);
+                prof_bp_g_q = BP_T10(prof_st_mx[4]);   /* the garde (W_LumpResident + Z_CanAllocate) */
+                prof_bp_g_c = BP_T10(prof_st_sum[5]);  /* W_CacheLumpNum single-patch, SUM (global) -- the CD-read bill */
+#undef BP_T10
                 /* (`b` = per-frame composite count RETIRED 2026-08-12, one capture after it was
                    added.  It did its job: g30/b0 and g197/b4 killed R_GenerateComposite as the
                    explanation of the R_GetColumn hole, so keeping the latch would be a value
@@ -2978,7 +3066,17 @@ static void rp_p3_prof_show(void)
         /* `z` RETIRED 2026-08-17 -- it read 0-1 on every capture ever taken, its question (is the
            worst Z_Malloc the hole?) is answered NO, and its two columns are worth more to `q`/`c`,
            the pair that now decides between "make the garde cheap" and "stop faulting lumps". */
-        snprintf(p, sizeof p, "%s g%u n%u x%u a%u e%u k%u q%u c%u  ",
+        /* UNITS (2026-08-24): `g` = whole ms, `n` = calls, `x` = MICROseconds (worst single call),
+           and `a e k q c` = TENTHS of a ms.  They were whole ms until today and read `0 0 0 0 0`
+           on Ymir for the arithmetic reason, not for a defect: the same brackets cost 1-7 ms on
+           console and 0,1-0,4 ms there.  `c` is the exception that no unit can fix -- it is the
+           W_CacheLumpNum disc bill, and Ymir serves the image from host RAM, so `c0` is STRUCTURAL
+           there and only the console can answer that field. */
+        /* TRAILING SPACES: dbg_print does not clear the tail, and the fields just got SHORTER
+           (whole ms -> tenths only widens the small values, while g/n/x shrink to 0 the moment
+           the walls all ride VDP1).  The owner's 4p capture read `BP g0 n0 x0 a0 e0 k0 q0 c0 87`
+           -- the `87` is the tail of a previous, longer line.  Pad to the widest form. */
+        snprintf(p, sizeof p, "%s g%u n%u x%u a%u e%u k%u q%u c%u                    ",
                  prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_g_n,
                  prof_bp_g_x, prof_bp_g_a, prof_bp_g_e, prof_bp_g_k,
                  prof_bp_g_q, prof_bp_g_c);

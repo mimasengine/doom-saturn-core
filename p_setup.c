@@ -651,6 +651,10 @@ void P_LoadBlockMap (int lump)
 // Builds sector line lists and subsector sector numbers.
 // Finds block bounding boxes for sectors.
 //
+/* SATURN: exact per-sector world bbox, 4 shorts each (BOXTOP/BOTTOM/LEFT/RIGHT, world
+   units), (re)built by P_GroupLines every level load.  NULL before the first level. */
+short *sat_sector_bbox = NULL;
+
 void P_GroupLines (void)
 {
     line_t**		linebuffer;
@@ -730,7 +734,23 @@ void P_GroupLines (void)
     }
     
     // Generate bounding boxes for sectors
-	
+
+    /* SATURN 2026-08-24 (owner): KEEP the exact world bbox.
+       Vanilla computes it right here and then throws it away -- only the blockmap-quantised
+       version (sector->blockbox, 128-unit grain) and the midpoint (soundorg) survive.  The
+       renderer therefore has no way to ask "how big is this floor in the world, and where",
+       and the VDP1 floor claim had been RECONSTRUCTING an AABB by inverse-projecting the four
+       corners of a visplane's SCREEN bbox -- a rectangle that overshoots the true polygon
+       badly for anything seen at an angle, which is why a lit inset rectangle or a stair
+       tread kept being refused or claimed with holes.
+       This is the missing input, and it costs nothing to compute: the loop below already has
+       the exact numbers.  4 shorts per sector (world units fit a short exactly -- Doom map
+       coordinates are +-32768), from the LEVEL zone (PU_LEVEL, freed on level change), NOT
+       from the boot TLSF pool.  ~720 B on E1M1, ~16 KB on a 2000-sector monster.
+       Layout mirrors bbox[]: BOXTOP, BOXBOTTOM, BOXLEFT, BOXRIGHT. */
+    sat_sector_bbox = (numsectors > 0)
+        ? Z_Malloc (numsectors * 4 * sizeof(short), PU_LEVEL, 0) : NULL;
+
     sector = sectors;
     for (i=0 ; i<numsectors ; i++, sector++)
     {
@@ -742,6 +762,16 @@ void P_GroupLines (void)
 
             M_AddToBox (bbox, LINE_V1(li)->x, LINE_V1(li)->y);
             M_AddToBox (bbox, LINE_V2(li)->x, LINE_V2(li)->y);
+	}
+
+	// SATURN: the exact world bbox, before the blockmap quantisation below destroys it
+	if (sat_sector_bbox)
+	{
+	    short *sb = sat_sector_bbox + i*4;
+	    sb[BOXTOP]    = (short)(bbox[BOXTOP]    >> FRACBITS);
+	    sb[BOXBOTTOM] = (short)(bbox[BOXBOTTOM] >> FRACBITS);
+	    sb[BOXLEFT]   = (short)(bbox[BOXLEFT]   >> FRACBITS);
+	    sb[BOXRIGHT]  = (short)(bbox[BOXRIGHT]  >> FRACBITS);
 	}
 
 	// set the degenmobj_t to the middle of the bounding box

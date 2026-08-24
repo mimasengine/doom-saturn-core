@@ -63,11 +63,23 @@ R_MakeSpans
 
 void R_DrawPlanes (void);
 
+/* SATURN 2026-08-24 -- PLANE IDENTITY (option A'), see the long note in r_plane.c.
+   vp_sector[i] / vp_flags[i] run parallel to visplanes[] (visplane_t itself is unchanged,
+   28 B, so the hash walk stays cache-tight).  flags == 0 means: plane i IS the whole of
+   exactly one sector's surface -- the only form in which the question can be asked, since a
+   visplane keys on (height, picnum, lightlevel) and forks per seg.  Combined with
+   sat_sector_bbox (p_local.h) it gives that surface's EXACT world AABB. */
+#define VPF_SPLIT  1   /* R_CheckPlane forked: this plane is a PIECE of its sector's surface */
+#define VPF_MULTI  2   /* R_FindPlane merged another sector in: not one surface at all       */
+extern short *vp_sector;
+extern byte  *vp_flags;
+
 visplane_t*
 R_FindPlane
 ( fixed_t	height,
   int		picnum,
-  int		lightlevel );
+  int		lightlevel,
+  int		secnum );
 
 visplane_t*
 R_CheckPlane

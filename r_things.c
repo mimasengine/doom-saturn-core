@@ -1911,7 +1911,7 @@ void R_EmitWorldThingsVDP1 (void)
 	    int  nem = 0, k;
 	    for (spr = vsprsortedhead.next ; emax > 0 && spr != &vsprsortedhead ; spr = spr->next)
 	    {
-		int  idx = spr - vissprites, j;
+		int  idx = spr - vissprites, j, sticky = 0;
 		long area = R_ThingScreenArea (spr);
 		int  is_actor = (spr->mobjflags & MF_SHOOTABLE) != 0;
 		long key, fl = is_actor ? actor_floor : area_floor;
@@ -1919,7 +1919,7 @@ void R_EmitWorldThingsVDP1 (void)
 		if (idx < 0 || idx >= MAXVISSPRITES) continue;
 		{ int h, dh; for (h = 0 ; h < hy_prev_n ; h++)
 		  { dh = hy_prev[h] - spr->patch;
-		    if (dh >= -THING_HY_SIB && dh <= THING_HY_SIB) { fl >>= 1; break; } } }   /* sticky floor (hysteresis, animation siblings included) */
+		    if (dh >= -THING_HY_SIB && dh <= THING_HY_SIB) { fl >>= 1; sticky = 1; break; } } }   /* sticky floor (hysteresis, animation siblings included) */
 		/* SATURN 2026-08-20: count the PASS-1 refusals -- they were INVISIBLE (the platform's
 		   THp `d` counters only see sprites that reached the emit hook), so "THp n0 on HW" could
 		   not be split between "area floor rejects" and "texture slot starvation".  Window
@@ -1936,7 +1936,18 @@ void R_EmitWorldThingsVDP1 (void)
 		   winner, only a real depth-cross flips it.  Decorations keep the real area (fill priority);
 		   the actor bit still puts every actor above every decoration.  Floor test + fill
 		   accumulator keep using the real area. */
-		key = (is_actor ? (long)spr->scale : area) + (is_actor ? (1L << 20) : 0);
+		/* SATURN 2026-08-21 (owner: reproduced the CORPSE flick -- one frame VDP1, next CPU): the
+		   incumbency fix above covers the GRANT (slot) election only.  This EMISSION ranking
+		   (top-emax by key) is a SECOND, independent cut with no hysteresis, so a sprite sitting at
+		   the emax boundary still flips every frame (the boundary moves: emax is the AIMD cap, and
+		   a corpse -- a decoration with a small on-screen area -- parks exactly there).  Same cure,
+		   same signal: a sprite whose texture was granted last frame competes with its rank KEY
+		   doubled, so it enters the top-emax small and leaves it small -- the boundary converges
+		   instead of oscillating.  Actors: doubling scale = "you must be 2x nearer to displace me",
+		   the same enter-big/leave-small contract as the grant. */
+		key = (is_actor ? (long)spr->scale : area);
+		if (sticky) key <<= 1;                      /* incumbency: last-frame winners rank higher */
+		key += (is_actor ? (1L << 20) : 0);
 		if (nem < emax) {                         /* insert (ascending, em_key[0] = lowest rank) */
 		    for (k = nem ; k > 0 && em_key[k-1] > key ; k--)
 		    { em_key[k] = em_key[k-1]; em_idx[k] = em_idx[k-1]; }

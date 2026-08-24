@@ -730,7 +730,11 @@ void R_GenerateLookup (int texnum)
 	    RP_StampEnd (1);
 	    return;
 	}
-	RP_StampBegin (2);
+	/* (SATURN 2026-08-24: an orphan `RP_StampBegin (2)` sat here with NO matching End --
+	   left behind when the header-only prefix path replaced the full W_CacheLumpNum it was
+	   meant to time.  Slot 2 is `k` = the R_GenerateComposite build, bracketed in
+	   R_GetColumn below; a Begin that no End closes only overwrites that pair's t0, so `k`
+	   measured from whichever Begin ran last.  Removed: `k` now means what row 20 says.) */
 	/* SATURN 2026-08-14 -- HEADER ONLY.  This loop reads `width` and `columnofs[]` and never a
 	   texel, but W_CacheLumpNum LZSS-decoded the whole 35 080-byte patch to serve them: measured
 	   `k12` per patch, ~4 patches per rebuild, ~4 rebuilds per frame = the whole 46 ms `e`.
@@ -921,6 +925,10 @@ R_GetColumn_impl
        Serve the placeholder, exactly like every other garde here -- it heals on a later frame. */
     if (!texturecolumnlump[tex] || !texturecolumnofs[tex])
     {
+	/* SATURN 2026-08-24: close slot 0 HERE too.  This return used to skip RP_StampEnd(0),
+	   so `e` -- the field whose whole job is to size the R4 directory rebuild -- lost its
+	   sample on exactly the path where the rebuild FAILED, i.e. the case it measures. */
+	RP_StampEnd (0);
 	r_patch_ovf++;
 	return r_column_stub;
     }

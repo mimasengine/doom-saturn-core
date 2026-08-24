@@ -149,11 +149,27 @@ extern unsigned int prof_seg_cols, prof_seg_fill, prof_seg_px, prof_lead_px;
    `sb`/`L<n>` tallies, which the platform zeroes on its own window and would make the governor's
    delta read as "no action" at random.  See the inert-by-construction test in r_parallel.c. */
 extern unsigned int sat_gov_act_w, sat_gov_act_l;
+/* SATURN 2026-08-24: the same contract for the PLATFORM's wall-span governor -- one increment per
+   tier the CPU took because of the span threshold (r_segs.c).  Free-running: never reset. */
+extern unsigned int sat_gov_act_s;
+/* SATURN 2026-08-24: the `p` (plane) axis's action counter + the platform-published index of the
+   first plane rung that can change a pixel over the owner's own SQ.  See the note in r_parallel.c. */
+extern unsigned int sat_gov_act_p;
+extern int sat_gov_p_min;
+extern int sat_gov_p_bites;   /* platform: 1 = the governor's plane floor is ABOVE the owner's SQ */
 
 /* SATURN 2026-08-17 -- row 16 `GCS`: R_GetColumn split by CALL SITE (see the note in r_parallel.c).
    Callers stamp sat_gc_site; 1 = seg-loop tier, 2 = routing preamble, 3 = masked midtexture. */
 extern int sat_gc_site;
 extern unsigned int prof_gc_st[4], prof_gc_sn[4];
+
+/* SATURN 2026-08-24 -- the governor's own per-frame render clock, and the third rung of its `B`
+   axis.  rp_rend10 = Bw+Bp+P+M for the WHOLE frame (split views summed) in tenths of a ms, written
+   once per frame by the governor in r_parallel.c; the platform's wall-span governor reads it so
+   both loops steer on the same quantity.  sat_wall_subdiv_skip lives in r_segs.c beside the knob
+   it drives (like sat_lod_eff) and is written ONLY by the governor. */
+extern unsigned int rp_rend10;
+extern int sat_wall_subdiv_skip;
 
 extern int sat_seg_budget;       /* textured segs allowed per view, 0 = unbounded */
 extern int sat_seg_count;        /* segs stored so far this view                  */

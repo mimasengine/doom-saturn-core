@@ -381,6 +381,7 @@ static int sat_wall_flat_color (int tex)
     return c;
 }
 extern int  sat_wall_paint;   /* SATURN debug paint (r_data.c): bit1 = CPU walls flat red */
+extern int  sat_dbg_overlay_mode;   /* r_parallel.c: 0 full / 1 fps-only / 2 off -- gates the per-column probes */
 extern int  sat_wall_textured;
 extern int  R_WallPotatoColor (int tex);
 extern int* texturewidthmask;   /* r_data.c: texture u-period, for the subdiv squish guards */
@@ -512,6 +513,28 @@ int sat_wall_cpu_v1 = SAT_WALL_CPU_V1;
    AND renders unchanged: it never reads them, and every increment lives inside the sat_wall_skip
    hybrid routing, which is inert on DoomJo (sat_wall_skip == 0). */
 int sat_fb_clamp_t = 0, sat_fb_mag_t = 0, sat_fb_starve_t = 0, sat_fb_px = 0;
+/* SATURN 2026-08-24 -- THE SPAN LEVER'S ACTION COUNTER.  Free-running and GOVERNOR-OWNED, exactly
+   like sat_gov_act_w/l and for the same reason: sat_fb_clamp_t above is a PER-FRAME tally the
+   platform zeroes on its own schedule, so a controller sampling it would read "no action" at
+   random.  Incremented once per tier the CPU takes BECAUSE OF THE SPAN -- which is precisely what
+   raising the span would hand back to VDP1.  If it does not move while the span governor's probe
+   runs, that direction has nothing to buy and is convicted without waiting for the timing. */
+unsigned int sat_gov_act_s = 0;
+/* SATURN 2026-08-24 (owner) -- SPECIALS BLOCKER, part 2: the ROUTE.
+   Part 1 (2026-08-20, `keep_tex` in R_RenderSegLoop) keeps a special TEXTURED once it is on
+   the CPU path.  It said nothing about the VDP1 path, where `special` only set the INTENT:
+   the platform's wall budget marked the wall textured and then dropped it to a FLAT whenever
+   it lost the surplus race or no texture slot could be freed.  A flat switch or door face is
+   invisible as an interactive element -- "ca rend la progression dans le jeu impossible".
+   The contract is: VDP1 textured if possible, CPU textured otherwise, NEVER flat.
+   The PLATFORM owns this table (dg_saturn.cxx, wall flush pass 0): it sets the bit for a
+   texture whose special wall it could not give a VDP1 slot, and clears the table at level
+   load.  A set bit routes every tier carrying that texture to the software renderer, where
+   keep_tex forbids both flatten rules.  Hash by (texnum & 255): a collision demotes an
+   innocent texture to the CPU, which is only ever slower, never wrong. */
+unsigned int sat_wall_spec_cpu[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+#define SAT_SPEC_CPU(tex) (sat_wall_textured && (tex) > 0 && \
+    ((sat_wall_spec_cpu[(((tex) & 255) >> 5)] >> ((tex) & 31)) & 1u))
 int sat_fb_wclamp_t = 0;   /* Phase-1: tiers KEPT on VDP1 by the cut+wedge clamp this frame */
 
 /* SATURN Phase-1 wall clamp ([[wall-clamp-world-anchored]]): when set, a SPAN-close one-sided
@@ -520,6 +543,17 @@ int sat_fb_wclamp_t = 0;   /* Phase-1: tiers KEPT on VDP1 by the cut+wedge clamp
    (the vertical clamp can't fix the horizontal squish).  Default 0 = shipping byte-identical;
    the platform sets it from the SAT_WALL_CLAMP compile flag (dg_saturn) for the HW A/B. */
 int sat_wall_clamp = 0;
+/* SATURN 2026-08-24 -- SUBDIVISION SKIP, NOW A GOVERNOR RUNG (owner: *"le skip subdivision devrait
+   aussi etre une option du gouverneur, pas la norme"*).  1 = a magnified wall emits as ONE quad
+   (it swims/squishes) instead of the perspective-subdivided N-quad path, saving both the
+   SAT_VROWS divides (Bp, master CPU) and N-1 VDP1 commands.  "vaut mieux nager que ramer" -- but
+   only when the frame cannot afford to row.
+   Shipped 2026-08-23 as a hardcoded 1, which was wrong twice over: it had NO writer at all (so no
+   live A/B, against the rule written 8 lines below), and it made the three sat_v1_*_sub emitters
+   -- and with them sat_wall_subdiv_max, the whole L4 rung -- DEAD CODE.
+   DEFAULT 0 = quality: the governor raises it as the FIRST step of its `B`/`w` axis
+   (r_parallel.c gov_sub[]) and lowers it back on release.  Nothing else writes it. */
+int sat_wall_subdiv_skip = 0;
 
 /* SATURN PERF LEVERS (2026-07-30) -- CUMULATIVE A/B level, pad L+C (1p).  Each step ADDS one
    optimisation so the tester can bisect the gain LIVE: build-vs-build fps photos are invalid
@@ -940,8 +974,8 @@ static void sat_lead_arm (sat_lead_t *L, int key, int x0, int x1)
 
 /* SATURN 2026-08-17 (row 14 `SEG`): one increment and one add per fill, NO timer -- a probe that
    cannot inflate the very number it is sizing.  Wraps every colfunc() reachable from the seg loop. */
-#define SAT_PROF_FILL() do { prof_seg_fill++;				\
-	if (dc_yh >= dc_yl) prof_seg_px += (unsigned)(dc_yh - dc_yl + 1); } while (0)
+#define SAT_PROF_FILL() do { if (sat_dbg_overlay_mode == 0) { prof_seg_fill++;	\
+	if (dc_yh >= dc_yl) prof_seg_px += (unsigned)(dc_yh - dc_yl + 1); } } while (0)
 
 /* One difference span: straight to the framebuffer, or into the slave's list.
    SATURN 2026-08-17: the span's PIXELS are counted on both paths (row 14 `SEG`), because the whole
@@ -1413,6 +1447,21 @@ void R_RenderSegLoop (void)
 	   across it, small enough never to hold a genuinely magnified wall on VDP1 (where it squishes). */
 	magnified = (sx * 4 > mdu * (SAT_WALL_CPU_MAG * 4 - (seg_hyst ? 2 : 0)));
 
+	/* SATURN 2026-08-24 -- THE SQUISH GUARD, HOISTED OUT OF THE SUBDIVISION LOOP.
+	   The subdivided path tests every sub-seg before emitting it (`sdu < 1 || tw*cols > 1024*sdu`
+	   -> route the whole wall to SOFTWARE, sat_fb_mag_t) because a tile that extrapolates past the
+	   platform's coordinate allowance can only be drawn CLAMPED = the "ecrasement" that raising
+	   wall_ext 96 -> 768 was meant to end (dg_saturn.cxx wall_ext).  The skip path emits ONE quad
+	   and had NO such test, so the guard has to live at the ROUTING decision -- which is free,
+	   because sx and mdu are the very quantities `magnified` above already computed, and for a
+	   single whole-seg quad they ARE the exact operands (no sub-seg to under-estimate).
+	   Fails -> the tier stays on the CPU, i.e. exactly the pre-skip behaviour, and the L5 edge
+	   split still gets its chance.
+	   32-bit on purpose: tw <= 1024 and sx <= the view width, so tw*sx <= ~330 000, and mdu is a
+	   texel span, so 1024*mdu stays far inside int on any seg the BSP can hand us -- the 64-bit
+	   form the subdivision loop uses would cost a __muldi3 per tier for no reachable case. */
+#define SAT_QUAD_FITS(texnum)  ((texturewidthmask[texnum] + 1) * sx <= 1024 * mdu)
+
 	if (midtexture && !SEG_BACKSECTOR(curline))
 	{
 	    int s1 = (bottomfrac - topfrac) >> HEIGHTBITS;
@@ -1435,17 +1484,30 @@ void R_RenderSegLoop (void)
 	    int cpu_now = span_close || magnified;
 	    if (!cpu_now && st && SAT_SEG_EXIT(st) == 2) sat_wall_flip++;   /* CPU last frame, VDP1 now */
 	    int entry;
-	    sat_v1_mid = (s < sat_wall_cpu_v1) && !magnified;  /* magnified -> NO VDP1 quad (it squishes) */
+	    /* magnified -> NO single quad (it squishes), unless the governor asked for the skip AND the
+	       quad actually fits the platform's extrapolation window (SAT_QUAD_FITS). */
+	    sat_v1_mid = (s < sat_wall_cpu_v1)
+		      && (!magnified || (sat_wall_subdiv_skip && SAT_QUAD_FITS(midtexture)));
 #if SAT_WALL_SUBDIV
-	    if (magnified && !span_close) { sat_v1_mid_sub = 1; cpu_now = 0; }  /* keep on VDP1 via perspective subdivision (emit site), not CPU */
+	    if (magnified && !span_close)
+	    {   /* keep it on VDP1: one quad if the governor is shedding CPU and the tile fits,
+		   otherwise the perspective-subdivided N-quad path (emit site).  Neither -> CPU. */
+		if (sat_wall_subdiv_skip && SAT_QUAD_FITS(midtexture))
+		    { sat_v1_mid = 1; cpu_now = 0; sat_gov_act_w++; }
+		else
+		    { sat_v1_mid_sub = 1; cpu_now = 0; }   /* skip off, or the quad would squish */
+	    }
 #endif
+	    /* part 2: a demoted SPECIAL never rides VDP1 -- every tier goes software, textured. */
+	    if (SAT_SPEC_CPU(midtexture))
+	    { sat_v1_mid = 0; sat_v1_mid_sub = 0; cpu_now = 1; }
 	    entry = sat_seg_entry_cover(st);   /* just came into view -> the CPU covers VDP1's first frame */
 	    cpu_now = sat_dwell_cpu(segidx, cpu_now, entry & 2);   /* bound the FLIP RATE, see sat_wall_dwell */
 	    if (cpu_now)
 	    {
 		if (!sat_v1_mid) {   /* Phase-0: count only the FULLY-CPU tiers (not the [SPAN,V1] VDP1-also pre-warm) */
 		    if (magnified)                  sat_fb_mag_t++;                             /* squish -> clamp can't fix   */
-		    else if (span_close)            { sat_fb_clamp_t++; sat_fb_px += s * sx; }  /* pure span  -> clampable     */
+		    else if (span_close)            { sat_fb_clamp_t++; sat_gov_act_s++; sat_fb_px += s * sx; }  /* pure span  -> clampable     */
 		}
 		sat_sw_mid = 1;  if (st) SAT_SEG_EXIT_ARM(st);           /* CPU draws (close/magnified); arm 2 CPU exit-frames */
 		    /* SATURN L5: this tier is about to cost a FULL-SCREEN software wall (the ~22ms
@@ -1488,10 +1550,15 @@ void R_RenderSegLoop (void)
 		cpu_lo = (s > sat_wall_cpu_span - dhy);
 	    }
 	    {
-		int cpu_now = cpu_up || cpu_lo || magnified;
+		/* part 2, door/switch tiers: a demoted SPECIAL texture is forced software.  Applied
+		   AFTER the Phase-0 counters below so the span governor is not credited for it. */
+		int spec_up = SAT_SPEC_CPU(toptexture), spec_lo = SAT_SPEC_CPU(bottomtexture);
+		int cpu_now = cpu_up || cpu_lo || magnified || spec_up || spec_lo;
 		if (!cpu_now && dst && SAT_SEG_EXIT(dst) == 2) sat_wall_flip++;   /* CPU last frame, VDP1 now */
-		if (cpu_up) sat_fb_clamp_t++;                        /* Phase-0: clampable span (upper door tier) */
-		if (cpu_lo) sat_fb_clamp_t++;                        /* Phase-0: clampable span (lower door tier) */
+		if (cpu_up) { sat_fb_clamp_t++; sat_gov_act_s++; }   /* Phase-0: clampable span (upper door tier) */
+		if (cpu_lo) { sat_fb_clamp_t++; sat_gov_act_s++; }   /* Phase-0: clampable span (lower door tier) */
+		if (spec_up) cpu_up = 1;
+		if (spec_lo) cpu_lo = 1;
 #if !SAT_WALL_SUBDIV
 		if (magnified && !cpu_up && !cpu_lo) sat_fb_mag_t++; /* Phase-0: magnified-only door residue      */
 #endif
@@ -1509,14 +1576,17 @@ void R_RenderSegLoop (void)
 		}
 		/* VDP1 owns a tier only when it is neither magnified nor span-close (so it never draws the
 		   squishing quad); the CPU draws it when close/magnified OR during the exit overlap. */
-		sat_v1_up = (toptexture    && !magnified && !cpu_up) ? 1 : 0;
-		sat_v1_lo = (bottomtexture && !magnified && !cpu_lo) ? 1 : 0;
+		int skip_up = sat_wall_subdiv_skip && toptexture    && SAT_QUAD_FITS(toptexture);
+		int skip_lo = sat_wall_subdiv_skip && bottomtexture && SAT_QUAD_FITS(bottomtexture);
+		sat_v1_up = (toptexture    && (!magnified || skip_up) && !cpu_up) ? 1 : 0;
+		sat_v1_lo = (bottomtexture && (!magnified || skip_lo) && !cpu_lo) ? 1 : 0;
+		if (magnified && ((skip_up && !cpu_up) || (skip_lo && !cpu_lo))) sat_gov_act_w++;
 #if SAT_WALL_SUBDIV
 		/* magnified (not span-close) door tiers -> perspective-subdivide on VDP1 (emit site), not CPU */
-		sat_v1_up_sub = (toptexture    && magnified && !cpu_up) ? 1 : 0;
-		sat_v1_lo_sub = (bottomtexture && magnified && !cpu_lo) ? 1 : 0;
-		sat_sw_up = (toptexture    && (cpu_up || (magnified && !sat_v1_up_sub) || overlap)) ? 1 : 0;
-		sat_sw_lo = (bottomtexture && (cpu_lo || (magnified && !sat_v1_lo_sub) || overlap)) ? 1 : 0;
+		sat_v1_up_sub = (toptexture    && magnified && !skip_up && !cpu_up) ? 1 : 0;
+		sat_v1_lo_sub = (bottomtexture && magnified && !skip_lo && !cpu_lo) ? 1 : 0;
+		sat_sw_up = (toptexture    && (cpu_up || (magnified && !sat_v1_up_sub && !sat_v1_up) || overlap)) ? 1 : 0;
+		sat_sw_lo = (bottomtexture && (cpu_lo || (magnified && !sat_v1_lo_sub && !sat_v1_lo) || overlap)) ? 1 : 0;
 #else
 		sat_sw_up = (toptexture    && (cpu_up || magnified || overlap)) ? 1 : 0;
 		sat_sw_lo = (bottomtexture && (cpu_lo || magnified || overlap)) ? 1 : 0;
@@ -1527,6 +1597,7 @@ void R_RenderSegLoop (void)
 	    }
 	}
     }
+#undef SAT_QUAD_FITS
 
     /* SATURN: pot2 (banded/flat) -- a plain (non-special) wall draws as a VDP1 quad, so the close-wall
        CPU fallback above is skipped.  FLAT (pot2-fl) clamps -> can't swim; BANDED (pot2-bd) CAN swim/
@@ -1964,7 +2035,7 @@ void R_RenderSegLoop (void)
 	   block above).  Disarmed -> a constant 0 the compiler folds away, exactly like the old
 	   SAT_WALL_EDGE_FILL enum it replaces.  DoomJo / VDP1-off never arm it. */
 	int is_edge = sat_we_on && (rw_x <= sat_we_lo || rw_x >= sat_we_hi);
-	prof_seg_cols++;                          /* SATURN row 14 `SEG`: the loop's trip count */
+	if (sat_dbg_overlay_mode == 0) prof_seg_cols++;   /* SATURN row 14 `SEG`: the loop's trip count (gated 2026-08-22) */
 	// mark floor / ceiling areas
 	yl = (topfrac+HEIGHTUNIT-1)>>HEIGHTBITS;
 
@@ -2270,12 +2341,34 @@ typedef struct {
     visplane_t *floorplane, *ceilingplane;
     int         start, stop;
 } walljob_t;
+/* 🔴 SATURN 2026-08-24 -- THE QUEUE ITSELF IS COMPILED OUT, AND HERE IS WHY.
+   walljobs[MAXDRAWSEGS] is 256 x 32 B = 8 192 BYTES OF .bss -- and the .bss sits between _end and
+   the work area, so every byte of it is taken straight off the TLSF pool the game boots on (the
+   pool was 15,2 KB on the TNT build that motivated this: the array was more than HALF of it).
+   It can only ever be written when sat_wallprep_defer is non-zero, and that variable has exactly
+   ONE writer in the whole tree -- the pad L+R diagnostic block in dg_saturn.cxx, which lives
+   under `#if SAT_DIAG_SLAVE_TOGGLES` and that macro is 0.  So the queue is unreachable in every
+   binary that has ever shipped, while its storage was paid in full.
+   The defer harness stays here, intact, behind one flag: STEP 2 (the slave consumer) is still a
+   live idea and this is its validation harness.
+   ⚠ TO REVIVE IT YOU MUST FLIP **BOTH**: SAT_WALLPREP_DEFER here AND SAT_DIAG_SLAVE_TOGGLES in
+   dg_saturn.cxx.  They cannot see each other (different translation units, different build
+   systems), which is exactly why this warning is written in both places. */
+#ifndef SAT_WALLPREP_DEFER
+#define SAT_WALLPREP_DEFER 0
+#endif
+#if SAT_WALLPREP_DEFER
 static walljob_t walljobs[MAXDRAWSEGS];
+#endif
 int  walljob_n = 0;
 int  sat_wallprep_defer = 0;
 
 void RP_QueueWall(int start, int stop)
 {
+#if !SAT_WALLPREP_DEFER
+    R_StoreWallRange(start, stop);   /* queue compiled out -- see the note at walljobs[] */
+    return;
+#else
     walljob_t *w;
     if (!sat_wallprep_defer || walljob_n >= MAXDRAWSEGS)
         { R_StoreWallRange(start, stop); return; }
@@ -2287,6 +2380,7 @@ void RP_QueueWall(int start, int stop)
     w->floorplane   = floorplane;
     w->ceilingplane = ceilingplane;
     w->start = start; w->stop = stop;
+#endif
 }
 
 /* Replay queued walls [from,to) in BSP order (single in-order consumer => the floorclip/
@@ -2294,6 +2388,9 @@ void RP_QueueWall(int start, int stop)
    the slave (RANK 3 inc-1, r_parallel.c) can flush a range without owning the master's counter. */
 void RP_FlushWallsRange(int from, int to)
 {
+#if !SAT_WALLPREP_DEFER
+    (void)from; (void)to;            /* nothing is ever queued -- see the note at walljobs[] */
+#else
     int i;
     for (i = from; i < to; i++)
     {
@@ -2306,6 +2403,7 @@ void RP_FlushWallsRange(int from, int to)
         ceilingplane = w->ceilingplane;
         R_StoreWallRange(w->start, w->stop);
     }
+#endif
 }
 
 void RP_FlushWalls(void)

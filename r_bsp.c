@@ -606,7 +606,8 @@ void R_Subsector (int num)
     {
 	floorplane = R_FindPlane (frontsector->floorheight,
 				  frontsector->floorpic,
-				  frontsector->lightlevel);
+				  frontsector->lightlevel,
+				  (int)(frontsector - sectors));   /* SATURN: plane identity */
     }
     else
 	floorplane = NULL;
@@ -616,7 +617,8 @@ void R_Subsector (int num)
     {
 	ceilingplane = R_FindPlane (frontsector->ceilingheight,
 				    frontsector->ceilingpic,
-				    frontsector->lightlevel);
+				    frontsector->lightlevel,
+				    (int)(frontsector - sectors));  /* SATURN: plane identity */
     }
     else
 	ceilingplane = NULL;

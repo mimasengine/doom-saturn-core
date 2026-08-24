@@ -303,11 +303,33 @@ extern int   columnofs[];
 // R_InitPlanes
 // Only at game startup.
 //
+/* SATURN 2026-08-24 (owner) -- PLANE IDENTITY, option A'.
+   A visplane carries no sector, no polygon and no world extent: R_FindPlane keys on
+   (height, picnum, lightlevel) and NOTHING else, and R_CheckPlane FORKS per seg whenever
+   the column interval hits a column the plane has already marked.  So a visplane is a
+   SCREEN FRAGMENT, and any renderer asking "is this a whole bounded surface?" had to
+   approximate it from screen space -- which is why the VDP1 floor claim kept oscillating.
+   These two arrays answer it exactly, for 768 B of zone and two stores on the rare paths:
+     vp_sector[i] = the sector whose floor/ceiling created plane i
+     vp_flags[i]  = VPF_SPLIT (R_CheckPlane forked this plane, so it is a PIECE of that
+                    sector's surface) | VPF_MULTI (R_FindPlane merged a second sector into
+                    it, so it is not one surface at all).
+   flags == 0 therefore means: this visplane IS the whole of exactly one sector's surface --
+   the predicate the owner's rules are written in.  Paired with sat_sector_bbox (p_setup.c)
+   it also yields that surface's EXACT world AABB, instead of one reconstructed by
+   inverse-projecting the four corners of a screen bbox.
+   PARALLEL arrays, not new fields: visplane_t stays 28 B and byte-identical, so the hash
+   walk the pooling change exists to keep cache-friendly is untouched. */
+short *vp_sector = NULL;
+byte  *vp_flags  = NULL;
+
 void R_InitPlanes (void)
 {
     /* SATURN: allocate from zone heap (low WRAM) — keeps high WRAM BSS within
        the 1MB limit.  Z_Init runs before R_Init so the heap is ready. */
     visplanes = Z_Malloc(MAXVISPLANES * sizeof(visplane_t), PU_STATIC, 0);
+    vp_sector = Z_Malloc(MAXVISPLANES * sizeof(short), PU_STATIC, 0);
+    vp_flags  = Z_Malloc(MAXVISPLANES * sizeof(byte),  PU_STATIC, 0);
     r_visplane_peak = 0;
 #if SAT_VISPLANE_POOL
     /* one (top+bottom) slice-pair per plane, capped at VP_POOL_PLANES */
@@ -523,7 +545,8 @@ visplane_t*
 R_FindPlane
 ( fixed_t	height,
   int		picnum,
-  int		lightlevel )
+  int		lightlevel,
+  int		secnum )      /* SATURN: the sector this call speaks for (-1 = unknown) */
 {
     visplane_t*	check;
     int		bucket = 0;   /* SATURN PERF L1: set in the hash path, read by its insert */
@@ -547,6 +570,10 @@ R_FindPlane
 	    && picnum == check->picnum
 	    && lightlevel == check->lightlevel)
 	{
+	    /* SATURN: a second sector reaching the same key MERGES into this plane -- it is
+	       then not one surface, and its sector's bbox no longer describes it. */
+	    if (vp_flags && secnum >= 0 && vp_sector[idx] != (short)secnum)
+		vp_flags[idx] |= VPF_MULTI;
 	    return check;
 	}
     }
@@ -564,7 +591,12 @@ R_FindPlane
     }
 
     if (check < lastvisplane)
+    {
+	int li = (int)(check - visplanes);      /* same merge rule, unhashed path */
+	if (vp_flags && secnum >= 0 && vp_sector[li] != (short)secnum)
+	    vp_flags[li] |= VPF_MULTI;
 	return check;
+    }
     }
 
     if (lastvisplane - visplanes == MAXVISPLANES)
@@ -578,6 +610,12 @@ R_FindPlane
     check->lightlevel = lightlevel;
     check->minx = SCREENWIDTH;
     check->maxx = -1;
+    if (vp_flags)
+    {
+	int ni = (int)(check - visplanes);
+	vp_sector[ni] = (short)secnum;
+	vp_flags[ni]  = 0;                       /* whole surface until proven otherwise */
+    }
 
 #if SAT_VISPLANE_POOL
     check->top    = R_PoolSlice ();   /* fresh top+bottom slices from the frame pool */
@@ -686,6 +724,16 @@ R_CheckPlane
     lastvisplane->height = pl->height;
     lastvisplane->picnum = pl->picnum;
     lastvisplane->lightlevel = pl->lightlevel;
+    /* SATURN: the FORK is the moment a surface stops being one visplane.  Both halves are
+       pieces from here on -- the parent as much as the child -- so both are marked, and the
+       child inherits the sector identity (and any MULTI already on the parent). */
+    if (vp_flags)
+    {
+	int pi = (int)(pl - visplanes), ci = (int)(lastvisplane - visplanes);
+	vp_sector[ci] = vp_sector[pi];
+	vp_flags[ci]  = (byte)(vp_flags[pi] | VPF_SPLIT);
+	vp_flags[pi] |= VPF_SPLIT;
+    }
 
     pl = lastvisplane++;
     pl->minx = start;

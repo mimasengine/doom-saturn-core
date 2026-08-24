@@ -269,6 +269,14 @@ extern short*		blockmaplump;	// offsets in blockmap are from here
 extern short*		blockmap;
 extern int		bmapwidth;
 extern int		bmapheight;	// in mapblocks
+/* SATURN 2026-08-24: exact per-sector world bbox kept by P_GroupLines -- 4 shorts per
+   sector in world units, indexed [sectornum*4 + BOXTOP|BOXBOTTOM|BOXLEFT|BOXRIGHT].
+   This is the geometry input the renderer never had: a visplane carries no sector, no
+   polygon and no world extent, so anything asking whether a floor is a BOUNDED surface,
+   and how big, had to guess it back out of screen space.  PU_LEVEL (Doom zone, not the
+   boot TLSF pool); NULL before the first level. */
+extern short*		sat_sector_bbox;
+
 extern fixed_t		bmaporgx;
 extern fixed_t		bmaporgy;	// origin of block map
 extern mobj_t**		blocklinks;	// for thing chains
