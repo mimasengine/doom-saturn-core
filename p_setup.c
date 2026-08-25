@@ -20,6 +20,7 @@
 
 
 #include <math.h>
+#include <stddef.h>   /* SATURN: offsetof, for the mobj_t layout asserts below */
 
 #include "z_zone.h"
 
@@ -87,6 +88,18 @@ _Static_assert (sizeof(side_t) == 16, "side_t must stay 16 bytes (was 20) -- see
    190 KB -- of which 26 KB is BLOCK HEADER, one per mobj.  That header, not the struct, is the
    cheapest thing to attack next. */
 _Static_assert (sizeof(mobj_t) == 156, "mobj_t is 156 bytes; the zone charges 180 with its header");
+/* SATURN 2026-08-25 -- mobj_t FIELD ORDER, pinned by the compiler (see the long note in
+   p_mobj.h).  Two invariants, two different failure modes:
+     - offsets 0..23 are the degenmobj_t pun (sector soundorg).  Break it and the SOUND code
+       reads a mobj's momentum as a coordinate -- silently, at run time, on hardware only.
+     - `state` at 60 pins the HOT BLOCK to cache lines 1..3.  Push a field in above it and
+       P_MobjThinker's working set spills into a fourth 16-byte line -- one more cold LWRAM
+       fetch per mobj per tic, ~2900 times a frame, invisible on Ymir and invisible in the
+       diff. */
+_Static_assert (offsetof(mobj_t, x) == 12 && offsetof(mobj_t, y) == 16 && offsetof(mobj_t, z) == 20,
+                "degenmobj_t pun: mobj_t's {thinker,x,y,z} prefix must stay at offsets 0..23");
+_Static_assert (offsetof(mobj_t, state) == 60,
+                "mobj_t hot set must stay inside cache lines 1..3 (see p_mobj.h)");
 /* The in-place load below computes its overlap bound from BOTH sides of each conversion, so the
    on-disc record sizes are load-bearing too.  They are all-short structs, so PACKEDATTR is a
    no-op for them today -- which is exactly why a silent change here would go unnoticed. */

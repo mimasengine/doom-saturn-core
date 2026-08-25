@@ -200,61 +200,96 @@ typedef enum
 // Map Object definition.
 typedef struct mobj_s
 {
+    /* SATURN 2026-08-25 -- FIELD ORDER IS A MEASURED OPTIMISATION.  DO NOT REORDER BACK, AND DO
+       NOT INSERT A FIELD ABOVE `state` WITHOUT READING THIS.
+       Three hardware captures (1p, TNT MAP20, 575 live things, 2026-08-21) put the frame at
+       MST 172-181 ms with T 81-88 > R 64-73 -- the GAME TIC, not the renderer, is the frame.
+       Inside it, `mo - ph - sm - mv` reads 34/35/34 ms across the three captures: ~2900
+       P_MobjThinker calls that mostly do nothing, at ~12 us each.  Two taxes explain that, and
+       both are paid by the LAYOUT, not by the code:
+
+       1. CACHE LINES.  The SH-2 cache is 4 KB / 4-way / 16-BYTE lines, and mobj_t lives in
+          LWRAM, ~2.1x slower than HWRAM.  577 mobjs x 156 B = 90 KB walked per tic against
+          4 KB of cache: every access is a cold miss, so the bill is (lines touched) x (LWRAM
+          latency).  In the vanilla order P_MobjThinker's common path -- thinker.function(8),
+          z(20), floorz(56), momx(72), momy(76), momz(80), tics(96), flags(104) -- straddles SIX
+          distinct lines out of ten.  In the order below those same eight fields sit in lines
+          0/1/2: THREE.
+       2. DISPLACEMENT ENCODING -- HYPOTHESISED, THEN MEASURED, THEN REFUTED.  `mov.l @(disp,Rm)`
+          on SH-2 has a 4-bit displacement scaled by 4, i.e. offsets 0..60 only, so the argument
+          was that pulling the hot fields under 60 would save an instruction at each of the
+          hundreds of sites that reach them.  A/B of the whole build (2026-08-25, sh2eb-elf-size
+          over every .o, this order against the vanilla one, nothing else changed) says
+          **-12 bytes of .text in total** -- p_map -56 and p_enemy -40 against a dozen +4/+12s.
+          GCC already hoists the base+offset once per access run, so the encoding was never the
+          cost.  Recorded here so nobody re-derives it: reason 1 is the whole reason.
+
+       THE PINNED PREFIX -- thinker/x/y/z at offsets 0..23 CANNOT MOVE.  degenmobj_t
+       (r_defs.h:84, the sector `soundorg`) is type-punned against mobj_t by the sound code and
+       declares exactly {thinker, x, y, z}.  Same trap class as the node_t/divline_t pun that bit
+       p_sight.c.  Everything from offset 24 on is free, and is ordered here by (P_MobjThinker's
+       hot set) then (static access frequency across core/).
+       THE FALSIFIER IS `mo` ON CONSOLE, and only there: Ymir does not model the SH-2 cache or
+       the LWRAM/HWRAM latency split (it reads T 8-14 ms where the console reads 69-83), so an
+       emulator A/B of this change is guaranteed to show nothing whichever way it went.
+       `sizeof(mobj_t) == 156` is _Static_assert'ed in p_setup.c: spawnpoint (10 B) must stay
+       second-to-last so its 2 bytes of tail padding land at the end of the struct. */
+
     // List: thinker links.
     thinker_t		thinker;
 
-    // Info for drawing: position.
+    // Info for drawing: position.  [PINNED at 12/16/20 -- degenmobj_t]
     fixed_t		x;
     fixed_t		y;
     fixed_t		z;
 
+    // ---- lines 1-2: P_MobjThinker's hot set (momentum, flags, state counter, floor clip) ----
+    // Momentums, used to update position.
+    fixed_t		momx;		/* 24 */
+    fixed_t		momy;		/* 28 */
+    fixed_t		momz;		/* 32 */
+
+    int			flags;		/* 36 */
+    int			tics;		/* 40 -- state tic counter */
+
+    // The closest interval over all contacted Sectors.
+    fixed_t		floorz;		/* 44 */
+    fixed_t		ceilingz;	/* 48 */
+
+    // For movement checking.
+    fixed_t		radius;		/* 52 */
+    fixed_t		height;		/* 56 */
+
+    state_t*		state;		/* 60 -- last offset a mov.l @(disp,Rm) can reach */
+
+    // ---- past the cheap displacement window: grouped by the pass that walks them ----
+    struct subsector_s*	subsector;
+
     // More list: links in sector (if needed)
     struct mobj_s*	snext;
     struct mobj_s*	sprev;
+
+    // Interaction info, by BLOCKMAP.  Links in blocks (if needed).
+    struct mobj_s*	bnext;
+    struct mobj_s*	bprev;
 
     //More drawing info: to determine current sprite.
     angle_t		angle;	// orientation
     spritenum_t		sprite;	// used to find patch_t and flip value
     int			frame;	// might be ORed with FF_FULLBRIGHT
 
-    // Interaction info, by BLOCKMAP.
-    // Links in blocks (if needed).
-    struct mobj_s*	bnext;
-    struct mobj_s*	bprev;
-    
-    struct subsector_s*	subsector;
-
-    // The closest interval over all contacted Sectors.
-    fixed_t		floorz;
-    fixed_t		ceilingz;
-
-    // For movement checking.
-    fixed_t		radius;
-    fixed_t		height;	
-
-    // Momentums, used to update position.
-    fixed_t		momx;
-    fixed_t		momy;
-    fixed_t		momz;
-
-    // If == validcount, already checked.
-    int			validcount;
-
     mobjtype_t		type;
     mobjinfo_t*		info;	// &mobjinfo[mobj->type]
-    
-    int			tics;	// state tic counter
-    state_t*		state;
-    int			flags;
-    int			health;
 
-    // Movement direction, movement generation (zig-zagging).
-    int			movedir;	// 0-7
-    int			movecount;	// when 0, select a new dir
+    int			health;
 
     // Thing being chased/attacked (or NULL),
     // also the originator for missiles.
     struct mobj_s*	target;
+
+    // Movement direction, movement generation (zig-zagging).
+    int			movedir;	// 0-7
+    int			movecount;	// when 0, select a new dir
 
     // Reaction time: if non 0, don't attack yet.
     // Used by player to freeze a bit after teleporting.
@@ -270,6 +305,9 @@ typedef struct mobj_s
 
     // Player number last looked for.
     int			lastlook;	
+
+    // If == validcount, already checked.
+    int			validcount;
 
     // For nightmare respawn.
     mapthing_t		spawnpoint;	
