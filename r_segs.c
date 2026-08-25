@@ -2759,9 +2759,14 @@ R_StoreWallRange_impl
     if (markfloor)
 	floorplane = R_CheckPlane (floorplane, rw_x, rw_stopx-1);
 
+    RP_WallHeadMark ();   /* SATURN 2026-08-25: closes row-4 `hd` -- everything since the wrapper
+                             (scale + texture resolution, silhouettes, BOTH R_CheckPlane calls
+                             just above) is the HEAD.  It was 24 % of the 4p `Bp`, unnamed. */
     RP_SegLoopEnter ();   /* SATURN PERF Phase-0a: bracket the per-column loop (c Bp) */
     R_RenderSegLoop ();
     RP_SegLoopLeave ();
+    RP_WallTailMark ();   /* SATURN 2026-08-25: opens row-4 `tl` (the four openings memcpy + the
+                             drawseg store below); closed by RP_WallPrepLeave in the wrapper. */
     sat_gc_site = 0;   /* SATURN row 16 `GCS`: back to "other" (r_plane.c's sky column, ...) */
 
 

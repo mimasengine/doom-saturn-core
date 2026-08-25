@@ -191,6 +191,17 @@ static unsigned short p3_t_begin, p3_t_bsp, p3_t_planes;
    for the row-20 `PSP` readout so a `P` spike can be attributed instead of assumed. */
 static unsigned short p3_t_p[1];
 unsigned int sat_p_kick10 = 0;   /* VDP1 wall kick + R_DrawPlayerSprites (weapon)               */
+/* SATURN 2026-08-25: row 4's FOUR Bp sub-terms, summed over the FRAME's views (the raw prof_*
+   accumulators they come from are per-view).  Tenths of a ms.  Written by rp_p3_prof_show on the
+   last view, read from dg_saturn's per-frame block at the end of DG_DrawFrame.
+   hd+pr+lp+tl == row-2 `Bp` by construction.  (`wp` retired the same day: it WAS prof_wallprep,
+   i.e. row-2 `Bp` restated, and it cost 7 of 40 columns to say so.) */
+unsigned int sat_bps_pr10 = 0, sat_bps_lp10 = 0, sat_bps_hd10 = 0, sat_bps_tl10 = 0;
+/* SATURN 2026-08-25: rows 14 (`SEG`) and 16 (`GCS`) summed over the FRAME's views -- same law,
+   same site and same writer as sat_bps_* above.  RAW counts / RAW FRT ticks: dg_saturn keeps the
+   clamping and the tick->ms conversion it already did on the per-view prof_* these replace. */
+unsigned int sat_seg_cols_f = 0, sat_seg_fill_f = 0, sat_seg_px_f = 0, sat_lead_px_f = 0;
+unsigned int sat_gc_st_f[4], sat_gc_sn_f[4];
 /* (n / d / j RETIRED 2026-08-06 -- all three measured ~0 and are SETTLED NEGATIVE: NetUpdate and
    the canaries are free, RP_LeadJoin never waits, and R_DrawPlanes itself is 1 ms, i.e. THE PLANES
    ARE INNOCENT.  They were still computed and window-folded for a row that no longer prints them,
@@ -1409,84 +1420,174 @@ unsigned int sat_tic_runs = 0;
    the TIC governor (p_tick.c decimation law).  One RP_Think bracket = exactly one tic, so this
    is already per-tic; no frame-sum ambiguity (the row-23 lesson). */
 int sat_think_last10 = 0;
-void RP_ThinkBegin (void) { sat_tic_runs++; tic_think_t0 = rp_frt(); }
+/* SATURN 2026-08-25: one tic = one sample-phase step, and the lazy one-shot calibration of
+   the probe itself.  Both live in the THK block below; this is the forward hook. */
+static void thk_tic_begin (void);
+extern int thk_tic_sampled;              /* defined with the THK block below */
+void RP_ThinkBegin (void) { sat_tic_runs++; thk_tic_begin (); tic_think_t0 = rp_frt(); }
 void RP_ThinkEnd   (void)
 {
     unsigned short d = (unsigned short)(rp_frt() - tic_think_t0);
     sat_tic_think_frt += d;
+    /* SATURN 2026-08-25 round 6: bank the SAMPLED tic's own total, so row 23's `w` subtracts
+       terms that all describe THE SAME TICS.  See the THK block below -- mixing a sampled
+       estimate with an exact total is what made the first `w` unreadable. */
+    if (thk_tic_sampled) sat_thk_th_frt += d;
     sat_think_last10 = (int)((unsigned)d * 10u / 224u);
 }
 void RP_SightBegin (void) { tic_sight_t0 = rp_frt(); }
 void RP_SightEnd   (void) { sat_tic_sight_frt += (unsigned short)(rp_frt() - tic_sight_t0); }
-/* 🔴 SATURN 2026-08-17 -- DECOMPOSE THE THINKERS (row 23 `THK`).  Hardware reads `th` at 24-38 ms on
+/* SATURN 2026-08-17 -- DECOMPOSE THE THINKERS (row 23 `THK`).  Hardware reads `th` at 24-38 ms on
    178-200 ms frames -- a fifth of the frame that is not rendering and that nobody has looked at all
-   session.  `s` (P_CheckSight's BSP walk) already carves one piece out; these carve the rest, so
-   the console session comes home with the whole picture instead of one number:
+   session.  `s` (P_CheckSight's BSP walk) already carves one piece out; these carve the rest:
      mo = P_MobjThinker, summed over the tic -- actors moving/animating
      mv = P_CheckPosition + P_TryMove inside it, the BLOCKMAP walk that is Doom's classic hot spot
-          (a SUBSET of mo, so mo - mv is state/animation and mv is collision)
+     ph = P_XYMovement / P_ZMovement;  sm = P_SetMobjState + every action function
      n  = thinkers actually RUN, so a big `th` can be read as "many" or as "expensive"
-   `th - mo` is then the sector thinkers (doors, platforms, lights).  Same raw-FRT contract as its
-   neighbours: the platform converts and resets.  DoomJo-safe (plain C, two timer reads per call). */
+   `th - mo - sc` is then the bare list walk.  The platform converts and resets.
+
+   ROUND 5, 2026-08-25 -- THE INSTRUMENT BECAME A MEASURABLE FRACTION OF WHAT IT MEASURES.
+   The 2026-08-21 captures read `n` 2870-2905 mobj thinker calls per frame.  At two rp_frt() per
+   call -- and rp_frt is not free: it masks SR, does TWO byte reads in the on-chip register area
+   (uncached, several cycles each) and restores SR -- the probe alone plausibly accounts for a
+   large slice of the ~24 ms `th - mo - sc` residual, and inflates every `mo` reading with it.
+   An A/B on `mo` would then be measuring the probe.  Two changes close that:
+
+     1. SAMPLING -- BY TIC, NOT BY CALL.  Round 5 timed every 8th mobj thinker.  Ymir 2026-08-25
+        showed why that was wrong: `w` (th - mo - sc - pt) read 18 ms of a 26 ms `th` the moment
+        three monsters woke up, while `mv0 s0 sm3` said the thinkers had done almost nothing --
+        and `w` had barely moved when the LIST itself grew.  A term that does not scale with the
+        list cannot be the list walk.  The defect is structural: **`th` was EXACT and `mo` was an
+        ESTIMATE, and I subtracted one from the other.**  With only a handful of expensive actors
+        in a 375-thinker list, a 1-in-8 CALL sample has enormous variance, and every miss lands in
+        `w` -- which then reads as a discovery instead of as noise.
+        Now a whole TIC is sampled or not: on a sampled tic EVERY bracket fires (mobj, ph, sm, mv
+        AND the sector thinkers) and RP_ThinkEnd banks that tic's own `th` into sat_thk_th_frt.
+        Row 23 derives `w` from terms that all describe THE SAME TICS, and one scale factor
+        (sat_tic_runs / sat_thk_tics) lifts the whole set to a per-frame mean.
+        RP_THK_SAMPLE is 4, not 8: the remaining variance is tic-to-tic, so what matters is the
+        NUMBER OF SAMPLED TICS per 1 s window (~6 at console frame rates), not the call count.
+        WARNING: every THK term is now an ESTIMATE from those few tics.  Cross-check on the
+        photograph: `mo + pt + w` must land near row 24's `th`, which is exact.
+     2. CALIBRATION.  thk_frt() counts its own calls, and rp_frt_calibrate() times 512 of them
+        back to back, ONCE, so the platform can print `pt` -- the probe's cost in ms, MEASURED on
+        the console instead of estimated from a cycle count.  `w` (the list walk) is then
+        th - mo - sc - pt, with the instrument subtracted out.
+        (The calibration loop's own overhead is counted into the cost, so `pt` slightly
+        OVER-estimates the read alone -- the conservative direction for a number used to subtract.)
+
+   RETIRED THE SAME DAY -- `sb` / `bt` (R_PointInSubsector and the THINGS blockmap loop inside
+   P_CheckPosition).  They were added on 2026-08-17 when `mv` was 66-75 ms, the biggest single item
+   in the frame.  The level-structs merge (line_t 64->24, side_t 20->16, mobj slab) collapsed `mv`
+   to 1-3 ms on the same class of scene, so two probe pairs per P_CheckPosition were splitting a
+   term smaller than their own cost.  They ANSWERED; rebuilding the split is ten lines the day `mv`
+   climbs again.
+
+   Resolution: one FRT tick is 4,47 us, so a bracket around a ~15 us call carries one tick of
+   truncation either way.  It averages out over the samples summed per frame; a PER-CALL figure
+   derived from these is good to ~20 %, not better. */
+#define RP_THK_SAMPLE   4u      /* fully time 1 TIC in 4 (power of two: the mask below) */
 unsigned int sat_thk_mobj_frt = 0, sat_thk_move_frt = 0, sat_thk_n = 0;
+unsigned int sat_thk_tics = 0;           /* tics fully timed -- the scale DENOMINATOR */
+unsigned int sat_thk_th_frt = 0;         /* P_RunThinkers total over THOSE tics only */
+unsigned int sat_thk_frt_calls = 0;      /* thk_frt() calls made inside the tic -> `pt` */
+unsigned int sat_thk_frt_cost_x256 = 0;  /* measured cost of ONE thk_frt(), in 1/256 FRT ticks */
 static unsigned short thk_mo_t0, thk_mv_t0;
-void RP_ThkMobjBegin (void) { sat_thk_n++; thk_mo_t0 = rp_frt(); }
-void RP_ThkMobjEnd   (void) { sat_thk_mobj_frt += (unsigned short)(rp_frt() - thk_mo_t0); }
-void RP_ThkMoveBegin (void) { thk_mv_t0 = rp_frt(); }
-void RP_ThkMoveEnd   (void) { sat_thk_move_frt += (unsigned short)(rp_frt() - thk_mv_t0); }
-/* 🔴 SATURN 2026-08-17, round 2 -- CARVE THE RESIDUAL.  The console run named the problem: at 63 s
-   the frame reads `T165` against `R141` -- the GAME TIC has overtaken the whole renderer -- with
-   `th157,7 mo146,4 mv75,1 s2,4`.  So `mo - mv - s` = ~69 ms per frame is inside P_MobjThinker and
-   attributed to NOTHING.  Two hypotheses, one probe each, both chosen because they are the only
-   candidates that can walk a data structure rather than a state table:
-     pt = P_PathTraverse -- the blockmap/BSP traversal behind every HITSCAN shot (P_AimLineAttack,
-          P_LineAttack, P_UseLines).  It is NOT inside `mv`: `mv` is P_CheckPosition, which shots
-          never call.  A firefight fires several of these per tic per monster.
-     sp = P_SpawnMobj -- the Z_Malloc per puff and blood splat.
-   VERDICT, same day, one console run: **`pt` CONFIRMED but minor** (10-13 ms, and exactly 0,0 when
-   not shooting -- the probe is right, the seam is small); **`sp` REFUTED and REMOVED** (`sp0,5/3` ..
-   `sp0,8/4`: three spawns a frame, under a millisecond).  No mobj_t free list is warranted.
+static unsigned int   thk_tic_phase = 0;
+int                   thk_tic_sampled = 0;  /* 1 for the WHOLE of a sampled tic (RP_ThinkEnd reads it) */
+static int            thk_in_mo = 0;        /* 1 while a mobj thinker is on the stack, sampled tics only */
 
-   🔴 ROUND 3 -- SPLIT `mv`, because it is now the biggest single item in the WHOLE frame:
-   at 95 s the console read `R66` against `T148` with `mv66,0` -- the blockmap check alone costs as
-   much as the entire renderer.  Two brackets INSIDE P_CheckPosition, so both are subsets of `mv`:
-     sb = R_PointInSubsector -- a full BSP DESCENT, ~10-15 node dereferences into the nodes array,
-          paid once per call before any collision work happens.  Structurally the most suspicious
-          line in the function and never once timed.
-     bt = the THINGS blockmap double loop (P_BlockThingsIterator/PIT_CheckThing) -- the one that
-          walks every corpse and item still linked into the block.
-   `mv - sb - bt` is then the LINES loop, by subtraction.  Three terms, two probes.
-   ⚠ Chosen over guessing on purpose: [[budget-before-mechanism]] -- write the subtraction before
-   naming the cause.  Every hypothesis this session that survived started from a number on screen.
+/* Every timer read on the thinker path goes through here, so `pt` is an exact count and not an
+   assumption about how many brackets fired. */
+static unsigned short thk_frt (void) { sat_thk_frt_calls++; return rp_frt(); }
 
-   Depth-guarded: only the OUTERMOST call is timed, so a nested traversal can never corrupt the
-   accumulator with a stale t0 (the failure that makes a probe quietly print fiction).
-   ⚠ Resolution: one FRT tick is 4,47 us, so a bracket around a call that costs ~15 us carries
-   ±1 tick of truncation.  It averages out over the hundreds of calls summed per frame, but a
-   PER-CALL figure derived from these is good to ~20 %, not better.
-   DoomJo-safe: plain C, two timer reads per call. */
+/* Measure thk_frt() against itself, once.  512 calls put a round at a few hundred FRT ticks --
+   far enough above the 1-tick quantum to mean something, far below the 65535 wrap.
+   THREE ROUNDS, KEEP THE MINIMUM.  rp_frt masks interrupts across its own H/L pair but not
+   between calls, so a vblank landing inside a round adds the whole ISR to that round -- a ~0,8 ms
+   round at 60 Hz catches one about 5 % of the time, and one hit inflates the estimate by >10 %.
+   The minimum of three is the round that ran clean.  This matters: `pt` is SUBTRACTED to get `w`,
+   so an inflated cost silently invents a smaller list walk.
+   The sink keeps the compiler from folding away the value composition that the real probe pays. */
+static volatile unsigned short thk_frt_sink;
+static void rp_frt_calibrate (void)
+{
+    unsigned int saved = sat_thk_frt_calls;
+    unsigned int best  = 0xffffffffu;
+    int r, i;
+    for (r = 0; r < 3; r++)
+    {
+	unsigned short t0, t1, sink = 0;
+	unsigned int   d;
+	t0 = rp_frt();
+	for (i = 0; i < 512; i++) sink = (unsigned short)(sink + thk_frt ());
+	t1 = rp_frt();
+	thk_frt_sink = sink;
+	d = (unsigned int)(unsigned short)(t1 - t0);
+	if (d < best) best = d;
+    }
+    sat_thk_frt_calls = saved;           /* the calibration must not bill itself to the tic */
+    sat_thk_frt_cost_x256 = (best * 256u) / 512u;
+    if (!sat_thk_frt_cost_x256) sat_thk_frt_cost_x256 = 1u;   /* never re-run on a 0 reading */
+}
+
+/* Called once per tic from RP_ThinkBegin, BEFORE its own bracket opens, so neither the
+   calibration nor the phase step is billed to `th`. */
+static void thk_tic_begin (void)
+{
+    if (!sat_thk_frt_cost_x256) rp_frt_calibrate ();
+    thk_tic_sampled = ((++thk_tic_phase & (RP_THK_SAMPLE - 1u)) == 0u);
+    if (thk_tic_sampled) sat_thk_tics++;
+    thk_in_mo = 0;                /* no bracket can survive a tic boundary */
+}
+
+
+void RP_ThkMobjBegin (void)
+{
+    sat_thk_n++;                  /* ALWAYS: `n` is a population, not a sample */
+    if (thk_tic_sampled)
+    {
+	thk_in_mo = 1;
+	thk_mo_t0 = thk_frt ();
+    }
+}
+void RP_ThkMobjEnd (void)
+{
+    if (thk_in_mo)
+    {
+	sat_thk_mobj_frt += (unsigned short)(thk_frt () - thk_mo_t0);
+	thk_in_mo = 0;
+    }
+}
+/* P_CheckPosition is ALSO reached from P_PlayerThink, outside any mobj bracket.  Gating on
+   thk_in_mo (not on the tic flag) keeps `mv` a strict subset of `mo`, which is what the row has
+   always claimed -- the player's own P_TryMove is not an actor thinker. */
+void RP_ThkMoveBegin (void) { if (thk_in_mo) thk_mv_t0 = thk_frt (); }
+void RP_ThkMoveEnd   (void) { if (thk_in_mo) sat_thk_move_frt += (unsigned short)(thk_frt () - thk_mv_t0); }
+
 unsigned int sat_thk_phys_frt = 0, sat_thk_state_frt = 0, sat_thk_sect_frt = 0;
-unsigned int sat_thk_sub_frt = 0, sat_thk_blk_frt = 0, sat_r_setup_frt = 0;
-static unsigned short thk_ph_t0, thk_sm_t0, thk_sc_t0, thk_sb_t0, thk_bk_t0, r_su_t0;
-static int            thk_ph_depth = 0, thk_sm_depth = 0, thk_sc_depth = 0,
-                      thk_sb_depth = 0, thk_bk_depth = 0;
-void RP_ThkPhysBegin  (void) { if (!thk_ph_depth++) thk_ph_t0 = rp_frt(); }
+unsigned int sat_r_setup_frt = 0;
+static unsigned short thk_ph_t0, thk_sm_t0, thk_sc_t0, r_su_t0;
+static int            thk_ph_depth = 0, thk_sm_depth = 0, thk_sc_depth = 0;
+void RP_ThkPhysBegin  (void) { if (thk_in_mo && !thk_ph_depth++) thk_ph_t0 = thk_frt (); }
 void RP_ThkPhysEnd    (void)
 {
-    if (--thk_ph_depth <= 0)
-    { thk_ph_depth = 0; sat_thk_phys_frt += (unsigned short)(rp_frt() - thk_ph_t0); }
+    if (thk_in_mo && --thk_ph_depth <= 0)
+    { thk_ph_depth = 0; sat_thk_phys_frt += (unsigned short)(thk_frt () - thk_ph_t0); }
 }
-void RP_ThkStateBegin (void) { if (!thk_sm_depth++) thk_sm_t0 = rp_frt(); }
+void RP_ThkStateBegin (void) { if (thk_in_mo && !thk_sm_depth++) thk_sm_t0 = thk_frt (); }
 void RP_ThkStateEnd   (void)
 {
-    if (--thk_sm_depth <= 0)
-    { thk_sm_depth = 0; sat_thk_state_frt += (unsigned short)(rp_frt() - thk_sm_t0); }
+    if (thk_in_mo && --thk_sm_depth <= 0)
+    { thk_sm_depth = 0; sat_thk_state_frt += (unsigned short)(thk_frt () - thk_sm_t0); }
 }
-void RP_ThkSectBegin  (void) { if (!thk_sc_depth++) thk_sc_t0 = rp_frt(); }
+/* Sampled on the SAME tics as the rest: `w` subtracts `sc`, so it has to describe the same tics.
+   (Round 5 left this one exact, which was half of why `w` did not add up.) */
+void RP_ThkSectBegin  (void) { if (thk_tic_sampled && !thk_sc_depth++) thk_sc_t0 = thk_frt (); }
 void RP_ThkSectEnd    (void)
 {
-    if (--thk_sc_depth <= 0)
-    { thk_sc_depth = 0; sat_thk_sect_frt += (unsigned short)(rp_frt() - thk_sc_t0); }
+    if (thk_tic_sampled && --thk_sc_depth <= 0)
+    { thk_sc_depth = 0; sat_thk_sect_frt += (unsigned short)(thk_frt () - thk_sc_t0); }
 }
 /* The one term OUTSIDE the game tic: R_RenderPlayerView's pre-BSP setup (the slave-clear join,
    R_SetupFrame, R_PostFlatCacheFrame).  Row 1 `R` is DERIVED (MST - T - S - b - dg) while
@@ -1494,18 +1595,6 @@ void RP_ThkSectEnd    (void)
    or just the slop of a derived number -- the only honest way to close the last gap. */
 void RP_RSetupBegin   (void) { r_su_t0 = rp_frt(); }
 void RP_RSetupEnd     (void) { sat_r_setup_frt += (unsigned short)(rp_frt() - r_su_t0); }
-void RP_ThkSubsecBegin (void) { if (!thk_sb_depth++) thk_sb_t0 = rp_frt(); }
-void RP_ThkSubsecEnd   (void)
-{
-    if (--thk_sb_depth <= 0)
-    { thk_sb_depth = 0; sat_thk_sub_frt += (unsigned short)(rp_frt() - thk_sb_t0); }
-}
-void RP_ThkBlkBegin (void) { if (!thk_bk_depth++) thk_bk_t0 = rp_frt(); }
-void RP_ThkBlkEnd   (void)
-{
-    if (--thk_bk_depth <= 0)
-    { thk_bk_depth = 0; sat_thk_blk_frt += (unsigned short)(rp_frt() - thk_bk_t0); }
-}
 static unsigned short prof_begin, prof_recend, prof_wait;
 /* SATURN PERF 2.4 Stage 0: split REC into BSP / planes / masked sub-times to
    find which generation phase dominates REC (decides what to offload).  Marks:
@@ -1521,6 +1610,15 @@ static unsigned short prof_bsp_end, prof_planes_end;
    per-column LOOP is now the number that picks the lever.  Row 4 prints all three in ms. */
 unsigned int   prof_wallprep;
 static unsigned short prof_wp_t0;
+/* SATURN 2026-08-25 -- THE UNNAMED HOLE INSIDE Bp.  prof_wallprep brackets ALL of
+   R_StoreWallRange; prof_segrout + prof_segloop bracket only R_RenderSegLoop.  hd = enter ->
+   RP_SegLoopEnter; tl = RP_SegLoopLeave -> leave.  hd+pr+lp+tl == wp by construction, so any
+   residual on row 4 is bracket overhead (each is an upper bound by one FRT read) or the
+   drawseg-overflow early return.  prof_tl_armed keeps that early return out of `tl`. */
+static unsigned int   prof_wallhead;   /* row 4 `hd` */
+static unsigned int   prof_walltail;   /* row 4 `tl` */
+static unsigned short prof_tl_t0;
+static unsigned char  prof_tl_armed;
 /* SATURN PERF Phase-0a: finer Bp/P sub-splits (each a subset of Bp or P). */
 /* SATURN 2026-08-17: EXPORTED (was static).  The owner is right that Bp cannot be fill --
    R_StoreWallRange runs for VDP1 walls too -- so the split between per-seg SETUP and the
@@ -1672,14 +1770,74 @@ void RP_WallPrepEnter(void)
                                          time it here (the flush cost comes from prof_wpwait). */
     prof_wp_t0 = rp_frt();
     prof_in_wp = 1;             /* gate R_GetColumn accounting to the wall-prep calls only */
+    prof_tl_armed = 0;          /* SATURN 2026-08-25: the drawseg-overflow early return (r_segs.c
+                                   :2428) leaves without ever reaching RP_WallTailMark -- disarm on
+                                   entry so `tl` can never swallow a call that had no tail. */
 #endif
 }
 void RP_WallPrepLeave(void)
 {
 #if RP_PROF
     if (sat_wallprep_slave) return;
+    /* SATURN 2026-08-25: ONE FRT read closes both `tl` and `wp` -- reading it twice would bill the
+       second read to wp and make hd+pr+lp+tl > wp, breaking the identity this row exists for. */
+    unsigned short now = rp_frt();
     prof_in_wp = 0;
-    prof_wallprep += (unsigned short)(rp_frt() - prof_wp_t0);
+    if (prof_tl_armed) { prof_walltail += (unsigned short)(now - prof_tl_t0); prof_tl_armed = 0; }
+    prof_wallprep += (unsigned short)(now - prof_wp_t0);
+#endif
+}
+
+/* SATURN 2026-08-25 -- THE TWO MARKS THAT NAME THE HOLE INSIDE Bp.  Called from r_segs.c around
+   the RP_SegLoopEnter/Leave pair, they split prof_wallprep four ways: hd (head: scale + texture
+   resolution, silhouette setup, BOTH R_CheckPlane calls) / pr / lp / tl (tail: the four openings
+   memcpy + the drawseg store).  Console medians of the unnamed remainder were 1p 2.5 / 2p 7.0 /
+   3p 11.3 / 4p 11.2 ms -- 24 % of the 4p Bp.
+   BOTH gates are load-bearing.  sat_wallprep_slave: under the L+R flush the prep runs on the OTHER
+   SH-2, whose FRT is a different clock -- without this bail prof_tl_armed could latch on the slave
+   and be consumed by a later master-side RP_WallPrepLeave, poisoning `tl` with a cross-CPU delta.
+   sat_dbg_overlay_mode: matches RP_SegRoutMark/RP_SegLoopLeave so the whole row-4 partition lives
+   on ONE gate and costs nothing when row 4 is not rendering.  Consequence to know: outside mode 0,
+   prof_wallprep still accrues while hd/tl do not, so the identity holds only in mode 0 -- which is
+   the only mode that prints it. */
+void RP_WallHeadMark(void)
+{
+#if RP_PROF
+    if (sat_wallprep_slave || sat_dbg_overlay_mode != 0) return;
+    prof_wallhead += (unsigned short)(rp_frt() - prof_wp_t0);
+#endif
+}
+void RP_WallTailMark(void)
+{
+#if RP_PROF
+    if (sat_wallprep_slave || sat_dbg_overlay_mode != 0) return;
+    prof_tl_t0 = rp_frt();
+    prof_tl_armed = 1;
+#endif
+}
+
+/* SATURN 2026-08-25 -- THE SOFTWARE SKY, PER VIEW.  The 4-quadrant HW-sky plan needs to know what
+   the SOFTWARE sky costs in the views that do NOT carry NBG0, and nothing measured it: sat_sky_px
+   counts PIXELS, and pixels cannot be converted to ms on this path -- R_DrawSkyColumn does a
+   128-byte per-column memcpy plus the grain loop, so the px->ms factor swings 2-4x with geometry.
+   Brackets the sky loop in R_DrawPlanes only; the HW-sky branch draws nothing and therefore reads
+   0.0 BY CONSTRUCTION, which is exactly how a capture identifies the elected view.
+   Gated on the overlay mode alone (the sky loop is master-side, inside R_DrawPlanes), so the
+   shipped build pays nothing. */
+static unsigned short prof_sky_t0;
+void RP_SkyEnter(void)
+{
+#if RP_PROF
+    if (sat_dbg_overlay_mode != 0) return;
+    prof_sky_t0 = rp_frt();
+#endif
+}
+void RP_SkyLeave(void)
+{
+#if RP_PROF
+    extern unsigned int sat_sky_frt;
+    if (sat_dbg_overlay_mode != 0) return;
+    sat_sky_frt += (unsigned short)(rp_frt() - prof_sky_t0);
 #endif
 }
 
@@ -2295,6 +2453,7 @@ void RP_BeginFrame(void)
        ONE reset site, both paths.  Anything per-frame added below MUST go here. */
     prof_wallprep = 0;                                                   /* Bp accumulator */
     prof_segloop = prof_segrout = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
+    prof_wallhead = prof_walltail = 0; prof_tl_armed = 0;                /* row 4 `hd`/`tl` */
     prof_mplane = 0;                                                     /* row 5 `Pm` (master plane drain) */
     prof_seg_cols = prof_seg_fill = prof_seg_px = prof_lead_px = 0;      /* row 14 `SEG` -- lp sizing */
     prof_gc_st[0] = prof_gc_st[1] = prof_gc_st[2] = prof_gc_st[3] = 0;   /* row 16 `GCS` -- who calls */
@@ -2539,7 +2698,7 @@ static void rp_p3_prof_show(void)
     unsigned int b10  = (unsigned short)(p3_t_bsp    - p3_t_begin)  * 10u / 224u;
     unsigned int p10  = (unsigned short)(p3_t_planes - p3_t_bsp)    * 10u / 224u;
     unsigned int m10  = (unsigned short)(t_mask      - p3_t_planes) * 10u / 224u;
-    unsigned int w10  = p3_wait_ticks  * 10u / 224u;   /* master FRT -> ms (reliable) */
+    unsigned int w10;   /* master FRT -> ms (reliable); frame sum in split, assigned below */
     extern int sat_masked_parallel;
     unsigned int rend = b10 + p10 + m10;                /* render = B+P+M (tenths-ms) */
     /* the slave is busy during P, and during M too once masked-by-half is on -> it idles only in
@@ -2556,11 +2715,126 @@ static void rp_p3_prof_show(void)
     char p[44];
     /* row 2: render phase split Bw/Bp/P/M (the memory-bound generation breakdown).  Printed only
        in the full overlay (mode 0) -- this runs EVERY frame, so gating it is part of the fps-only
-       overlay-cost measurement.  The histogram/peak folding below stays unconditional (cheap FRT). */
-    if (sat_dbg_overlay_mode == 0) {
-        snprintf(p, sizeof p, "Bw%u.%u Bp%u.%u P%u.%u M%u.%u        ",
-                 bw10/10,bw10%10, bp10/10,bp10%10, p10/10,p10%10, m10/10,m10%10);
-        dbg_print(0, 2, p);
+       overlay-cost measurement.  The histogram/peak folding below stays unconditional (cheap FRT).
+
+       SATURN 2026-08-25 -- ROW 2 IS THE FRAME, NOT THE LAST VIEW.  This function runs once per
+       VIEW, and each view overwrote row 2, so in split the photograph showed ONE QUADRANT while
+       row 1's MST showed the whole frame.  Every 2p/3p/4p phase number this project has ever
+       quoted is that last view multiplied by N in a spreadsheet -- docs/RESOURCE_BUDGETS.md 9.2
+       calls it the single biggest hole in the cost model, and it is the denominator of the one
+       constant that sizes half the roadmap (ms per drawseg, against row-11 `ds`).
+       The governor five lines below has summed across views since 2026-08-21; this is the same
+       law applied to the READOUT, and it reuses nothing of the governor's state on purpose (the
+       governor drops glitched views from ITS sum -- a measurement must show them, not hide them).
+       `n<v>` leads the row so a capture states how many views it is the sum of; 1p reads `n1` and
+       is bit-identical to the old line.  Frame-sum vs MST is now a legal subtraction. */
+    /* SATURN 2026-08-25 (2nd round): `last` is HOISTED to FUNCTION scope.  rp_p3_prof_show runs
+       once per VIEW and FOUR row families now need to know whether this is the frame's final view
+       -- rows 2 and 4 and the new 14/16 block below, plus rows 5 and 20 at the bottom of the
+       function, which were still paying 4x in 4p.  It stays 1 in 1p, so every 1p row is
+       bit-identical.  One mistake here silently desynchronises all four at once. */
+    int last = 1;
+    {
+        extern int sat_split_active, sat_split_view, sat_local_players;
+        static unsigned int r2_bw = 0, r2_bp = 0, r2_p = 0, r2_m = 0;
+        unsigned int s_bw = bw10, s_bp = bp10, s_p = p10, s_m = m10;
+        int nv = 1;
+        if (sat_split_active)
+        {
+            nv = sat_local_players; if (nv > 4) nv = 4; if (nv < 1) nv = 1;
+            r2_bw += bw10; r2_bp += bp10; r2_p += p10; r2_m += m10;
+            last = (sat_split_view >= nv - 1);
+            s_bw = r2_bw; s_bp = r2_bp; s_p = r2_p; s_m = r2_m;
+            if (last) { r2_bw = r2_bp = r2_p = r2_m = 0; }
+        }
+        else r2_bw = r2_bp = r2_p = r2_m = 0;   /* leaving split mid-window must not inflate the
+                                                   first frame of the next one */
+        /* SATURN 2026-08-25 -- THE DENOMINATOR, latched on the SAME law as the numerator.
+           `Bp / ds` is the one console constant that sizes DECIM, the light-only pass, the
+           cheap-seg rung and the FOV cut all at once -- and row-11 `ds` is r_drawseg_peak, a
+           high-water of ONE VIEW (R_ClearDrawSegs folds per view).  Dividing a frame-sum Bp by a
+           per-view ds is a category error that would have overstated the constant ~4x in 4p.
+           Summed here rather than in R_ClearDrawSegs because THIS is the site that knows where a
+           view ends: ds_p is still this view's when we run (before the next view's clear). */
+        static int r2_ds = 0;
+        {
+            extern drawseg_t drawsegs[]; extern drawseg_t *ds_p;
+            if (!sat_split_active) r2_ds = 0;   /* same rule as the phase sums above */
+            r2_ds += (int)(ds_p - drawsegs);
+        }
+        if (sat_dbg_overlay_mode == 0 && last) {
+            snprintf(p, sizeof p, "n%d Bw%u.%u Bp%u.%u P%u.%u M%u.%u d%d   ", nv,
+                     s_bw/10,s_bw%10, s_bp/10,s_bp%10, s_p/10,s_p%10, s_m/10,s_m%10,
+                     r2_ds > 9999 ? 9999 : r2_ds);
+            dbg_print(0, 2, p);
+        }
+        if (last) r2_ds = 0;
+        /* SATURN 2026-08-25 -- ROW 4 (BPS) OBEYS THE SAME LAW, and the owner's own Ymir pass is
+           what caught it: one 3p capture read `pr0.0 lp0.0 wp0.0` beside `Bp9.9`, because
+           prof_segrout/segloop/wallprep are reset per VIEW in RP_BeginFrame and the LAST view
+           that frame was a 1 ms sliver.  Another read `wp6.6` against a frame `Bp25.1` -- one
+           quarter, exactly.  A row-4 that describes the last view while row 2 describes the frame
+           cannot be differenced against it, which is the only reason row 4 exists. */
+        /* SATURN 2026-08-25 (2nd round) -- `wp` RETIRED, `hd`/`tl` ADDED.  `wp` was prof_wallprep,
+           i.e. LITERALLY row-2 `Bp` (:2636 reads the same variable), so it spent 7 of 40 columns
+           restating a number one row above.  In its place, the two brackets that name the hole:
+           console medians of (wp - pr - lp) were 1p 2.5 / 2p 7.0 / 3p 11.3 / 4p 11.2 ms -- 24 % of
+           the 4p `Bp` with no name on it.  `hd` = the head of R_StoreWallRange (scale + texture
+           resolution, silhouette setup, BOTH R_CheckPlane calls); `tl` = the tail (the four
+           openings memcpy + the drawseg store).  hd+pr+lp+tl == Bp is now an IDENTITY and is the
+           first thing a post-fix console pass must check before reading anything into hd/tl. */
+        {
+            static unsigned int f_pr = 0, f_lp = 0, f_hd = 0, f_tl = 0;
+            if (!sat_split_active) f_pr = f_lp = f_hd = f_tl = 0;
+            f_pr += prof_segrout; f_lp += prof_segloop;
+            f_hd += prof_wallhead; f_tl += prof_walltail;
+            if (last)
+            {
+                sat_bps_pr10 = f_pr * 10u / 224u;
+                sat_bps_lp10 = f_lp * 10u / 224u;
+                sat_bps_hd10 = f_hd * 10u / 224u;
+                sat_bps_tl10 = f_tl * 10u / 224u;
+                f_pr = f_lp = f_hd = f_tl = 0;
+            }
+        }
+        /* SATURN 2026-08-25 -- ROWS 14 (`SEG`) AND 16 (`GCS`) OBEY THE SAME LAW.  prof_seg_* and
+           prof_gc_* are zeroed in RP_BeginFrame (:2381-2383), which runs once per VIEW, but both
+           rows are printed by dg_saturn's overlay burst at the end of the FRAME -> in split they
+           showed the LAST VIEW ONLY.  The 08-25 console CSV is the proof: row-14 `c` medians 433
+           in 1p (range 160-937) against a flat 257 in 2p and 256 in 4p -- a per-view constant that
+           cannot be a frame census.
+           NOT the p10 trap: nothing else reads prof_seg_ or prof_gc_ (r_segs.c writes them,
+           RP_BeginFrame zeroes them, dg_saturn prints them, full stop), and accumulating IN them
+           is impossible anyway since RP_BeginFrame wipes them at the top of the next view -- hence
+           external accumulators, exactly as row 4 does.  Unrolled x4: no loop counter, so no
+           identifier can shadow anything in the enclosing scopes. */
+        {
+            static unsigned int f_sc = 0, f_sf = 0, f_sp = 0, f_slp = 0;
+            static unsigned int f_gt[4] = {0,0,0,0}, f_gn[4] = {0,0,0,0};
+            if (!sat_split_active) {
+                f_sc = f_sf = f_sp = f_slp = 0;
+                f_gt[0]=f_gt[1]=f_gt[2]=f_gt[3]=0;
+                f_gn[0]=f_gn[1]=f_gn[2]=f_gn[3]=0;
+            }
+            f_sc += prof_seg_cols;  f_sf  += prof_seg_fill;
+            f_sp += prof_seg_px;    f_slp += prof_lead_px;
+            f_gt[0]+=prof_gc_st[0]; f_gt[1]+=prof_gc_st[1];
+            f_gt[2]+=prof_gc_st[2]; f_gt[3]+=prof_gc_st[3];
+            f_gn[0]+=prof_gc_sn[0]; f_gn[1]+=prof_gc_sn[1];
+            f_gn[2]+=prof_gc_sn[2]; f_gn[3]+=prof_gc_sn[3];
+            if (last)
+            {
+                sat_seg_cols_f = f_sc;  sat_seg_fill_f = f_sf;
+                sat_seg_px_f   = f_sp;  sat_lead_px_f  = f_slp;
+                sat_gc_st_f[0]=f_gt[0]; sat_gc_st_f[1]=f_gt[1];
+                sat_gc_st_f[2]=f_gt[2]; sat_gc_st_f[3]=f_gt[3];
+                sat_gc_sn_f[0]=f_gn[0]; sat_gc_sn_f[1]=f_gn[1];
+                sat_gc_sn_f[2]=f_gn[2]; sat_gc_sn_f[3]=f_gn[3];
+                f_sc = f_sf = f_sp = f_slp = 0;
+                f_gt[0]=f_gt[1]=f_gt[2]=f_gt[3]=0;
+                f_gn[0]=f_gn[1]=f_gn[2]=f_gn[3]=0;
+            }
+        }
     }
     /* SATURN PERF (2026-07-08): MEASURED slave busy% = slave_busy ticks THIS frame (diff of the
        monotonic accumulator the slave bracketed on its own phi/128 FRT) / MST -- the real occupancy
@@ -2573,10 +2847,39 @@ static void rp_p3_prof_show(void)
     unsigned int pb_d   = pb_now - pb_last;                 /* plane-only slave ticks this frame            */
     sb_last = sb_now; pb_last = pb_now;
     (void)idle;                                             /* derived SLVi retired: b/id/Pb are all MEASURED */
-    unsigned int busy_pct = rp_master_ms ? (sb_d * 100u / (224u * rp_master_ms)) : 0u;
+    /* SATURN 2026-08-25 -- b%/Pb% ARE FRAME QUANTITIES TOO, and in split they were neither.
+       `b` divides THIS VIEW's slave ticks by rp_master_ms, which is the WHOLE frame -> the last
+       view (the one that survives on screen) reported roughly a quarter of the truth in 4p.  `Pb`
+       divided this view's plane ticks by this view's p10, which is at least self-consistent but
+       answers a per-view question nobody asked.  Both now accumulate across the frame exactly as
+       row 2 does, so `SLV b` can finally be read against `n4 P` on the same photograph -- the
+       measurement docs/RESOURCE_BUDGETS.md 9.10 has been waiting for since the 08-20 fixes lifted
+       the split gate.  The console baseline `b0 %` in every split frame is PRE-fix AND was read
+       through this bug; do not compare against it. */
+    /* THE THREE READ-ONLY COPIES: p10 itself must NOT be touched -- the governor below does its
+       own per-view accumulation (`gsum_p += p10`), so overwriting p10 with the frame sum on the
+       last view would make the governor count the whole frame twice.  Same for sb_d/pb_d, which
+       the peak snapshot folds per view. */
+    unsigned int sb_f = sb_d, pb_f = pb_d, p10_f = p10;
+    unsigned int mp_f = prof_mplane + prof_makespans, w_f = p3_wait_ticks;
+    {
+        extern int sat_split_active, sat_split_view, sat_local_players;
+        static unsigned int fsb = 0, fpb = 0, fp10 = 0, fmp = 0, fw = 0;
+        if (sat_split_active)
+        {
+            int nv = sat_local_players; if (nv > 4) nv = 4; if (nv < 1) nv = 1;
+            fsb += sb_d; fpb += pb_d; fp10 += p10;
+            fmp += prof_mplane + prof_makespans; fw += p3_wait_ticks;
+            sb_f = fsb; pb_f = fpb; p10_f = fp10; mp_f = fmp; w_f = fw;
+            if (sat_split_view >= nv - 1) { fsb = fpb = fp10 = fmp = fw = 0; }
+        }
+        else fsb = fpb = fp10 = fmp = fw = 0;   /* same rule as row 2 above */
+    }
+    w10 = w_f * 10u / 224u;
+    unsigned int busy_pct = rp_master_ms ? (sb_f * 100u / (224u * rp_master_ms)) : 0u;
     if (busy_pct > 999u) busy_pct = 999u;                   /* first-frame baseline / glitch clamp */
     /* (idle_pct dropped 2026-08-19 with the row-5 `id` field: it was 100-b, pure redundancy) */
-    unsigned int pb_pct   = p10 ? (pb_d * 1000u / (224u * (unsigned)p10)) : 0u;  /* plane-phase balance */
+    unsigned int pb_pct   = p10_f ? (pb_f * 1000u / (224u * (unsigned)p10_f)) : 0u;  /* plane balance */
     if (pb_pct > 999u) pb_pct = 999u;
 
     /* SATURN PERF (2026-06-24): fold this frame into the window.  Per-PHASE peaks are
@@ -2981,12 +3284,23 @@ static void rp_p3_prof_show(void)
        path) -- THE number a VDP1-planes offload would recover; Ps = SLAVE plane-fill ms (incl. its
        cache purge + claim overhead) -- rides an otherwise idle CPU; w = master idle at the plane
        barrier.  Full mode only.  (`id` dropped 2026-08-19: it was 100-b, pure redundancy.) */
-    if (sat_dbg_overlay_mode == 0) {
+    /* SATURN 2026-08-25: `&& last` -- rp_p3_prof_show runs once per VIEW, so before this gate a 4p
+       frame formatted and blitted rows 5 AND 20 four times for one visible line each (row 2 and
+       row 4 were given `last` earlier the same day; these two were missed).  One gate covers both:
+       the block closes after row 20's dbg_print.  ⚠ `mw` CHANGES VALUE with this: rp_wait_mx is
+       zeroed at the print site below, so the surviving `mw` used to be the max master-wait of the
+       LAST VIEW ONLY (views 0..n-2 were zeroed away unread).  It is now the frame max -- LARGER in
+       split and correct.  Do not read the rise as a slave regression against a pre-08-25 capture;
+       1p is byte-identical. */
+    if (sat_dbg_overlay_mode == 0 && last) {
         /* `mw` = the LONGEST the master waited for the slave this window, ms, any site.  Read it
            against RP_WAIT_TIMEOUT_FRT (100 ms): pinned at the ceiling = a dying slave, well under =
            the ceiling is doing no harm.  It is what `to` could never say. */
-        unsigned int mp10 = (prof_mplane + prof_makespans) * 10u / 224u;
-        unsigned int ps10 = pb_d * 10u / 224u;
+        /* every ms on this row is now the same quantity: the FRAME (see sb_f/pb_f/mp_f/w_f).
+           Pm and Ps are a PAIR -- the plane-phase balance meter -- so summing one and not the
+           other would have made the row read like an imbalance that is not there. */
+        unsigned int mp10 = mp_f * 10u / 224u;
+        unsigned int ps10 = pb_f * 10u / 224u;
         if (mp10 > 999u) mp10 = 999u;
         if (ps10 > 999u) ps10 = 999u;
         snprintf(p, sizeof p, "SLV b%u%% Pb%u%% Pm%u.%u Ps%u.%u w%u.%u mw%u ",
@@ -3103,9 +3417,15 @@ static void rp_p3_prof_show(void)
             sat_prof_dom_pct = prof_plane_pix ? (int)(dom * 100u / prof_plane_pix) : 0;
             sat_prof_plane_n = (int)prof_plane_n;
         }
-        snprintf(p, sizeof p, "FLAT Vs%u Vp%u Vi%u      ",
-                 vsec, prof_floor_vq_peak, prof_floor_vq_int_peak);
-        (void)p;   /* FLAT string parked; Vs/Vp + dom%/n now surfaced by the platform (row 17) */
+        /* SATURN 2026-08-25: the FLAT snprintf that stood here is DELETED.  It formatted a string
+           into `p` and threw it away one line later with `(void)p` -- and it sat OUTSIDE the
+           overlay-mode gate (which closes above), so it ran once per VIEW in EVERY mode including
+           overlay-OFF, i.e. in the SHIPPED build, forever, for nobody.  The "is this output
+           thrown away?" test answers YES before any "can it be tighter?".  The assignments around
+           it STAY: sat_floor_vq_cur/_peak and sat_plane_quad_n/_q4cmd/_q4pct have live consumers.
+           Consequence to know: prof_floor_vq_int_peak (:1736, fed per visplane at :2116) was read
+           ONLY by this string and is now write-only -- a candidate for a later cut, listed here so
+           the next pass does not have to re-find it. */
         /* SATURN 2026-08-19 (4th build of the day): the row-8 `Q` publish MUST live HERE -- this
            P3 path is the only one that runs in the shipping config (rp_disabled).  The first
            THREE probe builds published only from the rp_active block below (two near-identical

@@ -444,12 +444,10 @@ P_CheckPosition_impl
     tmbbox[BOXRIGHT] = x + tmthing->radius;
     tmbbox[BOXLEFT] = x - tmthing->radius;
 
-    /* SATURN 2026-08-17 (row 23 `sb`): a full BSP descent, paid once per call before any collision
-       work happens.  `mv` is now the biggest single item in the whole frame -- this says how much of
-       it goes on merely finding out WHERE the thing is. */
-    RP_ThkSubsecBegin ();
+    /* SATURN 2026-08-25: the `sb` bracket that used to wrap this descent is RETIRED -- see the
+       THK block in r_parallel.c.  It was sized against an `mv` of 66-75 ms; the level-structs
+       merge took `mv` to 1-3 ms and the probe outgrew the term. */
     newsubsec = R_PointInSubsector (x,y);
-    RP_ThkSubsecEnd ();
     ceilingline = NULL;
 
     // The base floor / ceiling is from the subsector
@@ -475,19 +473,11 @@ P_CheckPosition_impl
     yl = (tmbbox[BOXBOTTOM] - bmaporgy - MAXRADIUS)>>MAPBLOCKSHIFT;
     yh = (tmbbox[BOXTOP] - bmaporgy + MAXRADIUS)>>MAPBLOCKSHIFT;
 
-    /* SATURN 2026-08-17 (row 23 `bt`): the THINGS loop -- it walks every corpse and item still
-       linked into the touched blocks.  `mv - sb - bt` is then the LINES loop, by subtraction.
-       The bracket is closed on the early return too: a probe that leaks on the failure path
-       reports fiction exactly when the scene is busiest. */
-    RP_ThkBlkBegin ();
+    /* SATURN 2026-08-25: the `bt` bracket around this loop is RETIRED with `sb` (r_parallel.c). */
     for (bx=xl ; bx<=xh ; bx++)
 	for (by=yl ; by<=yh ; by++)
 	    if (!P_BlockThingsIterator(bx,by,PIT_CheckThing))
-	    {
-		RP_ThkBlkEnd ();
 		return false;
-	    }
-    RP_ThkBlkEnd ();
 
     // check lines
     xl = (tmbbox[BOXLEFT] - bmaporgx)>>MAPBLOCKSHIFT;

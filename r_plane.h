@@ -31,6 +31,10 @@ extern  short*		lastopening;
 extern  short* const	openings_end;       // == openings + MAXOPENINGS
 extern  short		opening_overflow[];  // graceful sink (SCREENWIDTH) for overflowing writes
 extern  int		r_opening_ovf;       // redirects this frame (0 = no overflow)
+/* SATURN 2026-08-25: the high-water of openings CONSUMPTION, folded per view in R_ClearPlanes.
+   r_opening_ovf only fires once it is ALREADY too late; THIS is the number that sizes
+   MAXOPENINGS (40 960 B of .bss against a ~31 KB TLSF pool).  Row 11 `o`, in SCREENWIDTH rows. */
+extern  int		r_opening_peak;
 
 
 typedef void (*planefunction_t) (int top, int bottom);

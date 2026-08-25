@@ -213,6 +213,12 @@ short*			lastopening;
 short* const		openings_end = openings + MAXOPENINGS;
 short			opening_overflow[SCREENWIDTH];
 int			r_opening_ovf = 0;
+/* SATURN 2026-08-25 -- the number that SIZES the array, which r_opening_ovf cannot give.
+   openings[] is SCREENWIDTH*64 = 40 960 B of .bss, LARGER THAN THE WHOLE TLSF POOL, and 64 is a
+   vanilla guess: nothing has ever recorded max(lastopening - openings).  r_opening_ovf only
+   fires once it is ALREADY too late (the redirect into opening_overflow).  Folded per view in
+   R_ClearPlanes below; the platform keeps the ~1 s window high-water (row 11 `o`). */
+int			r_opening_peak = 0;
 
 
 //
@@ -540,6 +546,10 @@ void R_ClearPlanes (void)
     vp_in_bad = vp_draw_bad = vp_map_bad = 0;   /* per-frame reset */
 #endif
     lastvisplane = visplanes;
+    /* SATURN 2026-08-25: fold the HIGH-WATER before the reset wipes it.  R_ClearPlanes runs
+       once per VIEW, so this is the max over every view of the window, and the 1p full-width
+       case is the maximum by construction (a 160-px quadrant cannot out-consume 320). */
+    { int op = (int)(lastopening - openings); if (op > r_opening_peak) r_opening_peak = op; }
     lastopening = openings;
     r_opening_ovf = 0;   /* SATURN garde-OPENINGS: per-frame reset of the overflow-redirect count */
 #if SAT_VISPLANE_POOL
@@ -1106,6 +1116,14 @@ int sat_sky_view = -1;
    R_DrawPlanes) into sat_sky_px_view[i] after each view renders, so the platform can elect the view
    that gains the most from a HW sky.  DoomJo never reads it. */
 unsigned int sat_sky_px_view[4] = { 0, 0, 0, 0 };
+/* SATURN 2026-08-25 -- what the SOFTWARE sky COSTS, per view, in FRT ticks.  The px twin above
+   elects the HW-sky view; this one sizes the 3-quadrant HW-sky plan, and a pixel count cannot
+   stand in for it: R_DrawSkyColumn does a 128-byte per-column memcpy plus the grain loop, so
+   the px->ms factor swings 2-4x with scene geometry.  The HW-sky branch draws nothing, so the
+   elected view reads 0 BY CONSTRUCTION -- that is how a capture identifies it.  Reset per view
+   at the top of R_DrawPlanes (with sat_sky_px), copied out by d_main's split loop. */
+unsigned int sat_sky_frt = 0;
+unsigned int sat_sky_frt_view[4] = { 0, 0, 0, 0 };
 /* SATURN: the elected view's viewangle, captured in the split loop so the platform scrolls the single
    NBG0 sky layer by the RIGHT view's angle (the global viewangle at present time is the LAST view's).
    angle_t == unsigned int; DoomJo never reads it. */
@@ -1392,6 +1410,7 @@ void R_DrawPlanes (void)
 
     sat_frame_has_sky = 0;   /* set below if any sky visplane is in view (platform drops NBG0 if not) */
     sat_sky_px = 0; sat_floor_px = 0;   /* SATURN: sky-vs-floor coverage this frame (classifier) */
+    sat_sky_frt = 0;                    /* SATURN 2026-08-25: software-sky ms, same per-view clock */
     if (!sat_split_active || sat_split_view == sat_rbg0_view)   /* SATURN split: only the punching view resets, so P2 doesn't wipe P1's floor top */
         sat_vdp2_floor_top_y = 0x3FFF;  /* reset; the floor punch below lowers it to the floor's top screen row */
 #if SAT_PLANE_LOCAL
@@ -1561,6 +1580,7 @@ void R_DrawPlanes (void)
 	    //  by INVUL inverse mapping.
 	    dc_colormap = colormaps;
 	    dc_texturemid = skytexturemid;
+	    RP_SkyEnter ();   /* SATURN 2026-08-25: row 12 `SKY` -- the SOFTWARE sky's own ms */
 	    for (x=pl->minx ; x <= pl->maxx ; x++)
 	    {
 		dc_yl = pl->top[x];
@@ -1580,6 +1600,7 @@ void R_DrawPlanes (void)
 			R_DrawSkyColumn ();       /* split hi-detail OR M7-lowres: PACKED drawer (1 col; lowres packs to fb[0,80)) */
 		}
 	    }
+	    RP_SkyLeave ();
 	    continue;
 	}
 

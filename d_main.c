@@ -181,6 +181,9 @@ void R_ExecuteSetViewSize (void);
    the split render block, exposed for the overlay.  0 in 1p (block not entered). */
 unsigned int sat_spl_sw = 0, sat_spl_v0 = 0, sat_spl_v1 = 0, sat_spl_kick = 0;
 unsigned int sat_spl_v2 = 0, sat_spl_v3 = 0;   /* SATURN: per-view render ms for views 2/3 (3/4p) */
+unsigned int sat_spl_mmap = 0;   /* SATURN 2026-08-25: the 3p minimap, ms.  Printed in row 17's
+                                    4th slot, which sat_spl_v3 leaves at 0 in 3p -- the row has no
+                                    spare columns (it already overruns 40 in 4p). */
 int sat_split_view = 0;                         /* SATURN: current split view index (0..3); set in D_Display */
 
 /* SATURN (VDP1 weapon, split-screen): emit EVERY split view's player weapon into the shared VDP1
@@ -357,6 +360,7 @@ void D_Display (void)
 	extern int sat_vdp2_floor, sat_rbg0_view, sat_split_p1hw;   /* SATURN split: P1-only HW floor punch */
 	extern int sat_sky_view;                                    /* SATURN Part 5: elected HW-sky view (-1 = none) */
 	extern unsigned int sat_sky_px, sat_sky_px_view[4];         /* per-view sky coverage (election metric) */
+	extern unsigned int sat_sky_frt, sat_sky_frt_view[4];       /* per-view SOFTWARE-sky ms, FRT ticks (row 12 `SKY`) */
 	extern unsigned int sat_sky_view_angle, viewangle;          /* elected view's angle -> platform NBG0 scroll (angle_t==unsigned int) */
 	extern void R_SetViewWindow (int, int, int, int);
 	extern void R_ExecuteSetViewSize (void);
@@ -419,6 +423,7 @@ void D_Display (void)
 		R_SetViewWindow (vpx[i], twop ? 0 : vpy[i], hw, fh);
 		R_RenderPlayerView (&players[i]);
 		sat_sky_px_view[i] = sat_sky_px;                /* SATURN Part 5: this view's sky coverage (platform election metric) */
+		sat_sky_frt_view[i] = sat_sky_frt;              /* SATURN 2026-08-25: and what its SOFTWARE sky COST (row 12 `SKY`; 0 by construction on the elected view, which draws none) */
 		if (i == sat_sky_view) sat_sky_view_angle = viewangle;   /* elected view's angle -> platform scrolls NBG0 by it (viewangle here is THIS view's, set by R_SetupFrame) */
 		tv[i + 1] = d_ms();
 	    }
@@ -428,12 +433,21 @@ void D_Display (void)
 	    /* SATURN: 3p leaves the bottom-right quadrant empty -> fill it with a player-position
 	       minimap (software fb writes only; does NOT consume the VDP1 wall budget).  Drawn
 	       AFTER the kick + td so it never pollutes the sat_spl_kick measurement. */
+	    /* SATURN 2026-08-25: the minimap is the ONE cost centre unique to 3p and it has never been
+	       timed -- 3p sits at MST 131-192 against 2p's 100-172 and nobody can say how much of that
+	       gap is a third view and how much is this call.  d_ms() granularity is 1 ms, which is the
+	       right precision for a term nobody has bounded yet. */
+	    sat_spl_mmap = 0;
 	    if (n == 3)
+	    {
+		unsigned int mm0 = d_ms();
 		/* M7-multi: pack the minimap into the bottom-right quad's LEFT half (fb x = 160>>1 = 80,
 		   w = 80) so it rides the 160-byte packed blit + x2 NBG1 zoom like the views; else full
 		   160-wide.  (AM_DrawMiniMap scales its content to w and rebuilds its scratch on a w change.) */
 		AM_DrawMiniMap (sat_lowres ? (vpx[3] >> 1) : vpx[3], vpy[3],
 				sat_lowres ? (hw >> 1) : hw, fh);
+		sat_spl_mmap = d_ms() - mm0;
+	    }
 	    sat_wall_skip    = sws;
 	    detailshift      = sds;
 	    sat_view_sq_restore ();   /* SATURN: back to the 1p SQ (after the kick@421 -- walls flushed with the split style) */

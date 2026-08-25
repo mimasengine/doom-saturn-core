@@ -41,6 +41,16 @@ void RP_EndFrame(void);
    ports (the shared core compiles this on GCC 9.3 too). */
 void RP_WallPrepEnter(void);
 void RP_WallPrepLeave(void);
+/* SATURN 2026-08-25: split the wall-prep bracket in THREE.  RP_WallHeadMark closes the HEAD (scale
+   + texture resolution, silhouette setup, BOTH R_CheckPlane calls); RP_WallTailMark opens the TAIL
+   (the four openings memcpy + the drawseg store), closed by RP_WallPrepLeave.  Row 4 `hd`/`tl`.
+   Bare empty calls unless RP_PROF; pure C, safe on GCC 9.3. */
+void RP_WallHeadMark(void);
+void RP_WallTailMark(void);
+/* SATURN 2026-08-25: bracket the SOFTWARE sky loop in R_DrawPlanes (row 12 `SKY`, cart builds).
+   The HW-sky branch draws nothing, so the elected view reads 0.0 by construction. */
+void RP_SkyEnter(void);
+void RP_SkyLeave(void);
 
 /* SATURN PERF (Phase-0a fine split, profiler): localise WHERE Bp and P spend
    their time, to rank the REC-reduction levers.  All per-seg / per-visplane (not
@@ -110,7 +120,15 @@ void RP_ThkMoveBegin(void);
 void RP_ThkMoveEnd(void);
 extern unsigned int sat_thk_mobj_frt;    /* P_MobjThinker, cumulative FRT ticks           */
 extern unsigned int sat_thk_move_frt;    /* P_CheckPosition/P_TryMove inside it (SUBSET)  */
-extern unsigned int sat_thk_n;           /* thinkers RUN -- "many" vs "expensive"         */
+extern unsigned int sat_thk_n;           /* mobj thinkers RUN -- "many" vs "expensive"    */
+/* SATURN 2026-08-25 -- the probe samples WHOLE TICS (1 in 4) and self-CALIBRATES; see
+   r_parallel.c.  mo/ph/sm/mv/sect AND sat_thk_th_frt are raw sums over the sampled tics: the
+   platform lifts the whole set with ONE factor, sat_tic_runs / sat_thk_tics.  Never mix a term
+   from this group with an exact one -- that is what made round 5's `w` unreadable. */
+extern unsigned int sat_thk_tics;        /* tics fully timed -- the scale DENOMINATOR             */
+extern unsigned int sat_thk_th_frt;      /* P_RunThinkers total over THOSE tics -> row 23 `w`     */
+extern unsigned int sat_thk_frt_calls;   /* timer reads made on the thinker path this window      */
+extern unsigned int sat_thk_frt_cost_x256; /* cost of ONE such read, 1/256 FRT tick, MEASURED     */
 /* round 2: carve the ~69 ms of `mo` that `mv` and `s` do not explain (see r_parallel.c). */
 void RP_ThkPhysBegin(void);              /* round 4: the mobj TREE -- all subsets of `mo`         */
 void RP_ThkPhysEnd(void);
@@ -118,17 +136,11 @@ void RP_ThkStateBegin(void);
 void RP_ThkStateEnd(void);
 void RP_ThkSectBegin(void);              /* the NON-mobj thinkers, inside `th` but outside `mo`   */
 void RP_ThkSectEnd(void);
-void RP_ThkSubsecBegin(void);            /* inside P_CheckPosition -- subsets of `mv`             */
-void RP_ThkSubsecEnd(void);
-void RP_ThkBlkBegin(void);
-void RP_ThkBlkEnd(void);
 void RP_RSetupBegin(void);               /* R_RenderPlayerView pre-BSP setup -- the last `R` gap  */
 void RP_RSetupEnd(void);
 extern unsigned int sat_thk_phys_frt;    /* P_XY/ZMovement in P_MobjThinker (PARENT of `mv`)      */
 extern unsigned int sat_thk_state_frt;   /* P_SetMobjState + actions (PARENT of `s` and hitscan)  */
 extern unsigned int sat_thk_sect_frt;    /* sector thinkers: doors, platforms, lights             */
-extern unsigned int sat_thk_sub_frt;     /* R_PointInSubsector: the BSP descent inside `mv`       */
-extern unsigned int sat_thk_blk_frt;     /* the THINGS blockmap loop inside `mv`                  */
 extern unsigned int sat_r_setup_frt;     /* R_RenderPlayerView setup, outside Bw/Bp/P/M           */
 extern unsigned int sat_tic_avail;       /* d_loop.c: tics TryRunTics ELECTED to run -- `a` vs `x` says
                                             whether the lost tics were never built or built-then-skipped */
@@ -142,6 +154,10 @@ extern int sat_thing_masked_cut;         /* r_things.c: sprites sent back to sof
 /* SATURN 2026-08-17 -- row 14 `SEG`: the COUNTS that size `lp` (see the note in r_parallel.c).
    Plain increments, reset per frame with the rest of the Phase-0a split. */
 extern unsigned int prof_seg_cols, prof_seg_fill, prof_seg_px, prof_lead_px;
+/* SATURN 2026-08-25: the FRAME sums of the four above, published by rp_p3_prof_show on the last
+   view.  The platform must read THESE, never the per-view originals -- in split those are the last
+   quadrant only (the defect the 08-25 console CSV caught: `c` flat at 257 in 2p, 256 in 4p). */
+extern unsigned int sat_seg_cols_f, sat_seg_fill_f, sat_seg_px_f, sat_lead_px_f;
 
 /* SATURN 2026-08-17 -- GOVERNOR ACTION COUNTERS.  One increment each time a governor rung actually
    CHANGES A PIXEL: `w` when a tier is flattened (area rung or drawseg budget), `l` when the
@@ -162,6 +178,8 @@ extern int sat_gov_p_bites;   /* platform: 1 = the governor's plane floor is ABO
    Callers stamp sat_gc_site; 1 = seg-loop tier, 2 = routing preamble, 3 = masked midtexture. */
 extern int sat_gc_site;
 extern unsigned int prof_gc_st[4], prof_gc_sn[4];
+/* SATURN 2026-08-25: the FRAME sums, same law and same reason as sat_seg_*_f above. */
+extern unsigned int sat_gc_st_f[4], sat_gc_sn_f[4];
 
 /* SATURN 2026-08-24 -- the governor's own per-frame render clock, and the third rung of its `B`
    axis.  rp_rend10 = Bw+Bp+P+M for the WHOLE frame (split views summed) in tenths of a ms, written
