@@ -748,7 +748,14 @@ void P_GroupLines (void)
        coordinates are +-32768), from the LEVEL zone (PU_LEVEL, freed on level change), NOT
        from the boot TLSF pool.  ~720 B on E1M1, ~16 KB on a 2000-sector monster.
        Layout mirrors bbox[]: BOXTOP, BOXBOTTOM, BOXLEFT, BOXRIGHT. */
-    sat_sector_bbox = (numsectors > 0)
+    /* PARKED with the VDP1 floor claim (via vp_bbox, its only reader -- see
+       r_plane.c SAT_PLANE_IDENTITY and dg_saturn.cxx SAT_VDP1_FLOORS).  NULL here costs
+       nothing and the fill below is guarded on it; the table is 8 B/sector of PU_LEVEL,
+       ~720 B on E1M1 and up to 16 KB on a 2000-sector map.  Flip SAT_SECTOR_BBOX to 1
+       with them.  The computation itself is free -- the loop below already has the exact
+       numbers and vanilla throws them away, keeping only the 128-unit blockmap version. */
+#define SAT_SECTOR_BBOX 0
+    sat_sector_bbox = (SAT_SECTOR_BBOX && numsectors > 0)
         ? Z_Malloc (numsectors * 4 * sizeof(short), PU_LEVEL, 0) : NULL;
 
     sector = sectors;

@@ -350,8 +350,16 @@ void R_InitPlanes (void)
     /* SATURN: allocate from zone heap (low WRAM) — keeps high WRAM BSS within
        the 1MB limit.  Z_Init runs before R_Init so the heap is ready. */
     visplanes = Z_Malloc(MAXVISPLANES * sizeof(visplane_t), PU_STATIC, 0);
+    /* PARKED with the VDP1 floor claim, its only consumer (dg_saturn.cxx SAT_VDP1_FLOORS,
+       where the console A/B that closed it is written out).  Leaving the pointers NULL is
+       the whole park: every writer here is already guarded on vp_flags, so the identity
+       simply never accumulates and the 2.3 KB of PU_STATIC is never taken.  Set to 1
+       together with SAT_VDP1_FLOORS to bring it back. */
+#define SAT_PLANE_IDENTITY 0
+#if SAT_PLANE_IDENTITY
     vp_bbox   = Z_Malloc(MAXVISPLANES * 4 * sizeof(short), PU_STATIC, 0);
     vp_flags  = Z_Malloc(MAXVISPLANES * sizeof(byte),  PU_STATIC, 0);
+#endif
     r_visplane_peak = 0;
 #if SAT_VISPLANE_POOL
     /* one (top+bottom) slice-pair per plane, capped at VP_POOL_PLANES */
@@ -1309,8 +1317,15 @@ static void sat_floor_cmap_from_band(int band)
    planezlight set by the R_DrawPlanes loop) with real per-pixel flat texels -- R_MapPlane's
    exact mapping + per-row zlight.  Used for the residual bands the VDP1 tiles cannot serve
    (the far sliver past the mip clamp in a partial claim).  Row counts there are small. */
+/* SATURN 2026-08-24: what the PARTIAL claim costs on the other side of the ledger.  A punch
+   that does not reach the plane's near edge leaves a FAR residue, and that residue is drawn
+   HERE -- per pixel, master only, no slave share, no span batching -- where the untouched
+   plane would have been drawn in spans.  If this counter approaches the punched-pixel count
+   the mode is paying more than it saves, and no frame-time reading will say so on its own. */
+int sat_plane_texcol_px = 0;
 static void sat_plane_texcol(int x, int y0, int y1)
 {
+    if (y1 >= y0) sat_plane_texcol_px += y1 - y0 + 1;
     unsigned tang = (unsigned)(viewangle + xtoviewangle[x]) >> ANGLETOFINESHIFT;
     fixed_t tcos = finecosine[tang], tsin = finesine[tang];
     fixed_t tdsc = distscale[x];
@@ -1836,8 +1851,15 @@ void R_DrawPlanes (void)
 		    int f0, f1;                                       /* far residue -> texels */
 		    if (is_ceil)
 		    {
-			pb0 = (pn > 0 && pn > yl) ? pn : yl;          /* near rows excluded     */
-			pb1 = pe < yh ? pe : yh;
+			/* SATURN 2026-08-24: the punch arrays have ONE meaning for both sides --
+			   edge[x] = the punch's TOP row, near[x] = its BOTTOM row (that is what
+			   the platform writes: fvdp1_ptop/fvdp1_pbot, a min and a max).  This
+			   branch used to read them the other way round, which was harmless only
+			   because ceilings were never claimed.  They are now, so read them the
+			   same way; what stays MIRRORED is which residue is which -- for a
+			   ceiling the near part is ABOVE the punch and the far part BELOW. */
+			pb0 = pe > yl ? pe : yl;                      /* punch top    */
+			pb1 = (pn > 0 && pn < yh) ? pn : yh;          /* punch bottom */
 			if (pb0 > pb1) continue;                      /* nothing tileable -> the
 			                                                 whole span stays software */
 			{ int nb = pb0 - 1;                           /* NEAR band -> span path  */
