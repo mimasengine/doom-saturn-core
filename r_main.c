@@ -1165,6 +1165,46 @@ extern volatile int game_phase;
    NULL on DoomJo / when the VDP1 world renderer is off. */
 void (*sat_walls_done_hook)(void) = 0;
 
+/* [!] SATURN 2026-08-26 -- LATE KICK (owner: *"on ne pouvait pas faire remonter le travail pour que
+   le slave puisse travailler ?"*).  This does NOT move work onto the slave.  It stops SERIALISING
+   the master's VDP1 emission against a slave that is standing still.
+
+   The measurement that produced it (1p console-shaped Ymir capture, MST51.5):
+       row-1 `pr` 3.1 ms  = the whole VDP1 kick        row-4 `em` 3.0 = 97 % of it is the wall emit
+       row-2 `P` 12.3     = planes, row-5 `Pm6.7` master / `Ps8.3` slave, CONCURRENT
+       row-5 `b29%`       = the slave is idle 71 % of the frame
+   Today the order is  BSP -> kick (3.1, slave IDLE) -> build worklist (Pv 0.7) -> dispatch slave.
+   The slave therefore starts its plane share 3.8 ms after the BSP walk ends, and `Ps` is the LONGER
+   side of the plane phase -- so the slave is the critical path and we hand it a late start.
+
+   With sat_kick_late the order becomes  BSP -> Pv -> DISPATCH SLAVE -> kick (on the master, while
+   the slave draws planes) -> master steals its share.  The slave starts 3.1 ms earlier; VDP1 starts
+   0.7 ms later (the worklist build is all that now precedes it).  Nothing else moves.
+
+   WHY IT IS SAFE, checked rather than assumed:
+     - the kick path writes RAW VDP1 command lists and registers -- there is NOT ONE sl* call in
+       vdp1_walls_flush / wall_emit* / the things, weapon and HUD emits / vdp1_wpn_kick.  That is
+       what matters: the documented M7 freeze is SGL work-area pointer creep while the slave runs
+       (see rp_sgl_workptr_reset), and a path that never touches SGL cannot cause it.
+     - the master writes VDP1 VRAM, the slave writes the NBG1 framebuffer.  Disjoint memories.
+     - it is the same overlap the shipped clear-on-slave and plane work-steal already rely on.
+   ⚠ READ IT ON MST, NOT ON `P`.  With the kick moved inside R_DrawPlanes its time lands in row-2
+   `P`, while row-1 `pr` still reports it from its own FRT pair -- so P and pr DOUBLE-COUNT while
+   this is on.  In 1p MST is the right judge anyway and it sits 1.5 ms above the 3-field line
+   (3 fields = 50.05 ms, the capture reads 51.5), which is exactly the size of this lever.
+
+   VALIDATED AND BAKED 2026-08-26, same afternoon, on a scene that was NOT sitting on a field
+   line -- which is what made the win legible.  Same spot, same geometry (d53, Bw4.4, Bp14.5,
+   pr7.8, em7.0 identical on both sides), 1p:
+       before   16.0 fps   MST 62   R42   Pm4.2 / Ps4.4   b10%
+       after    19.9 fps   MST 50   R35   Pm0.4 / Ps8.2   b21%
+   Read the plane pair: after the change the master takes 0.4 ms of the planes and the slave 8.2 --
+   the master spends that window on the 7.8 ms kick instead, which is the mechanism in its pure
+   form.  R falls 7 ms; MST falls 12, because 62 ms is 3.7 fields (about 75 % of frames spilling
+   onto a fourth) and 50 ms is three.  The pad R+Z A/B and the row-7 `K` field went with the
+   verdict -- a settled knob is not a knob ([[toggle-audit-cleanup]]). */
+int sat_kick_pending = 0;   /* a deferred kick is owed this frame -- flushed by the fallback below */
+
 /* SATURN split-screen (Iter 2): set while rendering the per-player half-views.  The VDP1
    wall emit (r_segs.c) + the VDP1 kick are skipped (the VDP1/VDP2 hybrid is single-view),
    so each half renders in pure software into its framebuffer region. */
@@ -1299,7 +1339,12 @@ static void R_RenderViewPass (int last_pass)
        floors/sprites below and presents the SAME frame (no 1-frame lag vs the framebuffer).
        In x-split this fires only on the final pass so VDP1 is kicked once with every wall.
        In split-screen (sat_split_active) the VDP1 hybrid is off (it is single-view) -> no kick. */
-    if (last_pass && sat_walls_done_hook && !sat_split_active) sat_walls_done_hook ();
+    if (last_pass && sat_walls_done_hook && !sat_split_active)
+    {
+        /* Hand it to RP_DrawPlanesSplit, which runs it the instant the slave has been launched
+           onto the planes.  See the note at sat_kick_pending. */
+        sat_kick_pending = 1;
+    }
 
     /* SATURN split world-things-on-VDP1: in split the kick above is skipped (d_main.c kicks ONCE
        after ALL views), but vissprites/drawsegs/view window are per-view state that is gone by
@@ -1341,6 +1386,11 @@ static void R_RenderViewPass (int last_pass)
 	if (lead_slave) RP_AuxDispatch (R_LeadSlaveDraw);
 
 	R_DrawPlanes ();
+
+	/* LATE-KICK FALLBACK -- this is what makes the deferral provably once-per-frame.  R_DrawPlanes
+	   does not always reach RP_DrawPlanesSplit (worklist of 0 or 1, sat_plane_parallel off, or the
+	   split self-healed to master-only), and a kick that never fires is a frame with no walls. */
+	if (sat_kick_pending) { sat_kick_pending = 0; if (sat_walls_done_hook) sat_walls_done_hook (); }
 
 	/* Join BEFORE the masked pass: sprites must land on top of the wall pixels. */
 	if (lead_slave) { RP_LeadJoin (); R_LeadSpanReset (); }

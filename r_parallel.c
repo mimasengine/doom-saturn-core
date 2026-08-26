@@ -202,6 +202,18 @@ unsigned int sat_bps_pr10 = 0, sat_bps_lp10 = 0, sat_bps_hd10 = 0, sat_bps_tl10 
    same site and same writer as sat_bps_* above.  RAW counts / RAW FRT ticks: dg_saturn keeps the
    clamping and the tick->ms conversion it already did on the per-view prof_* these replace. */
 unsigned int sat_seg_cols_f = 0, sat_seg_fill_f = 0, sat_seg_px_f = 0, sat_lead_px_f = 0;
+/* [!] SATURN 2026-08-26 -- row 14 `ov`: WHAT THE PROFILER ITSELF COSTS, frame-summed tenths-ms.
+   rp_p3_prof_show is 788 lines with ~36 divisions and it runs ONCE PER VIEW -- four times a frame
+   in 4p -- from RP_EndFrame, i.e. INSIDE the render, so its cost is charged to row-1 `R` and to
+   each view's row-17 time.  Only TWO blocks inside it are gated on sat_dbg_overlay_mode == 0;
+   everything else (the histograms, the peak folds, the per-view accumulators, the governor's
+   input) runs in fps-only and overlay-off builds too.  Nobody has ever measured it.
+   Bracketed from OUTSIDE the call so the probe cannot hide inside the thing it measures -- the
+   exact mistake RP_PlanePixels was making inside `Pv` until this same day.  Published on the
+   frame's LAST view, so what you read is the PREVIOUS frame's total (same law as row-19 `v`).
+   ⚠ Read it before restructuring the function: a blanket early return is NOT available, because
+   the LOD governor reads `p10` from in here and is not mode-gated (gsum_p, ~line 3010). */
+unsigned int sat_prof_show10 = 0;
 unsigned int sat_gc_st_f[4], sat_gc_sn_f[4];
 /* (n / d / j RETIRED 2026-08-06 -- all three measured ~0 and are SETTLED NEGATIVE: NetUpdate and
    the canaries are free, RP_LeadJoin never waits, and R_DrawPlanes itself is 1 ms, i.e. THE PLANES
@@ -1153,6 +1165,14 @@ void RP_DrawPlanesSplit(int n)
     for (int i = 0; i < n; i++) rp_plane_lock[i] = 0;         /* arm claims (write-through to RAM) */
     slSlaveFunc(rp_plane_tas_body, (void *)(unsigned int)n);  /* slave claims UP from 0 */
     rp_plane_pending = 1;                    /* a record is now live -> must be joined before any rewind */
+    {   /* SATURN 2026-08-26 -- THE LATE KICK LANDS HERE, and this line is the whole point: the
+           slave is running (slSlaveFunc above), the master has nothing claimed yet, so the VDP1
+           emission now happens IN PARALLEL with the slave's plane share instead of ahead of it.
+           r_main.c owns the flag and the fallback; see the note at sat_kick_late there. */
+        extern int sat_kick_pending;
+        extern void (*sat_walls_done_hook)(void);
+        if (sat_kick_pending) { sat_kick_pending = 0; if (sat_walls_done_hook) sat_walls_done_hook (); }
+    }
     RP_MPlaneEnter();
     while (m >= 0) { if (!rp_tas_claim(m)) break; R_DrawPlaneWorklist(m, m + 1); m--; }  /* master DOWN */
     RP_MPlaneLeave();                        /* row 5 `Pm`: the master's fill share of the steal */
@@ -3514,7 +3534,20 @@ void RP_EndFrame(void)
 {
     if (!rp_active) {
 #if RP_PROF
-        if (rp_disabled) rp_p3_prof_show();   /* P3: the only readout when parity is off */
+        if (rp_disabled)
+        {   /* row 14 `ov` -- see the note at sat_prof_show10 */
+            unsigned short ov_t0 = rp_frt();
+            rp_p3_prof_show();                /* P3: the only readout when parity is off */
+            {
+                extern int sat_split_active, sat_split_view, sat_local_players;
+                static unsigned int ov_acc = 0;
+                int nv = 1;
+                ov_acc += (unsigned short)(rp_frt() - ov_t0);
+                if (sat_split_active) { nv = sat_local_players; if (nv > 4) nv = 4; if (nv < 1) nv = 1; }
+                if (!sat_split_active || sat_split_view >= nv - 1)
+                {   sat_prof_show10 = ov_acc * 10u / 224u; ov_acc = 0; }
+            }
+        }
 #endif
         return;
     }
