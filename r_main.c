@@ -46,6 +46,36 @@
 // Fineangles in the SCREENWIDTH wide window.
 #define FIELDOFVIEW		2048	
 
+/* SATURN 2026-08-25 -- LIVE FIELD OF VIEW (platform chord pad L+Y, row-7 `f<deg>`).
+   WHY IT EXISTS: FIELDOFVIEW is a compile-time constant and focallength is built on
+   centerxfrac = viewwidth/2, so a 160-px SPLIT QUADRANT still shows a full 90 degrees.
+   Four views therefore accept four complete 90-degree arcs to paint 1.00x the pixels of
+   the 1p view -- and `d` (drawsegs) is the term the split law says inflates with player
+   count.  Narrowing the arc narrows clipangle (= xtoviewangle[0], set at the bottom of
+   R_InitTextureMapping), so the BSP genuinely accepts fewer segs: that is the mechanism,
+   and it is why the lever is falsifiable by a COUNT.
+
+   sat_fov_mul is tan(45deg)/tan(half) -- the RATIO of the vanilla focal to the new one.
+   It must be a ratio and not a focal, because vanilla is already inconsistent here:
+   projection is centerxfrac while focallength divides centerxfrac by
+   finetangent[FINEANGLES/4+1024], and that entry is 65185, NOT 65536 (counted in
+   core/tables.c: the table is sampled at the MIDDLE of each fine step, so tan(45 deg) is
+   not one of its samples).  Setting projection = focallength would therefore have moved
+   the SHIPPED image by 0.54 %, silently, on a change advertised as default-off.  As a
+   ratio, sat_fov_mul is EXACTLY FRACUNIT at the default whatever the table holds, so
+   every consumer below is bit-identical until the chord moves it -- which is what makes
+   the 90-degree arm of the A/B a genuine identity rather than a near-miss.
+
+   ⚠ PROBE-GRADE, NOT SHIPPABLE AS-IS.  The HW sky's scroll law is derived from the
+   90-degree geometry ([[part5-hw-sky-split]]) and is NOT scaled here, so the sky will
+   mis-track at any other setting.  That is cosmetic and does not touch `d`, which is the
+   only thing this toggle is built to measure.  Same for slSetScreenDist (the RBG0 focal),
+   which matters in 1p/2p only -- RBG0 is off in 3/4p, so the 4p reading is clean.
+   ⚠ It is also a GAME change (less peripheral vision in versus), so it stays default-off
+   and the owner judges it, not a benchmark. */
+int     sat_fov_half = FIELDOFVIEW/2;   /* fine-angle HALF-fov; 1024 = 45 deg = 90 deg total */
+fixed_t sat_fov_mul  = FRACUNIT;        /* tan(45)/tan(half); EXACTLY FRACUNIT at the default */
+
 
 
 int			viewangleoffset;
@@ -562,7 +592,7 @@ void R_InitTextureMapping (void)
     // Calc focallength
     //  so FIELDOFVIEW angles covers SCREENWIDTH.
     focallength = FixedDiv (centerxfrac,
-			    finetangent[FINEANGLES/4+FIELDOFVIEW/2] );
+			    finetangent[FINEANGLES/4+sat_fov_half] );   /* SATURN: was FIELDOFVIEW/2 */
 	
     for (i=0 ; i<FINEANGLES/2 ; i++)
     {
@@ -693,6 +723,24 @@ static int satvw_w = -1, satvw_h = -1, satvw_ds = -1;
 int sat_lowres = 0;
 void R_SetLowRes (int on) { sat_lowres = on; setsizeneeded = true; }
 
+/* SATURN 2026-08-25: the only writer of sat_fov_half.  Both view-setup paths cache their
+   size-dependent tables (1p on setsizeneeded, split on the satvw_* triple), and NEITHER
+   keys on the fov -- so a chord that only assigned the angle would change nothing until
+   the next resize.  Invalidate both here, or the toggle silently does nothing and the
+   A/B reads as "the lever is worth zero".  Clamped to never WIDEN past vanilla: the whole
+   point is fewer accepted segs, and a wider arc would also overrun viewangletox. */
+void R_SetFovHalf (int half)
+{
+    if (half < 256)              half = 256;               /* ~22.5 deg total, absurd but safe */
+    if (half > FIELDOFVIEW/2)    half = FIELDOFVIEW/2;     /* never wider than vanilla 90 */
+    if (half == sat_fov_half)    return;
+    sat_fov_half = half;
+    sat_fov_mul  = FixedDiv (finetangent[FINEANGLES/4+FIELDOFVIEW/2],
+			     finetangent[FINEANGLES/4+half] );
+    satvw_w = satvw_h = satvw_ds = -1;   /* split path: force R_SetViewWindow to rebuild */
+    setsizeneeded = true;                /* 1p path: force R_ExecuteSetViewSize */
+}
+
 void R_ExecuteSetViewSize (void)
 {
     fixed_t	cosadj;
@@ -723,7 +771,7 @@ void R_ExecuteSetViewSize (void)
     centerx = viewwidth/2;
     centerxfrac = centerx<<FRACBITS;
     centeryfrac = centery<<FRACBITS;
-    projection = centerxfrac;
+    projection = FixedMul (centerxfrac, sat_fov_mul);   /* SATURN fov: == centerxfrac at 90 deg */
 
     if (!detailshift || sat_lowres)
     {
@@ -760,7 +808,7 @@ void R_ExecuteSetViewSize (void)
     {
 	dy = ((i-viewheight/2)<<FRACBITS)+FRACUNIT/2;
 	dy = abs(dy);
-	yslope[i] = FixedDiv ( (viewwidth<<detailshift)/2*FRACUNIT, dy);
+	yslope[i] = FixedDiv ( FixedMul((viewwidth<<detailshift)/2*FRACUNIT, sat_fov_mul), dy);
     }
 	
     for (i=0 ; i<viewwidth ; i++)
@@ -818,7 +866,7 @@ void R_SetViewWindow (int wx, int wy, int w, int h)
 	centerx = viewwidth/2;
 	centerxfrac = centerx<<FRACBITS;
 	centeryfrac = centery<<FRACBITS;
-	projection = centerxfrac;
+	projection = FixedMul (centerxfrac, sat_fov_mul);   /* SATURN fov: == centerxfrac at 90 deg */
 
 	R_InitTextureMapping ();                    /* xtoviewangle from centerx/viewwidth */
 
@@ -830,7 +878,7 @@ void R_SetViewWindow (int wx, int wy, int w, int h)
 	for (i=0 ; i<viewheight ; i++)
 	{
 	    dy = ((i-viewheight/2)<<FRACBITS)+FRACUNIT/2;  dy = abs(dy);
-	    yslope[i] = FixedDiv ( (viewwidth<<detailshift)/2*FRACUNIT, dy);
+	    yslope[i] = FixedDiv ( FixedMul((viewwidth<<detailshift)/2*FRACUNIT, sat_fov_mul), dy);
 	}
 	for (i=0 ; i<viewwidth ; i++)
 	{
@@ -1185,6 +1233,21 @@ void (*sat_xsplit_wait)(void) = 0;
    slave never kicks VDP1 -- correct (VDP1 walls are the master's / software in x-split). */
 static void R_RenderViewPass (int last_pass)
 {
+    /* 🔴 SATURN 2026-08-25 -- `rs` MOVED HERE, and this is where the missing time actually is.
+       The old bracket (still live in R_RenderPlayerView) wrapped RP_AuxWait + R_SetupFrame +
+       R_PostFlatCacheFrame and read rs0.0 on every capture -- it proved a negative.  Meanwhile
+       the console ledger says R - (Bw+Bp+P+M) - kick = -2.0 / 5.9 / 19.7 / 20.8 ms across
+       1p/2p/3p/4p: ZERO in 1p and ~5-7 ms PER VIEW in split, which makes it a SPLIT LAW member
+       rather than the slop of a derived number.  THIS block is the candidate: four Clear* calls
+       and a NetUpdate that run once per VIEW and sit OUTSIDE every phase bracket.  R_ClearPlanes
+       alone memsets the 256-byte hash head and the cachedheight table and folds the per-view
+       peaks; R_ClearSprites, R_ClearDrawSegs and R_ClearClipSegs each walk their own arrays.
+       Both bracket sites accumulate into the same sat_r_setup_frt, so `rs` now reads ALL the
+       unbracketed per-view setup and costs no overlay column.  ⚠ If `rs` still reads ~0 in 4p
+       on console, the term is further in -- inside R_RenderBSPNode or between MarkP and
+       BeginMasked -- and the next FRT pair goes there, not here. */
+    RP_RSetupBegin ();
+
     // Clear buffers.
     R_ClearClipSegs ();
     R_ClearDrawSegs ();
@@ -1193,6 +1256,8 @@ static void R_RenderViewPass (int last_pass)
 
     // check for new console commands.
     NetUpdate ();
+
+    RP_RSetupEnd ();
 
     SAT_RP_BEGIN ();
 
