@@ -180,7 +180,25 @@ static boolean BuildNewTic(void)
     }
     else
     {
-       if (maketic - gameticdiv >= 5)
+       /* 🔴 SATURN 2026-08-25 -- THE CAP THAT ACTUALLY RUNS, and it was NOT the +8 above.
+          `settings->new_sync = 0` at the bottom of this file means the `if (new_sync)` branch --
+          and the whole SATURN comment in it describing this exact slow-motion bug -- is
+          UNREACHABLE.  It has never executed one frame on this port: new_sync=0 landed in
+          46b757c, three weeks BEFORE the 2026-07-06 "+2 -> +8" fix, so the A/B that validated
+          that fix exercised dead code.  What ran instead is the vanilla `>= 5` this replaces.
+          MEASURED-CONSOLE (106-frame capture, row 24): `x` NEVER exceeds 5.0 on 94 legible
+          readings and reads exactly 5.0 on 32 of them; on those frames the world speed `sp`
+          reads 66-83 % against a 94 % median elsewhere.  At 6.2 fps in 4p the frame owes
+          5.5-7.6 tics and delivers 5.0, and the excess is LOST, not deferred -- NetUpdate has
+          already advanced lasttime by the time this returns false.
+          9 (not 8) reproduces the +8 branch EXACTLY: `> 8` admits 8, so `>= 9` admits 8.
+          ⚠ THIS IS A SPEND, NOT A SAVE.  It buys world speed and costs frame time: the 4p
+          frame goes 158 -> ~161-166 ms.  Correct 35 Hz at 6.2 fps means monsters step ~5.6
+          tics between visible frames instead of 5.0 -- correct Doom, and an OWNER judgment
+          call, not a benchmark one.  The falsifier is `x` rising above 5.0; the outcome is
+          `sp` approaching 100.  The realtics>10 clamp in TryRunTics, not this line, remains
+          the hang-guard against a garbage clock. */
+       if (maketic - gameticdiv >= 9)
            return false;
     }
 
