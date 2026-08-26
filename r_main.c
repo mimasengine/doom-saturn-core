@@ -1261,6 +1261,19 @@ static void R_RenderViewPass (int last_pass)
 
     SAT_RP_BEGIN ();
 
+    /* 🔴 SATURN 2026-08-26 -- WALL FILL ON THE SLAVE: open the producer here.
+       `Bp` is the window: 48.6 ms of a 4p frame in which the master does pure geometry and the
+       slave does nothing at all.  The later window, R_DrawPlanes, is NOT free -- the plane
+       work-steal already splits it almost evenly (row 5 read Pm8.5 / Ps7.9 on hardware), so
+       handing the walls over there would only swap one job for another.  The slave DRAINS spans
+       while the master keeps recording them, and the join below gives it back in time to take its
+       half of the planes.
+       ⚠ THIS ONLY ARMS -- it does not dispatch.  The slave is woken by the FIRST recorded span,
+       inside the walk (see sat_wallfill_take), so a view whose threshold rejects every column
+       never wakes it: the 1p A/B measured ~0.4 ms of master time lost to a slave spinning on an
+       empty queue.  No-op unless sat_wallfill_min > 0 (pad R+X). */
+    { extern void R_WallFillArm (void); R_WallFillArm (); }
+
     // The head node is the last node output.
     R_RenderBSPNode (numnodes-1);
 
@@ -1274,6 +1287,11 @@ static void R_RenderViewPass (int last_pass)
       if (sat_wallprep_slave) { RP_DispatchWallPrep(walljob_n); RP_WaitWallPrep(); walljob_n = 0; }
       else                      RP_FlushWalls();
     }
+
+    /* Close the span queue and join the slave.  MUST be here: R_DrawPlanes below wants the slave
+       for the plane split, and the masked pass after it must paint sprites ON TOP of these wall
+       pixels. */
+    { extern void R_WallFillDone (void); R_WallFillDone (); }
 
     SAT_RP_BSPDONE ();   // SATURN: profiler BSP/planes boundary (row-20 B/P/M)
 

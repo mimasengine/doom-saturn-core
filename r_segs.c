@@ -210,6 +210,39 @@ R_RenderMaskedSegRange
 // CALLED: CORE LOOPING ROUTINE.
 //
 #define HEIGHTBITS		12
+
+/* 🔴 SATURN 2026-08-26 -- `>> HEIGHTBITS` IS A FUNCTION CALL ON THE SH-2.
+   The SH7604 has no dynamic shift (only 1, 2, 8 and 16), so GCC lowers a constant >>12 to
+   ___ashiftrt_r4_12: a jsr into twelve chained `shar` plus an rts.  The disassembly of the
+   SHIPPED r_segs.o carried TWELVE relocations to that helper, up to FOUR of them per column of
+   the hottest loop in the renderer (yl, yh and the two tier mids) and ~30 more per SEG in the
+   routing preamble.
+   Worse than the call overhead: the helper's ABI PINS its operand to r4, so every use forces a
+   shuffle in and out of one fixed register inside a loop the same disassembly shows to be
+   register-starved -- 42 stack-address formations (`mov #N,rX; add r15,rX`) in a single body,
+   three instructions just to reach one variable.  Inline, it is the SAME twelve instructions
+   minus the jsr, the rts, the delay slot and the r4 straitjacket.
+   ⚠ (x << 4) >> 16 -- two instructions via swap.w/exts.w -- WAS CONSIDERED AND REJECTED.  It
+   needs |x| < 2^27, and topfrac reaches ~5e8 on a close tall wall (centeryfrac -
+   FixedMul(worldtop, rw_scale), with rw_scale clamped at 64.0 by R_ScaleFromGlobalAngle).
+   Exactness is not negotiable here: yl/yh are SCREEN ROWS and the clip compares below read the
+   true value, so a wrapped one picks the wrong branch -- a mis-clipped wall, not a rounding.
+   Non-SH builds keep the plain shift, so the C is the definition and the asm is the SH-2 spelling
+   of it. */
+#if HEIGHTBITS != 12
+#error "SAT_SHR12 is the SH-2 spelling of >>12 -- retune it if HEIGHTBITS moves"
+#endif
+#ifdef __sh__
+static inline int SAT_SHR12 (int x)
+{
+    __asm__ ("shar %0; shar %0; shar %0; shar %0; shar %0; shar %0;"
+	     " shar %0; shar %0; shar %0; shar %0; shar %0; shar %0"
+	     : "+r" (x) : : "t");
+    return x;
+}
+#else
+#define SAT_SHR12(x) ((int)(x) >> 12)
+#endif
 #define HEIGHTUNIT		(1<<HEIGHTBITS)
 
 /* SATURN Potato walls: when enabled, the wall recorder paints each opaque wall
@@ -753,7 +786,7 @@ static sat_leadspan_t *sat_lead_spans;
 static int sat_lead_span_n;
 int sat_lead_span_drop;      /* spans the cap refused this frame -- silence would read as "nothing to do" */
 int sat_lead_stale;          /* spans whose source was GONE by drain time -> drawn flat instead of
-			        drawing a neighbour's pixels.  Overlay row 12 `st`, with the other
+			        drawing a neighbour's pixels.  Overlay `st` on the CD row, with the other
 			        gardes that must read 0.  Every one of these was a wrong texture
 			        before 2026-08-09; a persistent non-zero means the purge pressure is
 			        real and the lead-fill is fighting the zone, not that it is broken. */
@@ -763,33 +796,30 @@ int sat_lead_stale;          /* spans whose source was GONE by drain time -> dra
    in the record; the inner loops mirror R_DrawColumn / R_DrawColumnLow with locals.
    Pixel-safe against the planes it overlaps: Doom clips every visplane to the ceilingclip/floorclip
    the wall loop just wrote, so a plane never owns a row a wall tier owns. */
-void R_LeadSlaveDraw (void)
+/* One recorded span, drawn.  Split out of R_LeadSlaveDraw 2026-08-26 so the STREAMING drain
+   below can consume the queue one entry at a time while the master is still appending to it. */
+static void sat_lead_draw_span (const sat_leadspan_t *sp, int lowdraw)
 {
     extern byte *ylookup[]; extern int columnofs[];   /* r_draw.c, no header */
-    extern int sat_lowres;                           /* r_main.c */
+    {
     /* ⚠ MIRROR R_ExecuteSetViewSize'S DRAWER CHOICE EXACTLY.  In M7 detailshift is 1 -- it drives
        the 160-column projection and the VDP1 x<<1 -- but the master still uses the NORMAL
        R_DrawColumn, because the framebuffer is PACKED 160 wide (one byte per logical column) and
        the *Low drawers would re-duplicate it back to 320.  Branching on detailshift alone put every
        slave span at double x, duplicated: the owner's *"les dessins du slave ne sont pas au bon
        endroit sur l'image"*. */
-    int lowdraw = (detailshift && !sat_lowres);
-    int i;
-    for (i = 0 ; i < sat_lead_span_n ; i++)
-    {
-	const sat_leadspan_t *sp = &sat_lead_spans[i];
 	int count = sp->yh - sp->yl;
 	const byte *src;
 	byte *dest;
-	if (count < 0) continue;
-	if ((unsigned)sp->x >= (unsigned)SCREENWIDTH || sp->yl < 0 || sp->yh >= viewheight) continue;
+	if (count < 0) return;
+	if ((unsigned)sp->x >= (unsigned)SCREENWIDTH || sp->yl < 0 || sp->yh >= viewheight) return;
 	/* RE-RESOLVE HERE, not at record time.  R_GetColumnCached only reads -- it never allocates,
 	   so it is safe on the slave, and it answers NULL the moment the source stopped being
 	   reachable (directory purged, composite purged/stubbed, lump evicted).  NULL => this span
 	   draws FLAT in the texture's own dominant colour for one frame, which is the whole point:
 	   the old code held the stale ADDRESS and drew a neighbour's pixels instead. */
 	src = (sp->tex < 0) ? NULL : R_GetColumnCached (sp->tex, sp->tcol);
-	if (!src && sp->tex >= 0) sat_lead_stale++;   /* overlay row 12 `st` -- MUST tend to 0 */
+	if (!src && sp->tex >= 0) sat_lead_stale++;   /* overlay `st` on the CD row -- MUST tend to 0 */
 	if (lowdraw)
 	{
 	    int x = sp->x << 1;
@@ -828,6 +858,62 @@ void R_LeadSlaveDraw (void)
     }
 }
 
+/* The batch form: everything recorded, drawn in one go.  Kept for the 1p lead-fill path. */
+void R_LeadSlaveDraw (void)
+{
+    extern int sat_lowres;                           /* r_main.c */
+    int lowdraw = (detailshift && !sat_lowres);
+    int i;
+    for (i = 0 ; i < sat_lead_span_n ; i++)
+	sat_lead_draw_span (&sat_lead_spans[i], lowdraw);
+}
+
+/* 🔴 SATURN 2026-08-26 -- WALL FILL ON THE SLAVE, the streaming half.
+   WHY STREAMING AND NOT A HANDOVER.  The obvious shape -- record the whole view, then hand the
+   queue over -- has to run somewhere, and the only window after the wall phase is R_DrawPlanes,
+   where the slave is ALREADY earning its keep (row 5 `Pm`/`Ps` read 8.5/7.9 on hardware: the
+   plane work-steal splits that phase almost evenly).  Taking the planes away to give it the walls
+   would trade one job for another and improve nothing globally.
+   The window that is actually free is `Bp` itself -- 48.6 ms of 4p frame in which the master does
+   pure geometry and the slave does NOTHING.  So the slave drains spans as they appear inside that
+   window, joining after the wall flush and before R_DrawPlanes.  It keeps its half of the planes.
+   🔴 THE DISPATCH IS LAZY -- it fires on the FIRST span of the view, from sat_wallfill_take,
+   NOT at arm time.  Arming before the walk held the slave in the back-off spin for the whole wall
+   phase even when the threshold went on to reject every column, and that spin is NOT free: the 1p
+   A/B of 2026-08-26 read `lp` 12.2 with `lk0` and `b47%` against `lp` 11.8 with the toggle off --
+   ~0.4 ms of master time bought zero pixels.  Dispatching on the first append means the slave's
+   first read already finds work, and a view that queues nothing never wakes it at all.
+   WHY THIS IS SAFE WITHOUT A LOCK, and the fact that makes it so: the SH-2 cache is WRITE-THROUGH
+   by construction -- "Writing from the CPU always produces a write cycle externally", there is no
+   write-back bit (saturn-refs/knowledge/HW_MEMORY_AND_BUS.md, from the manual).  Two CPUs writing
+   different bytes of one cache line therefore cannot clobber each other, so the pixel-disjointness
+   argument that already licenses the plane steal is sufficient here too.  The queue index is read
+   through the UNCACHED mirror so the slave sees the master's appends.
+   The spin between appends touches NO memory (empty asm, registers only): an idle slave polling a
+   cached-through address would steal bus cycles from a master that is memory-bound. */
+static volatile int sat_lead_prod_done_v = 1;
+#define SAT_LEAD_PROD_DONE (*(volatile int *)((unsigned int)&sat_lead_prod_done_v | 0x20000000u))
+#define SAT_LEAD_SPAN_N    (*(volatile int *)((unsigned int)&sat_lead_span_n     | 0x20000000u))
+
+void R_LeadSlaveStream (void)
+{
+    extern int sat_lowres;
+    int lowdraw = (detailshift && !sat_lowres);
+    int drawn = 0;
+    for (;;)
+    {
+	int n = SAT_LEAD_SPAN_N;
+	while (drawn < n)
+	    sat_lead_draw_span (&sat_lead_spans[drawn++], lowdraw);
+	if (SAT_LEAD_PROD_DONE)
+	{
+	    if (drawn >= SAT_LEAD_SPAN_N) return;   /* re-read: the last append can race the flag */
+	    continue;
+	}
+	{ int k; for (k = 0; k < 24; k++) __asm__ __volatile__(""); }   /* back off, no bus access */
+    }
+}
+
 int  R_LeadSpanCount (void) { return sat_lead_span_n; }
 void R_LeadSpanReset (void) { sat_lead_span_n = 0; }
 
@@ -853,6 +939,80 @@ static void sat_lead_span_add (int yl, int yh)
 			sp->iscale = 0; sp->texmid = 0; }
     else              { sp->tex = sat_lead_tex; sp->tcol = sat_lead_tcol; sp->col = sat_lead_fb;
 			sp->iscale = dc_iscale; sp->texmid = dc_texturemid; }
+}
+
+/* 🔴 THE HEIGHT THRESHOLD IS NOT A COMPROMISE, IT IS THE BREAK-EVEN.  A record is 24 bytes;
+   drawing the column costs `count` bytes of framebuffer plus the texture reads.  Below ~24 rows
+   recording is pure loss, above it the slave draws for free in a window the master cannot use.
+   The 1536-entry cap says the same thing from the other side: a 4p view is 160 columns x up to 3
+   tiers = 480 spans, four views = 1920, so an UNFILTERED producer would overflow and
+   sat_lead_span_drop would eat the tail.  One knob, one subject: 0 = off, else the minimum column
+   height that goes to the slave.  Live on pad R+X. */
+/* [!] DEFAULT 24 SINCE 2026-08-26 (owner GO).  Measured better in every configuration tested
+   on Ymir -- 4p `lp` 17.7 against 20.4 with it off, 1p 10.2 against 11.2 -- with `st0` on every
+   capture and no visual artefact.  The one risk left is bus contention between the slave filling
+   columns and the master walking geometry, which console alone can price; it would show up as a
+   HIGHER MST, i.e. slower, never as a wrong pixel.  Pad R+X kills it in one press. */
+int sat_wallfill_min = 24;
+static int sat_wallfill_on;      /* producer OPEN for this view: buffer present, queue reset      */
+static int sat_wallfill_live;    /* slave ACTUALLY dispatched -- i.e. at least one span exists.
+				    Split from `on` so R_WallFillDone can skip the join AND the
+				    cache purge that RP_LeadJoin carries when nothing ever ran. */
+
+/* Record this column for the slave instead of drawing it.  Returns 0 = caller must draw it.
+   Everything the drain needs is already in the dc_* globals the caller just set; the texture is
+   stored as a KEY and re-resolved on the slave, never as an address (see sat_leadspan_t). */
+static int sat_wallfill_take (int tex, int col)
+{
+    if (!sat_wallfill_on || sat_dc_solid) return 0;
+    if (dc_yh - dc_yl + 1 < sat_wallfill_min) return 0;
+    if (sat_lead_span_n >= SAT_LEADSPAN_MAX) { sat_lead_span_drop++; return 0; }
+    SAT_LEAD_KEY (tex, col);
+    sat_lead_span_add (dc_yl, dc_yh);
+    /* WAKE THE SLAVE ON THE FIRST SPAN, once per view -- the append above is already in RAM
+       (write-through), so its first read finds work instead of an empty queue to spin on. */
+    if (!sat_wallfill_live)
+    {
+	extern void RP_AuxDispatch (void (*fn)(void));
+	sat_wallfill_live = 1;
+	RP_AuxDispatch (R_LeadSlaveStream);
+    }
+    /* Row 14 `lk` becomes the OFFLOAD METER: pixels this frame the master did not fill.  `f`/`k`
+       fall by the same amount, which is the point -- they count the master's own colfunc work. */
+    prof_lead_px += (unsigned)(dc_yh - dc_yl + 1);
+    sat_lead_cols++;
+    return 1;
+}
+
+/* Arm the producer for this view and hand the slave the queue.  Lazy, ASK-DO-NOT-DEMAND alloc:
+   the span buffer is 36 KB of zone and this is an OPTIONAL subsystem -- a fatal allocation for one
+   would be the SCYTHE MAP30 fault all over again.  Off => the tiers all draw on the master, byte
+   for byte as before. */
+void R_WallFillArm (void)
+{
+    sat_wallfill_on = 0;
+    sat_wallfill_live = 0;
+    if (sat_wallfill_min <= 0) return;
+    if (!sat_lead_spans)
+    {
+	if (!Z_CanAllocate (sizeof(sat_leadspan_t) * SAT_LEADSPAN_MAX)) return;
+	sat_lead_spans = Z_Malloc (sizeof(sat_leadspan_t) * SAT_LEADSPAN_MAX, PU_STATIC, NULL);
+    }
+    sat_lead_span_n = 0;
+    sat_lead_prod_done_v = 0;      /* write-through -> in RAM before the slave's first read */
+    sat_wallfill_on = 1;      /* the slave is woken by the first sat_wallfill_take, not here */
+}
+
+/* Close the producer and join.  MUST run before R_DrawPlanes: the plane split wants the slave
+   back, and the sprites of the masked pass must land on top of these wall pixels. */
+void R_WallFillDone (void)
+{
+    extern void RP_LeadJoin (void);
+    if (!sat_wallfill_on) return;
+    sat_wallfill_on = 0;
+    sat_lead_prod_done_v = 1;                     /* set BEFORE the join: it is the spin's exit */
+    if (sat_wallfill_live) { RP_LeadJoin (); sat_wallfill_live = 0; }
+    sat_lead_span_n = 0;
 }
 
 #define SAT_LEADH_DEPTH 6     /* ring slots: current + X up to 3, and the jitter pair needs X+1 */
@@ -1340,6 +1500,77 @@ static int sat_wall_try_edge(int texture, int yl1, int yh1, int yl2, int yh2,
 	return 0;                             /* VDP1 bank full */
     sat_we_on = 1; sat_we_lo = xL; sat_we_hi = xR;
     return 1;
+}
+
+/* 🔴 SATURN 2026-08-26 -- THE SOFTWARE TIER DRAW, LIFTED OUT OF THE COLUMN LOOP.
+   The disassembly of the shipped r_segs.o measured ONE loop body at 888 instructions, 336 of them
+   memory accesses (38 %) and 42 stack-address formations -- "mov #N,rX; add r15,rX" before the
+   access, three instructions to reach one variable, the signature of a function that has run out
+   of registers.  For 1630 of 1679 columns (row 14 `c` against `f`) that body has to produce six
+   array writes and nothing else: the VDP1 owns the wall, and `GCS w1/49` proves not even a
+   texture column is resolved for them.
+   The six software-draw blocks -- three tiers x {draw, lead-fill} -- were ~90 lines INLINE in
+   that body.  They never execute on the VDP1 path, but they are still ALLOCATED for: their
+   register demand is what spills the hot path onto the stack, and the hot path jumps over ~600
+   bytes of code it never runs, straddling cache lines that are mostly cold.  Lifting them out
+   costs one call on the 3 % of columns that already call colfunc().
+   [!] ONE implementation, not a duplicated fast loop (owner call, and the right one): the three
+   tiers differ only in WHICH texture / texmid / flat-substitute / wedge they use, so they are one
+   function over a per-seg descriptor.  There is no second copy of this logic to drift.
+   [!] The descriptors are snapshots taken ONCE per seg, which is only legal because every field
+   is constant across the loop: rw_*texturemid is written exclusively in R_StoreWallRange_impl
+   (all of it before this function is entered), and midtexture / toptexture / bottomtexture,
+   wall_solid, io_flat_* and sat_wcl_* are all fixed by the routing preamble above
+   RP_SegRoutMark.  The one field that MOVES per column is the wedge edge -- held BY POINTER.
+   [!] Measured on the SAME clone, before -> after: see docs/ATLAS.md row 4. */
+typedef struct {
+    int		 tex;		/* midtexture / toptexture / bottomtexture		*/
+    fixed_t	 texmid;	/* rw_midtexturemid / rw_toptexturemid / rw_bottom...	*/
+    int		 io_flat;	/* load budget said "no disc this frame" for this tier	*/
+    int		 io_col;	/*   ... and this is the flat colour to use instead	*/
+    int		 solid;		/* wall_solid (potato): one colour, no texture read	*/
+    int		 wcl;		/* Phase-1 wedge: 0 none / 1 clamp dc_yl / 2 clamp dc_yh	*/
+    fixed_t	*wcl_ef;	/* the wedge edge -- STEPPED per column, hence a pointer	*/
+    sat_lead_t	*lead;		/* &sat_lead_mid / _up / _lo				*/
+} sat_tier_t;
+
+/* The software column draw for one tier.  Byte-for-byte the block that was inline here. */
+static void sat_tier_draw (const sat_tier_t *t, int yl, int yh, int texturecolumn)
+{
+    dc_yl = yl;
+    dc_yh = yh;
+    /* Phase-1 wedge: VDP1 owns the tier up to the cut line -> software draws only the residue
+       past it (colfunc tolerates yl > yh, same as vanilla off-screen columns). */
+    if (t->wcl == 1)
+	{ int e = SAT_SHR12 (*t->wcl_ef); if (dc_yl < e) dc_yl = e; }
+    else if (t->wcl == 2)
+	{ int e = SAT_SHR12 (*t->wcl_ef); if (dc_yh > e) dc_yh = e; }
+    dc_texturemid = t->texmid;
+    if (t->solid)
+	sat_wall_color = R_WallPotatoColor (t->tex);
+    else if (t->io_flat)
+	sat_wall_color = t->io_col;		/* SATURN load budget: no disc this frame */
+    else
+	dc_source = R_GetColumn (t->tex, texturecolumn);
+    sat_dc_solid = t->solid || t->io_flat;	/* SATURN: armed for WALL columns only (r_draw.c) */
+    if (!sat_wallfill_take (t->tex, texturecolumn))
+    {	SAT_PROF_FILL ();
+	colfunc (); }
+    sat_dc_solid = 0;
+}
+
+/* LEAD-FILL: VDP1 owns the tier -> draw only what the OLD quad missed. */
+static void sat_tier_lead (const sat_tier_t *t, int x, int yl, int yh, int texturecolumn)
+{
+    int lflat = t->solid || sat_lead_flat;	/* see sat_lead_flat */
+    dc_texturemid = t->texmid;
+    if (lflat)		 sat_wall_color = R_WallPotatoColor (t->tex);
+    else if (t->io_flat) { sat_wall_color = t->io_col; lflat = 1; }
+    else		 { dc_source = R_GetColumn (t->tex, texturecolumn);
+			   SAT_LEAD_KEY (t->tex, texturecolumn); }
+    sat_dc_solid = lflat;
+    sat_lead_draw (t->lead, x, yl, yh);
+    sat_dc_solid = 0;
 }
 
 void R_RenderSegLoop (void)
@@ -2037,6 +2268,27 @@ void R_RenderSegLoop (void)
        tier routing, hysteresis, clamp, subdivision, lead-fill arming, the load-budget gates);
        everything below is per-COLUMN.  They scale with different quantities, so `BP` on row 20
        reports them apart.  Single call, no early return above it -- audited 2026-08-08. */
+    /* The per-seg tier snapshots the lifted helpers read (see sat_tier_t).  Taken HERE, after
+       every routing decision above is final and before the first column.
+       [!] FILLED ON THE SAME TEST THE LOOP READS THEM UNDER.  A seg is EITHER one-sided (mid) OR
+       two-sided (top/bottom), never both, so filling all three unconditionally wrote 96 bytes of
+       stack per seg with half of it unreachable -- and the Ymir A/B priced it exactly: `pr` went
+       10.8-11.6 -> 11.7-12.1 in 4p (187 segs) while `lp` fell 20.6 -> 18.7.  Cutting `lp` by
+       putting the cost back into `pr` would have been the trade the owner rejects; this is the
+       version that does not make it. */
+    sat_tier_t t_mid, t_up, t_lo;
+    if (midtexture)
+	t_mid = (sat_tier_t){ midtexture,    rw_midtexturemid,    io_flat_mid, io_col_mid,
+			      wall_solid, sat_wcl_mid, &sat_wcl_mid_ef, &sat_lead_mid };
+    else
+    {
+	if (toptexture)
+	    t_up = (sat_tier_t){ toptexture,    rw_toptexturemid,    io_flat_up, io_col_up,
+				 wall_solid, sat_wcl_up,  &sat_wcl_up_ef,  &sat_lead_up };
+	if (bottomtexture)
+	    t_lo = (sat_tier_t){ bottomtexture, rw_bottomtexturemid, io_flat_lo, io_col_lo,
+				 wall_solid, sat_wcl_lo,  &sat_wcl_lo_ef,  &sat_lead_lo };
+    }
     RP_SegRoutMark ();
     sat_gc_site = 1;   /* SATURN row 16 `GCS`: from here on, the per-column loop owns the calls */
     for ( ; rw_x < rw_stopx ; rw_x++)
@@ -2047,7 +2299,7 @@ void R_RenderSegLoop (void)
 	int is_edge = sat_we_on && (rw_x <= sat_we_lo || rw_x >= sat_we_hi);
 	if (sat_dbg_overlay_mode == 0) prof_seg_cols++;   /* SATURN row 14 `SEG`: the loop's trip count (gated 2026-08-22) */
 	// mark floor / ceiling areas
-	yl = (topfrac+HEIGHTUNIT-1)>>HEIGHTBITS;
+	yl = SAT_SHR12 (topfrac+HEIGHTUNIT-1);
 
 	// no space above wall?
 	if (yl < ceilingclip[rw_x]+1)
@@ -2068,7 +2320,7 @@ void R_RenderSegLoop (void)
 	    }
 	}
 		
-	yh = bottomfrac>>HEIGHTBITS;
+	yh = SAT_SHR12 (bottomfrac);
 
 	if (yh >= floorclip[rw_x])
 	    yh = floorclip[rw_x]-1;
@@ -2132,39 +2384,9 @@ void R_RenderSegLoop (void)
 	       clip update so floors/ceilings/sprite occlusion stay correct.  EXCEPT a
 	       too-close OR transition wall (sat_sw_mid): the CPU draws it (no swim/explosion). */
 	    if (!sat_wall_skip || sat_sw_mid || is_edge)
-	    {
-		dc_yl = yl;
-		dc_yh = yh;
-		/* Phase-1 wedge: VDP1 owns the tier up to the cut line -> software draws only the
-		   residue past it (colfunc tolerates yl > yh, same as vanilla off-screen columns). */
-		if (sat_wcl_mid == 1)
-		    { int e = (int)(sat_wcl_mid_ef >> HEIGHTBITS); if (dc_yl < e) dc_yl = e; }
-		else if (sat_wcl_mid == 2)
-		    { int e = (int)(sat_wcl_mid_ef >> HEIGHTBITS); if (dc_yh > e) dc_yh = e; }
-		dc_texturemid = rw_midtexturemid;
-		if (wall_solid)
-		    sat_wall_color = R_WallPotatoColor(midtexture);
-		else if (io_flat_mid)
-		    sat_wall_color = io_col_mid;   /* SATURN load budget: no disc this frame */
-		else
-		    dc_source = R_GetColumn(midtexture,texturecolumn);
-		sat_dc_solid = wall_solid || io_flat_mid;   /* SATURN: armed for WALL columns only (see r_draw.c) */
-			SAT_PROF_FILL ();
-		colfunc ();
-		sat_dc_solid = 0;
-	    }
-	    else if (sat_lead_mid.on)   /* LEAD-FILL: VDP1 owns it -> draw only what the OLD quad missed */
-	    {
-		dc_texturemid = rw_midtexturemid;
-		int lflat = wall_solid || sat_lead_flat;   /* see sat_lead_flat */
-		if (lflat)            sat_wall_color = R_WallPotatoColor(midtexture);
-		else if (io_flat_mid) { sat_wall_color = io_col_mid; lflat = 1; }
-		else                { dc_source = R_GetColumn(midtexture, texturecolumn);
-				      SAT_LEAD_KEY (midtexture, texturecolumn); }
-		sat_dc_solid = lflat;
-		sat_lead_draw (&sat_lead_mid, rw_x, yl, yh);
-		sat_dc_solid = 0;
-	    }
+		sat_tier_draw (&t_mid, yl, yh, texturecolumn);
+	    else if (sat_lead_mid.on)
+		sat_tier_lead (&t_mid, rw_x, yl, yh, texturecolumn);
 	    if (sat_wcl_mid) sat_wcl_mid_ef += sat_wcl_mid_es;
 	    ceilingclip[rw_x] = viewheight;
 	    floorclip[rw_x] = -1;
@@ -2175,7 +2397,7 @@ void R_RenderSegLoop (void)
 	    if (toptexture)
 	    {
 		// top wall
-		mid = pixhigh>>HEIGHTBITS;
+		mid = SAT_SHR12 (pixhigh);
 		pixhigh += pixhighstep;
 
 		if (mid >= floorclip[rw_x])
@@ -2184,37 +2406,9 @@ void R_RenderSegLoop (void)
 		if (mid >= yl)
 		{
 		    if (!sat_wall_skip || sat_sw_up || is_edge)   /* VDP1 owns it (unless close/transition); is_edge = edge-fill */
-		    {
-			dc_yl = yl;
-			dc_yh = mid;
-			if (sat_wcl_up == 1)      /* Phase-1 wedge: only the residue past the VDP1 cut line */
-			    { int e = (int)(sat_wcl_up_ef >> HEIGHTBITS); if (dc_yl < e) dc_yl = e; }
-			else if (sat_wcl_up == 2)
-			    { int e = (int)(sat_wcl_up_ef >> HEIGHTBITS); if (dc_yh > e) dc_yh = e; }
-			dc_texturemid = rw_toptexturemid;
-			if (wall_solid)
-			    sat_wall_color = R_WallPotatoColor(toptexture);
-			else if (io_flat_up)
-			    sat_wall_color = io_col_up;
-			else
-			    dc_source = R_GetColumn(toptexture,texturecolumn);
-			sat_dc_solid = wall_solid || io_flat_up;   /* SATURN: WALL columns only (see r_draw.c) */
-				SAT_PROF_FILL ();
-			colfunc ();
-			sat_dc_solid = 0;
-		    }
-		    else if (sat_lead_up.on)   /* LEAD-FILL, see the mid tier */
-		    {
-			dc_texturemid = rw_toptexturemid;
-			int lflat = wall_solid || sat_lead_flat;   /* see sat_lead_flat */
-			if (lflat)           sat_wall_color = R_WallPotatoColor(toptexture);
-			else if (io_flat_up) { sat_wall_color = io_col_up; lflat = 1; }
-			else               { dc_source = R_GetColumn(toptexture, texturecolumn);
-					     SAT_LEAD_KEY (toptexture, texturecolumn); }
-			sat_dc_solid = lflat;
-			sat_lead_draw (&sat_lead_up, rw_x, yl, mid);
-			sat_dc_solid = 0;
-		    }
+			sat_tier_draw (&t_up, yl, mid, texturecolumn);
+		    else if (sat_lead_up.on)
+			sat_tier_lead (&t_up, rw_x, yl, mid, texturecolumn);
 		    ceilingclip[rw_x] = mid;
 		}
 		else
@@ -2231,7 +2425,7 @@ void R_RenderSegLoop (void)
 	    if (bottomtexture)
 	    {
 		// bottom wall
-		mid = (pixlow+HEIGHTUNIT-1)>>HEIGHTBITS;
+		mid = SAT_SHR12 (pixlow+HEIGHTUNIT-1);
 		pixlow += pixlowstep;
 
 		// no space above wall?
@@ -2241,38 +2435,9 @@ void R_RenderSegLoop (void)
 		if (mid <= yh)
 		{
 		    if (!sat_wall_skip || sat_sw_lo || is_edge)   /* VDP1 owns it (unless close/transition); is_edge = edge-fill */
-		    {
-			dc_yl = mid;
-			dc_yh = yh;
-			if (sat_wcl_lo == 1)      /* Phase-1 wedge: only the residue past the VDP1 cut line */
-			    { int e = (int)(sat_wcl_lo_ef >> HEIGHTBITS); if (dc_yl < e) dc_yl = e; }
-			else if (sat_wcl_lo == 2)
-			    { int e = (int)(sat_wcl_lo_ef >> HEIGHTBITS); if (dc_yh > e) dc_yh = e; }
-			dc_texturemid = rw_bottomtexturemid;
-			if (wall_solid)
-			    sat_wall_color = R_WallPotatoColor(bottomtexture);
-			else if (io_flat_lo)
-			    sat_wall_color = io_col_lo;
-			else
-			    dc_source = R_GetColumn(bottomtexture,
-						    texturecolumn);
-			sat_dc_solid = wall_solid || io_flat_lo;   /* SATURN: WALL columns only (see r_draw.c) */
-				SAT_PROF_FILL ();
-			colfunc ();
-			sat_dc_solid = 0;
-		    }
-		    else if (sat_lead_lo.on)   /* LEAD-FILL, see the mid tier */
-		    {
-			dc_texturemid = rw_bottomtexturemid;
-			int lflat = wall_solid || sat_lead_flat;   /* see sat_lead_flat */
-			if (lflat)           sat_wall_color = R_WallPotatoColor(bottomtexture);
-			else if (io_flat_lo) { sat_wall_color = io_col_lo; lflat = 1; }
-			else               { dc_source = R_GetColumn(bottomtexture, texturecolumn);
-					     SAT_LEAD_KEY (bottomtexture, texturecolumn); }
-			sat_dc_solid = lflat;
-			sat_lead_draw (&sat_lead_lo, rw_x, mid, yh);
-			sat_dc_solid = 0;
-		    }
+			sat_tier_draw (&t_lo, mid, yh, texturecolumn);
+		    else if (sat_lead_lo.on)
+			sat_tier_lead (&t_lo, rw_x, mid, yh, texturecolumn);
 		    floorclip[rw_x] = mid;
 		}
 		else

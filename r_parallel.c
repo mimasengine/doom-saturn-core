@@ -189,8 +189,9 @@ static unsigned short p3_t_begin, p3_t_bsp, p3_t_planes;
 /* SATURN 2026-08-06: sub-brackets INSIDE `P` (see RP_MarkP in r_parallel.h).  p3_t_p[0..2] =
    after the VDP1 wall kick / before R_DrawPlanes / after R_DrawPlanes.  Published as tenths-ms
    for the row-20 `PSP` readout so a `P` spike can be attributed instead of assumed. */
-static unsigned short p3_t_p[1];
+static unsigned short p3_t_p[2];
 unsigned int sat_p_kick10 = 0;   /* VDP1 wall kick + R_DrawPlayerSprites (weapon)               */
+unsigned int sat_p_build10 = 0;  /* row 5 `Pv`: R_DrawPlanes entry -> dispatch (worklist build) */
 /* SATURN 2026-08-25: row 4's FOUR Bp sub-terms, summed over the FRAME's views (the raw prof_*
    accumulators they come from are per-view).  Tenths of a ms.  Written by rp_p3_prof_show on the
    last view, read from dg_saturn's per-frame block at the end of DG_DrawFrame.
@@ -1698,6 +1699,19 @@ static unsigned short prof_ms_t0;
    twin `Ps` is slave_pbusy's per-frame delta (already accumulated, was never printed in ms). */
 static unsigned int   prof_mplane;
 static unsigned short prof_mp_t0;
+/* [!] SATURN 2026-08-26 -- prof_flatres: THE FLAT-RESOLUTION SLICE OF `Pv`.
+   This bracket existed once as RP_FlatCacheEnter/Leave and I DELETED IT EARLIER TONIGHT, with
+   the note "two FRT reads per visplane for prof_flatalloc, which nothing has read".  Deleting
+   the inputs is the right cure for a probe nobody wants; it is the WRONG one for a probe whose
+   print was dropped by accident -- and this is that probe.  It is back, and it is DISPLAYED.
+   What it separates, and why the split is the whole point: `Pv` (11.2 ms in 4p) is the visplane
+   worklist build, and the slave is idle through all of it.  The part that RESOLVES THE FLAT
+   allocates (W_CacheLumpNum / R_FlatCacheGet), so the second SH-2 can never run it.  The part
+   after it -- lighting, planeheight, span setup -- is pure compute over independent visplanes,
+   exactly the profile the plane work-steal already exploits.  `Pv - flat` IS the parallelisable
+   budget, and if it is small the offload is not worth its mechanism. */
+static unsigned short prof_fr_t0;
+static unsigned int   prof_flatres;
 /* SATURN PERF (RBG0 candidate sizing): per-frame floor/ceiling FILL accounting.
    pix = total non-sky span pixels (the P fill workload); dom = the largest single
    (picnum,height) flat group's pixels (the RBG0 offload prize); n = non-sky
@@ -1939,6 +1953,16 @@ void RP_MakeSpansEnter(void) {
 void RP_MakeSpansLeave(void) {
 #if RP_PROF
     prof_makespans += (unsigned short)(rp_frt() - prof_ms_t0);
+#endif
+}
+void RP_FlatResEnter(void) {
+#if RP_PROF
+    prof_fr_t0 = rp_frt();
+#endif
+}
+void RP_FlatResLeave(void) {
+#if RP_PROF
+    prof_flatres += (unsigned short)(rp_frt() - prof_fr_t0);
 #endif
 }
 void RP_MPlaneEnter(void) {
@@ -2422,6 +2446,7 @@ void RP_BeginFrame(void)
     prof_segloop = prof_segrout = prof_makespans = 0;                    /* Phase-0a fine split */
     prof_wallhead = prof_walltail = 0; prof_tl_armed = 0;                /* row 4 `hd`/`tl` */
     prof_mplane = 0;                                                     /* row 5 `Pm` (master plane drain) */
+    prof_flatres = 0;                                                    /* row 5 `Pv` 2nd half (flat resolve) */
     prof_seg_cols = prof_seg_fill = prof_seg_px = prof_lead_px = 0;      /* row 14 `SEG` -- lp sizing */
     prof_gc_st[0] = prof_gc_st[1] = prof_gc_st[2] = prof_gc_st[3] = 0;   /* row 16 `GCS` -- who calls */
     prof_gc_sn[0] = prof_gc_sn[1] = prof_gc_sn[2] = prof_gc_sn[3] = 0;
@@ -2478,7 +2503,7 @@ void RP_MarkBSPDone(void)
 void RP_MarkP(int slot)
 {
 #if RP_PROF
-    if ((unsigned)slot < 1u) p3_t_p[slot] = rp_frt();
+    if ((unsigned)slot < 2u) p3_t_p[slot] = rp_frt();
 #else
     (void)slot;
 #endif
@@ -2491,7 +2516,17 @@ void RP_BeginMasked(void)
     /* Attribute `P`.  Note the LAST slice (p3_t_planes - p3_t_p[2]) is the lead-fill JOIN plus the
        trailing NetUpdate/canary -- the join dominates it whenever the slave is late, which is
        exactly the failure mode a bounded spin produces: a huge outlier on an otherwise idle frame. */
-    sat_p_kick10 = (unsigned short)(p3_t_p[0]   - p3_t_bsp)  * 10u / 224u;
+    sat_p_kick10  = (unsigned short)(p3_t_p[0] - p3_t_bsp)  * 10u / 224u;
+    /* [!] SATURN 2026-08-26 -- `Pv`: THE VISPLANE WORKLIST BUILD, the last unnamed slice of `P`.
+       Slot 1 is stamped in r_plane.c immediately before RP_DrawPlanesSplit, so this is
+       R_DrawPlanes from its entry to the dispatch: ~720 lines of flat resolution, lighting and
+       span setup, PER VISPLANE, before either CPU writes a pixel.
+       THE SUBTRACTION THAT MADE IT NECESSARY (4p, TNT, vp50/view): row 2 read P21.7 with a
+       measured kick of 2.2, while row 5 read Pm8.0 / Ps7.1 -- and master and slave run those
+       CONCURRENTLY with w0.0, so the fill costs max(8.0, 7.1) = 8.0, not 15.1.  21.7 - 2.2 - 8.0
+       leaves ~11.5 ms that was neither fill nor wait: ~57 us per visplane of pure preparation.
+       Read it as the CLOSING term: kick + Pv + max(Pm, Ps) must land on `P`. */
+    sat_p_build10 = (unsigned short)(p3_t_p[1] - p3_t_p[0]) * 10u / 224u;
 #endif
     if (!rp_active||rp_disabled) return;
 #if RP_PROF
@@ -2699,19 +2734,20 @@ static void rp_p3_prof_show(void)
     int last = 1;
     {
         extern int sat_split_active, sat_split_view, sat_local_players;
-        static unsigned int r2_bw = 0, r2_bp = 0, r2_p = 0, r2_m = 0;
-        unsigned int s_bw = bw10, s_bp = bp10, s_p = p10, s_m = m10;
+        static unsigned int r2_bw = 0, r2_bp = 0, r2_p = 0, r2_m = 0, r2_pk = 0;
+        unsigned int s_bw = bw10, s_bp = bp10, s_p = p10, s_m = m10, s_pk = sat_p_kick10;
         int nv = 1;
         if (sat_split_active)
         {
             nv = sat_local_players; if (nv > 4) nv = 4; if (nv < 1) nv = 1;
-            r2_bw += bw10; r2_bp += bp10; r2_p += p10; r2_m += m10;
+            r2_bw += bw10; r2_bp += bp10; r2_p += p10; r2_m += m10; r2_pk += sat_p_kick10;
             last = (sat_split_view >= nv - 1);
-            s_bw = r2_bw; s_bp = r2_bp; s_p = r2_p; s_m = r2_m;
-            if (last) { r2_bw = r2_bp = r2_p = r2_m = 0; }
+            s_bw = r2_bw; s_bp = r2_bp; s_p = r2_p; s_m = r2_m; s_pk = r2_pk;
+            if (last) { r2_bw = r2_bp = r2_p = r2_m = r2_pk = 0; }
         }
-        else r2_bw = r2_bp = r2_p = r2_m = 0;   /* leaving split mid-window must not inflate the
-                                                   first frame of the next one */
+        else r2_bw = r2_bp = r2_p = r2_m = r2_pk = 0;   /* leaving split mid-window must not
+                                                   inflate the first frame of the next one */
+        if (s_pk > 9999u) s_pk = 9999u;
         /* SATURN 2026-08-25 -- THE DENOMINATOR, latched on the SAME law as the numerator.
            `Bp / ds` is the one console constant that sizes DECIM, the light-only pass, the
            cheap-seg rung and the FOV cut all at once -- and row-11 `ds` is r_drawseg_peak, a
@@ -2726,8 +2762,22 @@ static void rp_p3_prof_show(void)
             r2_ds += (int)(ds_p - drawsegs);
         }
         if (sat_dbg_overlay_mode == 0 && last) {
-            snprintf(p, sizeof p, "n%d Bw%u.%u Bp%u.%u P%u.%u M%u.%u d%d   ", nv,
-                     s_bw/10,s_bw%10, s_bp/10,s_bp%10, s_p/10,s_p%10, s_m/10,s_m%10,
+            /* [!] SATURN 2026-08-26 -- `P` IS PRINTED SPLIT: P<total>/<kick>.  The second half is
+               sat_p_kick10, which has been COMPUTED EVERY FRAME SINCE THE MarkP(0) probe was
+               written and DISPLAYED NOWHERE -- the exact anti-pattern this project keeps finding:
+               the inputs kept running, only the print was dropped.  r_main.c:1315 already says
+               what it is in words: "Everything above this line is charged to P today but is not a
+               plane" -- the wall-list flush, the VDP1 kick and, IN SPLIT, this view's
+               R_EmitWorldThingsVDP1 (the kick itself is skipped in split, d_main fires one for all
+               four views, but the per-view SPRITE emission is not).
+               Why it was needed: row 5 reads Pm7.2 / Ps7.1 with w0.2, and master and slave run
+               those CONCURRENTLY, so the plane phase should last ~max(7.2, 7.1) + join = ~7.5 ms.
+               Row 2 read P22.6.  ~15 ms of "P" was neither master plane fill, nor slave plane
+               fill, nor waiting -- and it was the largest unnamed block left on the critical path.
+               Accumulated on the SAME law as bw/bp/p/m so a split photo is a FRAME sum. */
+            snprintf(p, sizeof p, "n%d Bw%u.%u Bp%u.%u P%u.%u/%u.%u M%u.%u d%d ", nv,
+                     s_bw/10,s_bw%10, s_bp/10,s_bp%10, s_p/10,s_p%10, s_pk/10,s_pk%10,
+                     s_m/10,s_m%10,
                      r2_ds > 9999 ? 9999 : r2_ds);
             dbg_print(0, 2, p);
         }
@@ -2825,18 +2875,20 @@ static void rp_p3_prof_show(void)
        the peak snapshot folds per view. */
     unsigned int sb_f = sb_d, pb_f = pb_d, p10_f = p10;
     unsigned int mp_f = prof_mplane + prof_makespans, w_f = p3_wait_ticks;
+    unsigned int pvb_f = sat_p_build10;   /* row 5 `Pv`, frame-summed below like the rest */
+    unsigned int fr_f  = prof_flatres;    /* row 5 `Pv`'s 2nd half: the allocating part          */
     {
         extern int sat_split_active, sat_split_view, sat_local_players;
-        static unsigned int fsb = 0, fpb = 0, fp10 = 0, fmp = 0, fw = 0;
+        static unsigned int fsb = 0, fpb = 0, fp10 = 0, fmp = 0, fw = 0, fpv = 0, ffr = 0;
         if (sat_split_active)
         {
             int nv = sat_local_players; if (nv > 4) nv = 4; if (nv < 1) nv = 1;
-            fsb += sb_d; fpb += pb_d; fp10 += p10;
+            fsb += sb_d; fpb += pb_d; fp10 += p10; fpv += sat_p_build10; ffr += prof_flatres;
             fmp += prof_mplane + prof_makespans; fw += p3_wait_ticks;
-            sb_f = fsb; pb_f = fpb; p10_f = fp10; mp_f = fmp; w_f = fw;
-            if (sat_split_view >= nv - 1) { fsb = fpb = fp10 = fmp = fw = 0; }
+            sb_f = fsb; pb_f = fpb; p10_f = fp10; mp_f = fmp; w_f = fw; pvb_f = fpv; fr_f = ffr;
+            if (sat_split_view >= nv - 1) { fsb = fpb = fp10 = fmp = fw = fpv = ffr = 0; }
         }
-        else fsb = fpb = fp10 = fmp = fw = 0;   /* same rule as row 2 above */
+        else fsb = fpb = fp10 = fmp = fw = fpv = ffr = 0;   /* same rule as row 2 above */
     }
     w10 = w_f * 10u / 224u;
     unsigned int busy_pct = rp_master_ms ? (sb_f * 100u / (224u * rp_master_ms)) : 0u;
@@ -3261,9 +3313,32 @@ static void rp_p3_prof_show(void)
         unsigned int ps10 = pb_f * 10u / 224u;
         if (mp10 > 999u) mp10 = 999u;
         if (ps10 > 999u) ps10 = 999u;
-        snprintf(p, sizeof p, "SLV b%u%% Pb%u%% Pm%u.%u Ps%u.%u w%u.%u mw%u ",
-                 busy_pct, pb_pct, mp10/10, mp10%10, ps10/10, ps10%10,
+        /* [!] `Pb%` RETIRED 2026-08-26 and its cells pay for `Pv`.  Pb was pb_f/p10, i.e.
+           exactly Ps / row-2 P -- derivable on sight from two numbers already printed (7.1 / 21.7
+           = 33 %), so it spent 7 of 40 cells restating them.  `Pv` is the visplane worklist
+           build and is derivable from nothing.  With it the plane budget CLOSES on one photo:
+           row-2 kick + Pv + max(Pm, Ps) == row-2 P. */
+        unsigned int pv10 = pvb_f;
+        unsigned int pf10 = fr_f * 10u / 224u;
+        if (pv10 > 999u) pv10 = 999u;
+        if (pf10 > 999u) pf10 = 999u;
+        (void)pb_pct;
+        /* [!] PADDED TO 40 AND CUT AT 40, like the BPS row.  The 4p capture of 2026-08-26 read
+           "... mw0 1": a glyph from a LONGER previous render surviving past the end of a shorter
+           one, because this row was never fixed-width.  Retiring Pb% shortened it and made the
+           ragged tail visible -- the bug was always there, it just had nothing to expose it.
+           A row that can ghost is worse than a missing row: it reads as a live measurement. */
+        /* `Pv<build>/<flat>` and `w<sum>/<max>`.  The wait pair was two fields (`w` and `mw`)
+           asking ONE question -- how long did the master spend waiting on the slave -- so folding
+           them into sum/max is the coherent spelling AND it buys the four cells `Pv`'s second
+           half needs.  `mw` keeps its meaning: the LONGEST single wait this window, read against
+           RP_WAIT_TIMEOUT_FRT (100 ms); pinned at the ceiling = a dying slave. */
+        snprintf(p, sizeof p, "SLV b%u%% Pm%u.%u Ps%u.%u Pv%u.%u/%u.%u w%u.%u/%u"
+                              "                                        ",
+                 busy_pct, mp10/10, mp10%10, ps10/10, ps10%10,
+                 pv10/10, pv10%10, pf10/10, pf10%10,
                  w10/10, w10%10, (unsigned int)(rp_wait_mx / 224u));
+        p[40] = 0;
         rp_wait_mx = 0;
         dbg_print(0, 5, p);
         /* row 20 -- the Bp DECOMPOSITION, all of it describing the frame that set `PK Bp` on row 4.

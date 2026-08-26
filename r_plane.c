@@ -70,9 +70,7 @@ int r_visplane_peak = 0;
    the top-bytes a TIGHT pooled arena would need (x2 for bottom).  Tells us, on Ymir
    (deterministic, identical to HW), exactly how much a span pool could save WITHOUT
    committing to the invasive layout.  Cheap per-frame loop (~n planes), both ports. */
-int r_visplane_coverage_peak = 0;
 /* high-water BYTES of the #1 span pool (0 when SAT_VISPLANE_POOL is off) */
-int r_visplane_pool_peak = 0;
 /* SATURN: planes that overflowed VP_POOL_PLANES this frame -> handed a SHARED
    fallback slice (harmless span glitch, NOT a crash).  If this is ever non-zero
    on a scene you care about, raise VP_POOL_PLANES.  (On the overlay.) */
@@ -141,8 +139,6 @@ static byte *R_PoolSlice (void)
     }
     plane_pool_ptr += VP_SLICE_BYTES;
     used = (int)(plane_pool_ptr - plane_pool);
-    if (used > r_visplane_pool_peak)
-	r_visplane_pool_peak = used;
     return p + 1;   /* base+1: the [-1] pad slot is p[0], [SCREENWIDTH] is p[SCREENWIDTH+1] */
 }
 #endif
@@ -417,7 +413,6 @@ void R_InitPlanes (void)
     plane_pool     = Z_Malloc(VP_POOL_PLANES * 2 * VP_SLICE_BYTES, PU_STATIC, 0);
     plane_pool_ptr = plane_pool;
     plane_pool_end = plane_pool + VP_POOL_PLANES * 2 * VP_SLICE_BYTES;
-    r_visplane_pool_peak = 0;
 #endif
 }
 
@@ -1692,6 +1687,10 @@ void R_DrawPlanes (void)
 	}
 
 	// regular flat
+        /* row 5 `Pv`'s SECOND half opens here: everything to the R_FlatPotatoColor prime below
+           is flat RESOLUTION, and it allocates -- so it can never leave the master.  What sits
+           after it (lighting, planeheight, span setup) is the parallelisable remainder. */
+        { extern void RP_FlatResEnter (void); RP_FlatResEnter (); }
         lumpnum = firstflat + flattranslation[pl->picnum];
 	/* SATURN M/SQ: independent floor vs ceiling software quality.  is_ceil = height>viewz.
 	   eff_potato/eff_ld pick the floor or ceiling SQ flag, carried per-plane on the worklist
@@ -1750,6 +1749,7 @@ void R_DrawPlanes (void)
 	/* LAZY since 2026-08-08, same subject as the wall side: until the budget has actually
 	   refused something (sat_budget_refused, r_segs.c) this dominant colour is never read. */
 	if (flat_paid && sat_budget_refused) R_FlatPotatoColor (lumpnum);
+	{ extern void RP_FlatResLeave (void); RP_FlatResLeave (); }   /* row 5 `Pv` 2nd half */
 
 	planeheight = abs(pl->height-viewz);
 	light = (pl->lightlevel >> LIGHTSEGSHIFT)+extralight;
@@ -2186,6 +2186,11 @@ void R_DrawPlanes (void)
            this gate guarded (RP_WaitPlanes unbounded spin on a mid-menu count flip) was hardened
            away long before (FRT-bounded + idempotent fallback); the MP-off just outlived it.
            Each view's dispatch JOINS inside this call, so no slave work crosses a view switch. */
+        /* row 5 `Pv` closes HERE: everything above in R_DrawPlanes is the worklist BUILD
+           (flat resolution + lighting + span setup, per visplane), everything below is the FILL
+           (Pm on the master, Ps on the slave, concurrently).  See RP_BeginMasked for the
+           subtraction that made this bracket necessary. */
+        { extern void RP_MarkP (int); RP_MarkP (1); }
         if (sat_plane_parallel && n > 1 && (sat_local_players <= 1 || sat_mp_slave))
             RP_DrawPlanesSplit(n);           /* master+slave: static half-split or work-steal (pad Y).
                                                 SATURN M7 2026-07-30: the `!sat_lowres` hard-off is GONE --
