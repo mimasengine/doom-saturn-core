@@ -39,7 +39,6 @@ int sat_flatcache_on    = 1;         // live A/B bypass (pad R+Z)
 int sat_flatcache_slots = 0;
 int sat_flatcache_live  = 0;
 int sat_flatcache_load  = 0;
-int sat_flatcache_evict = 0;
 int sat_flatcache_full  = 0;
 
 static byte *fc_slab = NULL;                    // the one contiguous PU_STATIC block
@@ -57,7 +56,6 @@ void R_ClearFlatCache (void)
     sat_flatcache_slots = 0;
     sat_flatcache_live  = 0;
     sat_flatcache_load  = 0;
-    sat_flatcache_evict = 0;
     sat_flatcache_full  = 0;
 }
 
@@ -148,9 +146,8 @@ byte *R_FlatCacheGet (int lumpnum)
         return NULL;
     }
 
-    if (fc_lump[victim] >= 0)
-        sat_flatcache_evict++;
-    else
+    /* (sat_flatcache_evict REMOVED 2026-08-26 -- row-19 `ev` had no printer.) */
+    if (fc_lump[victim] < 0)
         sat_flatcache_live++;
 
     // THE disc read -- once per flat per residency, instead of once per plane per frame.

@@ -63,8 +63,6 @@ void RP_SkyLeave(void);
 void RP_SegLoopEnter(void);
 void RP_SegRoutMark(void);   /* SATURN: splits SegLoop into routing preamble | per-column loop */
 void RP_SegLoopLeave(void);
-void RP_FlatCacheEnter(void);
-void RP_FlatCacheLeave(void);
 void RP_MakeSpansEnter(void);
 void RP_MakeSpansLeave(void);
 void RP_MPlaneEnter(void);   /* SATURN: master worklist-drain bracket (row 5 `Pm`) -- r_plane.c
@@ -103,13 +101,10 @@ void rp_sgl_workptr_reset(void);
    accumulated per call).  Accumulators are RAW FRT TICKS; the platform converts to ms and resets
    them, because only it knows the window's frame count.  DoomJo-safe: plain C, and the port simply
    gets two extra timer reads per tic. */
-void RP_TicBegin(void);
-void RP_TicEnd(void);
 void RP_ThinkBegin(void);
 void RP_ThinkEnd(void);
 void RP_SightBegin(void);
 void RP_SightEnd(void);
-extern unsigned int sat_tic_total_frt;   /* TryRunTics,    cumulative FRT ticks -- row 24's own `T` */
 extern unsigned int sat_tic_think_frt;   /* P_RunThinkers, cumulative FRT ticks */
 extern unsigned int sat_tic_sight_frt;   /* P_CrossBSPNode, cumulative FRT ticks */
 extern unsigned int sat_tic_runs;        /* P_RunThinkers CALLS = tics run; divides `th` into cost x count */
@@ -145,7 +140,7 @@ extern unsigned int sat_r_setup_frt;     /* R_RenderPlayerView setup, outside Bw
 extern unsigned int sat_tic_avail;       /* d_loop.c: tics TryRunTics ELECTED to run -- `a` vs `x` says
                                             whether the lost tics were never built or built-then-skipped */
 extern unsigned int sat_tic_built;       /* d_loop.c: tics NetUpdate WANTED (`newtics`) -- row 24 `b` */
-extern int sat_thing_masked_cut;         /* r_things.c: sprites sent back to software for a grate -- `mk` */
+/* (sat_thing_masked_cut REMOVED 2026-08-26.)   sprites sent back to software for a grate -- `mk` */
 
 /* SATURN 2026-08-16 -- DRAWSEG BUDGET (defined in r_segs.c, driven by the governor in r_parallel.c,
    spent in R_StoreWallRange, reset per view in RP_BeginFrame).  Bounds the NUMBER of textured segs,
@@ -172,7 +167,6 @@ extern unsigned int sat_gov_act_s;
    first plane rung that can change a pixel over the owner's own SQ.  See the note in r_parallel.c. */
 extern unsigned int sat_gov_act_p;
 extern int sat_gov_p_min;
-extern int sat_gov_p_bites;   /* platform: 1 = the governor's plane floor is ABOVE the owner's SQ */
 
 /* SATURN 2026-08-17 -- row 16 `GCS`: R_GetColumn split by CALL SITE (see the note in r_parallel.c).
    Callers stamp sat_gc_site; 1 = seg-loop tier, 2 = routing preamble, 3 = masked midtexture. */

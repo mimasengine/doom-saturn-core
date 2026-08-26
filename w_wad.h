@@ -70,7 +70,6 @@ int	W_GetNumForName (char* name);
 int	W_LumpLength (unsigned int lump);
 int	W_LumpResident (int lump);   /* SATURN: 1 = W_CacheLumpNum would NOT hit the disc */
 void*	W_LumpCached (int lump);     /* SATURN: pure read, no alloc/no retag -- for the SLAVE SH-2 */
-extern int w_lump_reads;             /* SATURN: cumulative W_ReadLump calls (lumps off the medium) */
 extern unsigned int w_cd_ms10;       /* SATURN: cumulative ms*10 spent in medium commands (see w_wad.c) */
 int	W_LumpPinned (int lumpnum);          /* SATURN: 1 = W_CacheLumpNum must not retag it       */
 /* SATURN: first nbytes of a lump into a private scratch, WITHOUT populating lumpinfo[].cache.

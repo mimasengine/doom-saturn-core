@@ -168,9 +168,8 @@ int sat_things_hw = 1;                      /* platform (sat_apply_mode): 1 = wo
    count-only old default -> byte-identical).  Platform cycles it live (pad L+X); area = full-320 px
    (R_ThingScreenArea).  DoomJo keeps it 0 -> inert. */
 int sat_thing_fill_budget = 0;
-int sat_thing_vdp1_fill   = 0;   /* accumulated VDP1 sprite area this view (overlay)    */
-int sat_thing_vdp1_kept   = 0;   /* sprites kept crisp on VDP1 under the budget         */
-int sat_thing_vdp1_spill  = 0;   /* sprites spilled to software by the budget (overlay) */
+/* (sat_thing_vdp1_fill / _kept / _spill REMOVED 2026-08-26 -- three per-view stores whose
+   overlay field was cut; the budget break below uses the LOCAL acc, not these.) */
 
 
 /* SATURN nearSprites cull (FastDoom, r_things.c:1137): 1 = drop FAR non-shootable decorations before
@@ -185,13 +184,13 @@ int sat_near_sprites = 1;
    Distance is in MAP UNITS and bounds the NON-ENGAGED world only. */
 int sat_thing_role_cull = 1;
 int sat_thing_cull_dist = 1024;
-int sat_thing_role_cut  = 0;
+/* sat_thing_role_cut REMOVED 2026-08-26 -- dead work: the row-21 field was removed and only the
+   per-culled-thing increment survived. */
 /* SATURN: sprites handed back to the software path because a masked midtexture (grate) overlapped
    them -- VDP1 things and NBG1 midtextures have FIXED relative priority and cannot z-sort.  Row 24 `mk`. */
-int sat_thing_masked_cut = 0;    /* SATURN 2026-08-17: now GRATE COLUMNS HIDDEN behind a nearer VDP1
-				    sprite (~1 s window, row 24 `mk`).  It used to count sprites demoted
-				    to software; that cure was worse than the disease (see the note at
-				    the emit site) and the demotion is gone. */
+/* (sat_thing_masked_cut REMOVED 2026-08-26 -- defined, reset every window, read by nobody.
+   It counted GRATE COLUMNS HIDDEN behind a nearer VDP1 sprite for row-24 `mk`, a field that
+   is gone; the demotion it once measured is gone too.) */
 /* ⚠ SATURN 2026-08-17: sat_v1spr_sc[] (nearest VDP1 sprite scale per column) lived here to let
    R_RenderMaskedSegRange hide grate columns behind a monster.  WITHDRAWN the same day on the
    owner's call -- the test used the sprite's BOUNDING BOX, so the grate also vanished in the
@@ -795,7 +794,7 @@ void R_ProjectSprite (mobj_t* thing)
 		   || ((thing->flags & MF_COUNTKILL) && thing->health > 0
 		       && !(thing->flags & MF_CORPSE) && thing->target != NULL);
 	if (!engaged && far > sat_thing_cull_dist)
-	    { sat_thing_role_cut++; return; }
+	    return;
     }
 
     gxt = FixedMul(tr_x,viewcos);
@@ -984,11 +983,11 @@ void R_AddSprites (sector_t* sec)
 	spritelights = scalelight[lightnum];
 
     // Handle all things in sector.
-    /* SATURN sprite-cost profiler: bracket the projection (folded into Bw today). */
+    /* SATURN sprite-cost profiler: count the projected things (row-15 `n`).  The TIME half of
+       this bracket was removed 2026-08-26 -- `pj` had no field and no reader. */
     {
-	extern void RP_SprProjEnter(void); extern void RP_SprProjLeave(int);
+	extern void RP_SprProjLeave(int);
 	int _n = 0;
-	RP_SprProjEnter();
 	for (thing = sec->thinglist ; thing ; thing = thing->snext)
 	{ R_ProjectSprite (thing); _n++; }
 	RP_SprProjLeave(_n);
@@ -1975,9 +1974,6 @@ void R_EmitWorldThingsVDP1 (void)
 			if (acc >= budg) break;   /* budget reached -> the rest stay software */
 		    }
 		}
-		sat_thing_vdp1_fill  = (int)acc;
-		sat_thing_vdp1_kept  = kept;
-		sat_thing_vdp1_spill = nem - kept;
 	    }
 	}
     }

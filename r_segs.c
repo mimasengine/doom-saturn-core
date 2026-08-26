@@ -281,7 +281,8 @@ int sat_wall_lod_hits  = 0;     /* tiers flattened by distance this ~1 s window 
    background.  384 ~ three player-widths: inside that, a sliver is something you are standing next
    to.  `sat_wall_lod_near` counts tiers the floor rescued (~1 s window, row 21 `nr`). */
 int sat_lod_mindist    = 384;
-int sat_wall_lod_near  = 0;
+/* sat_wall_lod_near REMOVED 2026-08-26 -- dead work: row-21 `nr` was never actually added, so
+   this counted once per LOD-rescued seg for nobody. */
 /* SATURN LOD GOVERNOR (controller in r_parallel.c, reported on row 21).  `sat_lod_eff` is the
    threshold the renderer ACTUALLY uses.  One writer (the governor), one reader (below).  There is
    no manual rung and no chord any more -- the governor is unconditional (owner 2026-08-16). */
@@ -419,8 +420,8 @@ int (*sat_wall_edge_hook)(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
 /* Row-8 sizer for L5.  `e<got>/<want>` + `b<L><M><T><R>`: a single capture must be able to explain a
    NULL result, or a flat Bp proves nothing (the `to` lesson -- never judge a lever through an
    instrument that cannot show why it did nothing).  want = tiers that ASKED for the split. */
-int sat_fb_edge_w = 0;     /* tiers that armed the split this frame (the denominator)            */
-int sat_fb_edge_b[4] = {0,0,0,0};  /* bail causes: 0 lateral, 1 magnitude, 2 too-thin, 3 refused */
+/* (sat_fb_edge_w REMOVED 2026-08-26 -- denominator of a rate nothing prints.)                   */
+/* (sat_fb_edge_b[] REMOVED 2026-08-26 -- four bail counters, no reader.)                        */
 
 /* SATURN: when the VDP1 world renderer owns the one-sided walls, skip the software
    midtexture column draw (R_GetColumn + colfunc) for them -> measure the perf the
@@ -512,7 +513,9 @@ int sat_wall_cpu_v1 = SAT_WALL_CPU_V1;
    Plain ints, 0-default, reset per frame by the platform (dg_saturn vdp1_wpn_kick) -> DoomJo links
    AND renders unchanged: it never reads them, and every increment lives inside the sat_wall_skip
    hybrid routing, which is inert on DoomJo (sat_wall_skip == 0). */
-int sat_fb_clamp_t = 0, sat_fb_mag_t = 0, sat_fb_starve_t = 0, sat_fb_px = 0;
+int sat_fb_mag_t = 0, sat_fb_starve_t = 0;   /* sat_fb_clamp_t / sat_fb_px REMOVED 2026-08-26:
+                                                their only readers (fb_cur_*, fb_pk_clamp, fb_pk_px)
+                                                were themselves write-only.  mag/starve DO print. */
 /* SATURN 2026-08-24 -- THE SPAN LEVER'S ACTION COUNTER.  Free-running and GOVERNOR-OWNED, exactly
    like sat_gov_act_w/l and for the same reason: sat_fb_clamp_t above is a PER-FRAME tally the
    platform zeroes on its own schedule, so a controller sampling it would read "no action" at
@@ -535,7 +538,7 @@ unsigned int sat_gov_act_s = 0;
 unsigned int sat_wall_spec_cpu[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 #define SAT_SPEC_CPU(tex) (sat_wall_textured && (tex) > 0 && \
     ((sat_wall_spec_cpu[(((tex) & 255) >> 5)] >> ((tex) & 31)) & 1u))
-int sat_fb_wclamp_t = 0;   /* Phase-1: tiers KEPT on VDP1 by the cut+wedge clamp this frame */
+/* (sat_fb_wclamp_t REMOVED 2026-08-26 -- it fed fb_cur_wclamp, which nothing printed.) */
 
 /* SATURN Phase-1 wall clamp ([[wall-clamp-world-anchored]]): when set, a SPAN-close one-sided
    wall STAYS on VDP1 (clamped swim-free in wall_emit_band via the constant-z linear v->y map)
@@ -604,7 +607,7 @@ static int sat_clip_fcm, sat_clip_ccm, sat_clip_have;
    sat_we_on gates it per seg; 0 = the untouched full-CPU wall, so bailing out never regresses. */
 #define SAT_WALL_EDGE_MIN 12      /* interior columns below which the split is not worth a quad */
 static int sat_we_on, sat_we_lo, sat_we_hi;
-int sat_fb_edge_t = 0;            /* tiers rendered as CPU-borders + VDP1-core this frame (overlay `e`) */
+/* (sat_fb_edge_t REMOVED 2026-08-26 -- the row-8 `e` rate instrumentation was cut and left it.) */
 
 /* LAZY on purpose (Ymir A/B 2026-07-30): the first cut of L2 ran this eagerly once per seg and
    measured EXACTLY ZERO -- because sat_wall_cross_lo returns on its two END-column tests for most
@@ -1169,7 +1172,6 @@ static int sat_wall_cut_floor(fixed_t texmid, int v0, int yl1, int yl2,
 	*w_es = FixedMul(dv, rw_scalestep) >> 4;
 	*w_flag = 1;
     }
-    sat_fb_wclamp_t++;
     return 1;
 }
 
@@ -1225,7 +1227,6 @@ static int sat_wall_cut_ceil(fixed_t texmid, int v1, int yh1, int yh2,
 	*w_es = FixedMul(dv, rw_scalestep) >> 4;
 	*w_flag = 2;
     }
-    sat_fb_wclamp_t++;
     return 1;
 }
 
@@ -1320,10 +1321,10 @@ static int sat_wall_try_edge(int texture, int yl1, int yh1, int yl2, int yh2,
     if (tw <= 1) return 0;
     if (!sat_wall_edge_hook(rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, u1, u2, tw,
                             &xL, &xR, &uL, &uR, &why))
-	{ if (why >= 1 && why <= 2) sat_fb_edge_b[why - 1]++; return 0; }
+	return 0;
     if (xL < rw_x)         xL = rw_x;
     if (xR > rw_stopx - 1) xR = rw_stopx - 1;
-    if (xR - xL < SAT_WALL_EDGE_MIN) { sat_fb_edge_b[2]++; return 0; }
+    if (xR - xL < SAT_WALL_EDGE_MIN) return 0;
     dL = xL - rw_x; dR = xR - rw_x;
     ylL = (topfrac    + topstep    * dL + HEIGHTUNIT - 1) >> HEIGHTBITS;
     yhL = (bottomfrac + bottomstep * dL)                  >> HEIGHTBITS;
@@ -1333,12 +1334,11 @@ static int sat_wall_try_edge(int texture, int yl1, int yh1, int yl2, int yh2,
     {
 	int m = yhL > yhR ? yhL : yhR;
 	sat_wall_clip_need();
-	if (m >= sat_clip_fcm) { sat_fb_edge_b[3]++; return 0; }  /* may dip under a nearer floor -> CPU */
+	if (m >= sat_clip_fcm) return 0;   /* may dip under a nearer floor -> CPU */
     }
     if (sat_wall_hook(xL, ylL, yhL, xR, ylR, yhR, texture, uL, uR, v0, v1, cm))
-	{ sat_fb_edge_b[3]++; return 0; }     /* VDP1 bank full */
+	return 0;                             /* VDP1 bank full */
     sat_we_on = 1; sat_we_lo = xL; sat_we_hi = xR;
-    sat_fb_edge_t++;
     return 1;
 }
 
@@ -1507,13 +1507,13 @@ void R_RenderSegLoop (void)
 	    {
 		if (!sat_v1_mid) {   /* Phase-0: count only the FULLY-CPU tiers (not the [SPAN,V1] VDP1-also pre-warm) */
 		    if (magnified)                  sat_fb_mag_t++;                             /* squish -> clamp can't fix   */
-		    else if (span_close)            { sat_fb_clamp_t++; sat_gov_act_s++; sat_fb_px += s * sx; }  /* pure span  -> clampable     */
+		    else if (span_close)            { sat_gov_act_s++; }                                          /* pure span  -> clampable     */
 		}
 		sat_sw_mid = 1;  if (st) SAT_SEG_EXIT_ARM(st);           /* CPU draws (close/magnified); arm 2 CPU exit-frames */
 		    /* SATURN L5: this tier is about to cost a FULL-SCREEN software wall (the ~22ms
 		       nose-to-wall Bp).  Let the emit site below try the CPU-borders/VDP1-core split
 		       first; it silently leaves everything as-is when the interior is too thin. */
-		    if (sat_opt >= 5) { sat_v1_mid_edge = 1; sat_fb_edge_w++; }
+		    if (sat_opt >= 5) sat_v1_mid_edge = 1;
 	    }
 	    else
 	    {
@@ -1555,8 +1555,8 @@ void R_RenderSegLoop (void)
 		int spec_up = SAT_SPEC_CPU(toptexture), spec_lo = SAT_SPEC_CPU(bottomtexture);
 		int cpu_now = cpu_up || cpu_lo || magnified || spec_up || spec_lo;
 		if (!cpu_now && dst && SAT_SEG_EXIT(dst) == 2) sat_wall_flip++;   /* CPU last frame, VDP1 now */
-		if (cpu_up) { sat_fb_clamp_t++; sat_gov_act_s++; }   /* Phase-0: clampable span (upper door tier) */
-		if (cpu_lo) { sat_fb_clamp_t++; sat_gov_act_s++; }   /* Phase-0: clampable span (lower door tier) */
+		if (cpu_up) { sat_gov_act_s++; }                     /* Phase-0: clampable span (upper door tier) */
+		if (cpu_lo) { sat_gov_act_s++; }                     /* Phase-0: clampable span (lower door tier) */
 		if (spec_up) cpu_up = 1;
 		if (spec_lo) cpu_lo = 1;
 #if !SAT_WALL_SUBDIV
@@ -1662,11 +1662,13 @@ void R_RenderSegLoop (void)
 	       (!sat_v1_mid: the cut can't fix the horizontal squish) nor when the tier ALSO crosses
 	       a deported ceiling (both-sides cut = two wedges; rare -> keep full CPU).
 	       Clamp off / no useful cut / bank full -> the status-quo full-software fallback. */
-	    if (!(sat_wall_clamp && sat_v1_mid
-	          && !(sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2))
-	          && sat_wall_cut_floor(rw_midtexturemid, v0, yl1, yl2, midtexture, u1, u2, cm,
-	                                sat_sw_mid, &sat_wcl_mid_ef, &sat_wcl_mid_es, &sat_wcl_mid)))
-	        { sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }
+	    /* Evaluated for its SIDE EFFECT: the sat_wall_cut_* call performs the clamp.  This was an
+	       if (!(...)) whose body only bumped sat_fb_clamp_t / sat_fb_px -- both had no reader, so the
+	       branch went with them (2026-08-26).  The && chain stays: it short-circuits the call. */
+	    if (sat_wall_clamp && sat_v1_mid
+	        && !(sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2)))
+	        sat_wall_cut_floor(rw_midtexturemid, v0, yl1, yl2, midtexture, u1, u2, cm,
+	                           sat_sw_mid, &sat_wcl_mid_ef, &sat_wcl_mid_es, &sat_wcl_mid);
 	    sat_sw_mid = 1;   /* full tier on a failed clamp; only the WEDGE rows when sat_wcl_mid is armed */
 	    /* SATURN L5 COMPOSITION: the vertical cut above is gated on !magnified, so a MAGNIFIED wall
 	       that ALSO crosses the floor line used to fall straight through to a full software wall --
@@ -1685,10 +1687,12 @@ void R_RenderSegLoop (void)
 	       same prio 5; owner 2026-07-02).  Only when ceilings are deported (sat_vdp1_floor); else
 	       the software ceiling (NBG1 prio 6) covered it.  Phase-1 clamp: mirrored top cut +
 	       software wedge above (sat_wall_cut_ceil); else full CPU as before. */
-	    if (!(sat_wall_clamp && sat_v1_mid
-	          && sat_wall_cut_ceil(rw_midtexturemid, v1, yh1, yh2, midtexture, u1, u2, cm,
-	                               sat_sw_mid, &sat_wcl_mid_ef, &sat_wcl_mid_es, &sat_wcl_mid)))
-	        { sat_fb_clamp_t++; sat_fb_px += (yh1 - yl1) * (rw_stopx - rw_x); }
+	    /* Evaluated for its SIDE EFFECT: the sat_wall_cut_* call performs the clamp.  This was an
+	       if (!(...)) whose body only bumped sat_fb_clamp_t / sat_fb_px -- both had no reader, so the
+	       branch went with them (2026-08-26).  The && chain stays: it short-circuits the call. */
+	    if (sat_wall_clamp && sat_v1_mid)
+	        sat_wall_cut_ceil(rw_midtexturemid, v1, yh1, yh2, midtexture, u1, u2, cm,
+	                          sat_sw_mid, &sat_wcl_mid_ef, &sat_wcl_mid_es, &sat_wcl_mid);
 	    sat_sw_mid = 1;   /* full tier on a failed clamp; only the WEDGE rows when sat_wcl_mid is armed */
 	}
 	else if (sat_v1_mid_edge)
@@ -1783,19 +1787,23 @@ void R_RenderSegLoop (void)
 		{ if (sat_wall_clamp) sat_sw_up = 1; /* SATURN: 816 passed => VISIBLE; end-only "below floor" = pedestal false-positive -> SOFTWARE (per-column floorclip clips).  clamp off: cull as before. */ }
 	    else if (sat_floor_punch_here() && sat_wall_cross_lo(yh1, yh2))
 	    {   /* below the floor somewhere -> Phase-1 world-anchored cut + software wedge; else CPU */
-		if (!(sat_wall_clamp && sat_v1_up
-		      && !(sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2))
-		      && sat_wall_cut_floor(rw_toptexturemid, v0, yl1, yl2, toptexture, u1, u2, cm,
-		                            sat_sw_up, &sat_wcl_up_ef, &sat_wcl_up_es, &sat_wcl_up)))
-		    sat_fb_clamp_t++;
+		/* Evaluated for its SIDE EFFECT: the sat_wall_cut_* call performs the clamp.  This was an
+		   if (!(...)) whose body only bumped sat_fb_clamp_t / sat_fb_px -- both had no reader, so the
+		   branch went with them (2026-08-26).  The && chain stays: it short-circuits the call. */
+		if (sat_wall_clamp && sat_v1_up
+		       && !(sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2)))
+		    sat_wall_cut_floor(rw_toptexturemid, v0, yl1, yl2, toptexture, u1, u2, cm,
+		                             sat_sw_up, &sat_wcl_up_ef, &sat_wcl_up_es, &sat_wcl_up);
 		sat_sw_up = 1;
 	    }
 	    else if (sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2))
 	    {   /* above a nearer deported ceiling -> mirrored top cut + wedge; else CPU as before */
-		if (!(sat_wall_clamp && sat_v1_up
-		      && sat_wall_cut_ceil(rw_toptexturemid, v1, yh1, yh2, toptexture, u1, u2, cm,
-		                           sat_sw_up, &sat_wcl_up_ef, &sat_wcl_up_es, &sat_wcl_up)))
-		    sat_fb_clamp_t++;
+		/* Evaluated for its SIDE EFFECT: the sat_wall_cut_* call performs the clamp.  This was an
+		   if (!(...)) whose body only bumped sat_fb_clamp_t / sat_fb_px -- both had no reader, so the
+		   branch went with them (2026-08-26).  The && chain stays: it short-circuits the call. */
+		if (sat_wall_clamp && sat_v1_up)
+		    sat_wall_cut_ceil(rw_toptexturemid, v1, yh1, yh2, toptexture, u1, u2, cm,
+		                            sat_sw_up, &sat_wcl_up_ef, &sat_wcl_up_es, &sat_wcl_up);
 		sat_sw_up = 1;
 	    }
 #if SAT_WALL_SUBDIV
@@ -1857,19 +1865,23 @@ void R_RenderSegLoop (void)
 		{ if (sat_wall_clamp) sat_sw_lo = 1; /* SATURN: 887 passed => VISIBLE; end-only "below floor" = pedestal false-positive -> SOFTWARE (per-column floorclip clips).  clamp off: cull as before. */ }
 	    else if (sat_floor_punch_here() && sat_wall_cross_lo(yh1, yh2))
 	    {   /* below the floor somewhere -> Phase-1 world-anchored cut + software wedge; else CPU */
-		if (!(sat_wall_clamp && sat_v1_lo
-		      && !(sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2))
-		      && sat_wall_cut_floor(rw_bottomtexturemid, v0, yl1, yl2, bottomtexture, u1, u2, cm,
-		                            sat_sw_lo, &sat_wcl_lo_ef, &sat_wcl_lo_es, &sat_wcl_lo)))
-		    sat_fb_clamp_t++;
+		/* Evaluated for its SIDE EFFECT: the sat_wall_cut_* call performs the clamp.  This was an
+		   if (!(...)) whose body only bumped sat_fb_clamp_t / sat_fb_px -- both had no reader, so the
+		   branch went with them (2026-08-26).  The && chain stays: it short-circuits the call. */
+		if (sat_wall_clamp && sat_v1_lo
+		       && !(sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2)))
+		    sat_wall_cut_floor(rw_bottomtexturemid, v0, yl1, yl2, bottomtexture, u1, u2, cm,
+		                             sat_sw_lo, &sat_wcl_lo_ef, &sat_wcl_lo_es, &sat_wcl_lo);
 		sat_sw_lo = 1;
 	    }
 	    else if (sat_vdp1_floor && sat_wall_cross_hi(yl1, yl2))
 	    {   /* above a nearer deported ceiling -> mirrored top cut + wedge; else CPU as before */
-		if (!(sat_wall_clamp && sat_v1_lo
-		      && sat_wall_cut_ceil(rw_bottomtexturemid, v1, yh1, yh2, bottomtexture, u1, u2, cm,
-		                           sat_sw_lo, &sat_wcl_lo_ef, &sat_wcl_lo_es, &sat_wcl_lo)))
-		    sat_fb_clamp_t++;
+		/* Evaluated for its SIDE EFFECT: the sat_wall_cut_* call performs the clamp.  This was an
+		   if (!(...)) whose body only bumped sat_fb_clamp_t / sat_fb_px -- both had no reader, so the
+		   branch went with them (2026-08-26).  The && chain stays: it short-circuits the call. */
+		if (sat_wall_clamp && sat_v1_lo)
+		    sat_wall_cut_ceil(rw_bottomtexturemid, v1, yh1, yh2, bottomtexture, u1, u2, cm,
+		                            sat_sw_lo, &sat_wcl_lo_ef, &sat_wcl_lo_es, &sat_wcl_lo);
 		sat_sw_lo = 1;
 	    }
 #if SAT_WALL_SUBDIV
@@ -1990,8 +2002,6 @@ void R_RenderSegLoop (void)
 	{
 	    if ((rw_distance >> FRACBITS) > sat_lod_mindist)
 		{ lod_flat = 1; sat_gov_act_w++; }
-	    else
-		sat_wall_lod_near++;
 	}
     }
     /* 🔴 SATURN 2026-08-16 -- THE DRAWSEG BUDGET.  The area rung above degrades walls that are

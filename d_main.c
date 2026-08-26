@@ -179,7 +179,13 @@ void R_ExecuteSetViewSize (void);
 
 /* SATURN split-screen perf breakdown (diagnose the 2p slowdown): ms in each piece of
    the split render block, exposed for the overlay.  0 in 1p (block not entered). */
-unsigned int sat_spl_sw = 0, sat_spl_v0 = 0, sat_spl_v1 = 0, sat_spl_kick = 0;
+unsigned int sat_spl_v0 = 0, sat_spl_v1 = 0, sat_spl_kick = 0;   /* sat_spl_sw REMOVED 2026-08-26: no reader */
+/* SATURN 2026-08-26 -- D_Display outside the per-view timers, per frame in TENTHS of a ms,
+   refreshed once a second by the DISPLAY_DEBUG block at the bottom of D_Display.  Row 14 `dd`.
+   st = the switch + ST_Drawer + I_UpdateNoBlit preamble, hu = HU_Drawer,
+   ot = M_Drawer / NetUpdate / border / pause / misc.  Their sum is the term that R minus the
+   sum of the per-view times minus the VDP1 kick leaves unexplained (~9 ms in 4p). */
+unsigned int sat_dd_st10 = 0, sat_dd_hu10 = 0, sat_dd_ot10 = 0;
 unsigned int sat_spl_v2 = 0, sat_spl_v3 = 0;   /* SATURN: per-view render ms for views 2/3 (3/4p) */
 unsigned int sat_spl_mmap = 0;   /* SATURN 2026-08-25: the 3p minimap, ms.  Printed in row 17's
                                     4th slot, which sat_spl_v3 leaves at 0 in 3p -- the row has no
@@ -454,7 +460,6 @@ void D_Display (void)
 	    sat_psprite_yoff = 0;
 	    sat_vdp2_sky     = sky_save;
 	    sat_vdp2_floor   = floor_save;
-	    sat_spl_sw   = 0;
 	    sat_spl_v0   = (n > 0) ? (tv[1] - tv[0]) : 0;   /* per-view R_RenderPlayerView ms */
 	    sat_spl_v1   = (n > 1) ? (tv[2] - tv[1]) : 0;
 	    sat_spl_v2   = (n > 2) ? (tv[3] - tv[2]) : 0;
@@ -553,27 +558,31 @@ void D_Display (void)
 #if DISPLAY_DEBUG
 	{
 	    /* Sub-phase breakdown of D_Display over a 1s window, in ms (DG_GetTicksMs).
-	       st = switch/ST_Drawer + I_UpdateNoBlit   rp = R_RenderPlayerView (REC+EX)
-	       hu = HU_Drawer   ot = M_Drawer/NetUpdate/border/pause/misc
-	       bl = I_FinishUpdate (the framebuffer blit -- the step-4 SCU-DMA target)
-	       f  = frames in the window (divide each sum by f for per-frame ms).
-	       st+rp+hu+ot+bl should match row-3 "D" (D_Display incl. blit). */
-	    static unsigned int sum_st, sum_rp, sum_hu, sum_ot, sum_bl, dd_win, dd_f;
+	       st = switch/ST_Drawer + I_UpdateNoBlit   hu = HU_Drawer
+	       ot = M_Drawer/NetUpdate/border/pause/misc
+	       🔴 SATURN 2026-08-26 -- THIS BLOCK USED TO COMPUTE AND THROW AWAY.  It formatted a
+	       full line with sprintf every second into dd_dbg, and the ONE line that would have shown
+	       it was commented out ("[overlay lean] ... off for wall/floor work").  DISPLAY_DEBUG stayed
+	       1, so the arithmetic, the five d_ms deltas and the sprintf all kept running for a string
+	       nobody could read.  It is now WIRED: st/hu/ot are exported per frame in tenths of a ms and
+	       printed on row 14 beside SEG.
+	       WHY THESE THREE AND NOT FIVE: `rp` (the views) is already row-17 `=`, and `bl` (the blit)
+	       is already row-1 `b`.  Accumulating them here was duplicate work, so sum_rp/sum_bl are
+	       gone.  st+hu+ot is exactly the part of D_Display that sits OUTSIDE the per-view timers --
+	       the ~9 ms that R - (sum of views) - kick leaves unexplained in 4p. */
+	    static unsigned int sum_st, sum_hu, sum_ot, dd_win, dd_f;
 	    unsigned int now = (unsigned int)d_ms();
 	    sum_st += dd_t1 - dd_t0;
-	    sum_rp += dd_t2 - dd_t1;
 	    sum_hu += dd_t3 - dd_t2;
 	    sum_ot += dd_t4 - dd_t3;
-	    sum_bl += now   - dd_t4;
 	    dd_f++;
 	    if (!dd_win) dd_win = now;
 	    if (now - dd_win >= 1000)
 	    {
-		static char dd_dbg[41];
-		sprintf(dd_dbg, "st%4u rp%4u hu%3u ot%3u bl%4u f%3u",
-			sum_st, sum_rp, sum_hu, sum_ot, sum_bl, dd_f);
-		/* [overlay lean] dbg_print(0, 13, dd_dbg);  -- D_Display split st/rp/hu/ot/bl, off for wall/floor work */
-		sum_st = sum_rp = sum_hu = sum_ot = sum_bl = 0;
+		sat_dd_st10 = dd_f ? (sum_st * 10u) / dd_f : 0u;
+		sat_dd_hu10 = dd_f ? (sum_hu * 10u) / dd_f : 0u;
+		sat_dd_ot10 = dd_f ? (sum_ot * 10u) / dd_f : 0u;
+		sum_st = sum_hu = sum_ot = 0;
 		dd_f = 0;
 		dd_win = now;
 	    }
@@ -707,18 +716,12 @@ int sat_snd_ms = 0;   /* S_UpdateSounds (positional sound update)        */
 void doomgeneric_Tick()
 {
 #if SATURN_TICK_DEBUG
-    uint32_t t0, t1, t2, t3;
-    /* t_entry: wall-clock ms at the very start of this call.
-       Using DG_GetTicksMs() (32-bit ms) instead of the FRT (16-bit, wraps
-       at 73ms) so that phases longer than one FRT period are measured
-       correctly.  G = inter-tick gap; I = intra-tick overhead not in T/S/D. */
-    uint32_t t_entry = d_ms();
-    static uint32_t t_prev_end = 0;
-    static unsigned int sum_gap  = 0;
-    static unsigned int sum_tick = 0;
-    static char dbg[41];
-    if (t_prev_end)
-        sum_gap += t_entry - t_prev_end;
+    /* Only the three stamps that are actually READ survive: t0/t1 give sat_tic_ms (row-1 `T`)
+       and t1/t2 give sat_snd_ms (row-1 `S`).  The entry stamp, the gap/tick accumulators and
+       the 41-byte scratch buffer that used to live here fed nothing but the dead 1 s block at
+       the bottom of this function -- see the note there.  Uses DG_GetTicksMs (32-bit ms) and
+       not the FRT, which wraps at 73 ms and cannot measure a tic this port routinely exceeds. */
+    uint32_t t0, t1, t2;
 #endif
 
     // frame syncronous IO operations
@@ -735,9 +738,7 @@ void doomgeneric_Tick()
        sub-timers use.  `sat_tic_ms` below is d_ms-based and was seen SATURATING at 72-73 ms on
        hardware while the thinkers alone measured 106-110 -- row 24 must be internally consistent
        or its decision rule is worthless.  Row-1 `T` keeps the d_ms value as the cross-check. */
-    RP_TicBegin ();
     TryRunTics (); // will run at least one tic
-    RP_TicEnd ();
 
     V_Canary ("tryruntics");
 
@@ -766,43 +767,16 @@ void doomgeneric_Tick()
     game_phase = 0; /* idle */
     V_Canary ("d_display");
 
-#if SATURN_TICK_DEBUG
-    t3 = d_ms();
-    t_prev_end = t3;
-    sum_tick += t3 - t_entry;
-    {
-        /* 1s window (ms): total in each phase + X = unaccounted.
-           All values are already in ms (DG_GetTicksMs), no /895 needed.
-           G = inter-tick gap; I = intra-tick overhead not in T/S/D. */
-        static unsigned int sum_t, sum_s, sum_d, win_start;
-        unsigned int now = (unsigned int)t3;
-
-        sum_t += t1 - t0;
-        sum_s += t2 - t1;
-        sum_d += t3 - t2;
-        if (win_start == 0)
-            win_start = now;
-        if (now - win_start >= 1000)
-        {
-            unsigned int el  = now - win_start;
-            unsigned int mt  = sum_t;
-            unsigned int ms  = sum_s;
-            unsigned int md  = sum_d;
-            unsigned int mg  = sum_gap;
-            unsigned int mtk = sum_tick;
-            unsigned int X   = el > mt + ms + md ? el - mt - ms - md : 0;
-            /* row 2: T S D X/total  row 3: G(ap) I(ntra) */
-            sprintf(dbg, "T%4u S%4u D%4u X%4u/%4u",
-                    mt, ms, md, X, el);
-            /* [overlay lean] dbg_print(0, 14, dbg);  -- tick budget T/S/D/X, off for now */
-            sprintf(dbg, "G%4u I%4u tk%4u",
-                    mg, X > mg ? X - mg : 0, mtk);
-            /* [overlay lean] dbg_print(0, 15, dbg);  -- G/I/tk, off for now */
-            sum_t = sum_s = sum_d = sum_gap = sum_tick = 0;
-            win_start = now;
-        }
-    }
-#endif
+/* 🔴 SATURN 2026-08-26 -- THE WHOLE TRAILING TICK-DEBUG BLOCK IS GONE, dead end to end.
+   It read the clock twice more per frame (t_entry at the top of this function and t3 here),
+   carried three per-frame accumulators and a static 41-byte buffer, and once a second built
+   TWO full sprintf lines -- into a string neither of whose dbg_print calls was live.  Both had
+   been commented out as "[overlay lean] ... off for now" while SATURN_TICK_DEBUG stayed 1, so
+   the display went and the work did not.  Nothing else read sum_gap, sum_tick or t_prev_end.
+   Every term it showed survives elsewhere and is actually displayed: T = row-1 `T` (still set
+   from t1-t0 above), S = row-1 `S` (t2-t1), D = row-3 `D`, and X -- the unaccounted remainder
+   it inferred by subtraction -- is now row-14 `dd`, measured directly where it happens.
+   t0/t1/t2 stay: they feed sat_tic_ms and sat_snd_ms, which ARE read. */
 }
 
 //

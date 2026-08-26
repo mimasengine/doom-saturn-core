@@ -73,7 +73,6 @@ int r_readlump_short = 0;
    phases with it and DoomJo still compiles.  Answers "the load is 4704 CD commands -- issued BY
    WHAT?" ([[streaming-load-budget-and-flat-treadmill]]).  Cart builds read every lump once at
    W_AddFile and never again, so this stays flat there. */
-int w_lump_reads = 0;
 
 /* SATURN 2026-08-07: cumulative wall-clock spent INSIDE medium commands, in tenths of a ms.
    Owned by core (not by the platform) for one reason: the per-frame texture LOAD BUDGET
@@ -395,7 +394,6 @@ void W_ReadLump(unsigned int lump, void *dest)
     }
 
     l = lumpinfo+lump;
-    w_lump_reads++;
 
     I_BeginRead ();
 

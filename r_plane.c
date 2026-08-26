@@ -1114,10 +1114,20 @@ int         plane_worklist_n;
    platform, main.cxx).  Defined in r_parallel.c with the dispatch. */
 extern int  sat_plane_parallel;
 
-/* draw worklist entries [from,to) -- run by BOTH CPUs via r_parallel.c RP_DrawPlanesSplit:
-   the static half-split (master [0,half) / slave [half,n)) or, when sat_plane_steal=1, the
-   two-pointer work-steal (master fwd from 0 / slave bwd from n-1, one plane per call).  DoomJo /
-   sat_plane_parallel=0 calls it once as (0,n) on the master. */
+/* draw worklist entries [from,to) -- run by BOTH CPUs via r_parallel.c RP_DrawPlanesSplit.
+   🔴 CORRECTED 2026-08-26: this used to describe a CHOICE -- "the static half-split (master
+   [0,half) / slave [half,n)) or, when sat_plane_steal=1, the two-pointer work-steal".  There is
+   no choice.  The static half-split is GONE from the code and `sat_plane_steal` was a GHOST:
+   declared extern in src/dg_saturn.cxx, read only inside `#if SAT_DIAG_SLAVE_TOGGLES` (0),
+   defined nowhere, absent from the linker map.  RP_DrawPlanesSplit does one thing -- a
+   meet-in-the-middle TAS work-steal, master DOWN from n-1 against slave UP from 0.
+   ⚠ And that shape has a ceiling nothing in the code states: the slave's share is bounded by
+   slSlaveFunc's DISPATCH LATENCY, because the master starts claiming immediately.  On the light,
+   packed 160-wide planes of a split view the master routinely takes them all (`m<0`, the branch
+   below that skips the join entirely).  Hardware reads SLV b6% / Pb33% in 4p: the slave wins
+   about a third of the race and is idle the rest of the frame.  A work-steal CANNOT load an idle
+   slave -- only work handed over before the master can reach it can.
+   DoomJo / sat_plane_parallel=0 calls it once as (0,n) on the master. */
 void R_DrawPlaneWorklistRows (int from, int to, int row_lo, int row_hi)
 {
     int i;
@@ -1156,7 +1166,9 @@ int sat_frame_has_sky = 0;
    every sky visplane (any sky mode); sat_floor_px counts the dominant-floor skip => read both in a
    perf-sim floor-on mode (pad-Y mode 1/3).  Absolute pixel counts, reset each frame.  DoomJo-safe. */
 unsigned int sat_sky_px   = 0;
-unsigned int sat_floor_px = 0;
+/* sat_floor_px REMOVED 2026-08-26 -- dead work.  It was incremented once per span row and read
+   by nobody: the row-13 classifier that consumed it was cut on 2026-08-06 and only the producer
+   survived.  sat_sky_px stays -- it still prints. */
 /* SATURN split HW sky (Part 5 -- docs/RBG0_SKY_SPLIT_ANALYSIS.md §5): the SINGLE split view that gets
    the hardware NBG0 sky (its sky region is left index-0, exactly like 1p) which the platform windows to
    that view's band; every OTHER view keeps its software sky.  -1 (default, and DoomJo, and any build
@@ -1461,7 +1473,7 @@ void R_DrawPlanes (void)
 #endif
 
     sat_frame_has_sky = 0;   /* set below if any sky visplane is in view (platform drops NBG0 if not) */
-    sat_sky_px = 0; sat_floor_px = 0;   /* SATURN: sky-vs-floor coverage this frame (classifier) */
+    sat_sky_px = 0;   /* SATURN: sky coverage this frame (sat_floor_px removed 2026-08-26) */
     sat_sky_frt = 0;                    /* SATURN 2026-08-25: software-sky ms, same per-view clock */
     if (!sat_split_active || sat_split_view == sat_rbg0_view)   /* SATURN split: only the punching view resets, so P2 doesn't wipe P1's floor top */
         sat_vdp2_floor_top_y = 0x3FFF;  /* reset; the floor punch below lowers it to the floor's top screen row */
@@ -1675,7 +1687,6 @@ void R_DrawPlanes (void)
 		int yh = pl->bottom[x];
 		if (yl > yh) continue;
 		{ int sr = yl + viewwindowy; if (sr < sat_vdp2_floor_top_y) sat_vdp2_floor_top_y = sr; }  /* track the floor's TOP screen row (its real horizon) */
-		sat_floor_px += (unsigned)(yh - yl + 1);   /* classifier: dominant-floor coverage */
 	    }
 	    continue;
 	}
@@ -1724,7 +1735,6 @@ void R_DrawPlanes (void)
 	if (!fc_src && !io_flat_plane)
 	    fc_src = R_FlatCacheGet (lumpnum);
 	}
-	RP_FlatCacheEnter();   /* SATURN PERF Phase-0a: per-visplane flat allocator cost (c P) */
 	if (fc_src)
 	    ds_source = fc_src;                                   /* pooled: nothing to release */
 	else if (!io_flat_plane)
@@ -1732,7 +1742,6 @@ void R_DrawPlanes (void)
 	    ds_source = W_CacheLumpNum(lumpnum, PU_STATIC);
 	    flat_locked = 1;                                      /* the lock the release sites undo */
 	}
-	RP_FlatCacheLeave();
 	/* PRIME the dominant colour on the frame the budget decides to PAY, now that the flat IS in
 	   memory (pool slot or zone block -- R_FlatPotatoColor peeks the pool, so this never costs a
 	   second read).  It is otherwise only called by the potato mode, which is off in normal play,
@@ -2142,9 +2151,7 @@ void R_DrawPlanes (void)
 	sat_potato_floors = _save_pf; }
 	RP_MakeSpansLeave();
 
-	RP_FlatCacheEnter();
         if (flat_locked) W_ReleaseLumpNum(lumpnum);   /* SATURN: 0 = gated or POOLED -> no lock taken */
-	RP_FlatCacheLeave();
         } /* SATURN: end sorted visplane loop */
     }
 

@@ -257,8 +257,13 @@ Z_Malloc
        W_CacheLumpNum does one when it misses), it purges and coalesces as it walks, and `zw` does
        NOT see it -- zw only counts Z_CanAllocate/Z_LargestAllocatable.  Latched as row-20 `z` =
        the worst single Z_Malloc on the frame.  The 08-07 note "z_scan_steps read 0" retired a STEP
-       counter, never a timer, so nothing here has actually been measured. */
-    RP_StampBegin (3);
+       counter, never a timer, so nothing here has actually been measured.
+       🔴 REMOVED 2026-08-26 -- DEAD WORK.  Row-20 `z` was retired on 2026-08-17 ("it read
+       0-1 on every capture ever taken, its question is answered NO") and its two display columns
+       were given to `q`/`c`.  The DISPLAY went; the BRACKET did not.  Since then every single
+       Z_Malloc has paid two out-of-line calls and two FRT register reads to latch a maximum that
+       r_parallel.c then threw away with an explicit `(void)prof_bp_g_z`.  There is no measurement
+       to weigh here: the output was discarded, so the cost was 100 %% waste at any call count. */
 
     size = (size + MEM_ALIGN - 1) & ~(MEM_ALIGN - 1);
     
@@ -447,7 +452,6 @@ Z_Malloc
 	
     base->id = ZONEID;
 
-    RP_StampEnd (3);            /* SATURN 2026-08-14: row-20 `z`.  The only other exit is I_Error. */
     return result;
 }
 
@@ -681,7 +685,8 @@ void Z_RoverToStart (void)
    with two cache-missing header reads per block, and estimates of the block count ranged 600..1500 --
    i.e. 0.4 ms vs 1.6 ms PER WALK, which decides whether the allocator is the subject or a detail.
    Measure it instead of arguing about it.  Overlay row 22 `zb`. */
-int	z_block_count = 0;
+/* z_block_count REMOVED 2026-08-26 -- row-22 `zb` was cut and left the three stores behind.
+   z_walk_blocks, on the adjacent lines, is the one that still prints. */
 /* SATURN 2026-08-12: how many times the walk ran this overlay window (overlay row 22 `zc`).  The
    product zb x zc is the real cost, and it is the leading explanation of the R_GetColumn hole:
    r_data.c:615 tests this function PER COLUMN on the single-patch path, and at zb~790 blocks one
@@ -722,7 +727,6 @@ int Z_CanAllocate (int size)
             run += block->size;
             if (run >= size)
             {
-                z_block_count = nblk;   /* blocks actually WALKED, not the zone total */
                 z_walk_blocks += nblk;
                 return 1;
             }
@@ -730,7 +734,6 @@ int Z_CanAllocate (int size)
         else
             run = 0;   // unpurgeable block breaks the contiguous run
     }
-    z_block_count = nblk;
     z_walk_blocks += nblk;
     return 0;
 }
@@ -758,7 +761,6 @@ int Z_LargestAllocatable (void)
             run = 0;   // unpurgeable block breaks the contiguous run
     }
 
-    z_block_count = nblk;
     z_walk_blocks += nblk;
     return largest;
 }

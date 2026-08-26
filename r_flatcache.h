@@ -72,7 +72,6 @@ extern int sat_flatcache_on;       // live A/B bypass (pad R+Z).  The slab stays
 extern int sat_flatcache_slots;    // slots carved this level (0 = no pool)
 extern int sat_flatcache_live;     // slots currently holding a flat
 extern int sat_flatcache_load;     // cumulative slot fills = the REAL disc reads for flats
-extern int sat_flatcache_evict;    // cumulative LRU evictions
 extern int sat_flatcache_full;     // times every slot was busy this view -> classic path
 
 #endif

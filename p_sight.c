@@ -38,7 +38,9 @@ divline_t	strace;			// from t1 to t2
 fixed_t		t2x;
 fixed_t		t2y;
 
-int		sightcounts[2];
+/* sightcounts[] REMOVED 2026-08-26 -- dead work.  Vanilla carries it for a stats line this port
+   never had; the two increments sat on the hot LOS path (P_CheckSight is 21-49 %% of the tic)
+   and nothing ever read the array. */
 
 // SATURN: temporal sight cache -- P_CheckSight(t1,t2) for the SAME pair is re-issued every few
 // tics (A_Chase / P_LookForPlayers re-check monster->player) and REJECT is NULL in the big-WAD
@@ -66,7 +68,7 @@ int		sat_sight_cache_tics = SIGHT_CACHE_TICS;
 // ladder 4/8/16 at 120/300 live monsters+barrels, hysteresis bands) -- the staleness is spent
 // exactly where the sight bill is big and the crowd hides it.  0 = manual (pad L+A fixed window).
 int		sat_sight_cache_auto = 1;
-int		sat_sight_cachehit = 0;	// telemetry (cumulative cache hits)
+/* sat_sight_cachehit REMOVED 2026-08-26 -- row-24 `hc` was retired and took its only reader. */
 int		sat_sight_maxdist = 0;	// distance early-out in map units, 0 = off (behaviour-changing; opt-in A/B)
 
 
@@ -365,7 +367,6 @@ P_CheckSight
     // to the full LOS check below (correct, only slower).
     if (rejectmatrix && (rejectmatrix[bytenum]&bitnum))
     {
-	sightcounts[0]++;
 
 	// can't possibly be connected
 	return false;
@@ -380,7 +381,6 @@ P_CheckSight
 	if (c->valid && c->t1 == (void*)t1 && c->t2 == (void*)t2
 	    && (unsigned)(leveltime - c->tic) < (unsigned)sat_sight_cache_tics)
 	{
-	    sat_sight_cachehit++;
 	    return c->result;
 	}
     }
@@ -392,7 +392,6 @@ P_CheckSight
 
     // An unobstructed LOS is possible.
     // Now look from eyes of t1 to any part of t2.
-    sightcounts[1]++;
 
     validcount++;
 	

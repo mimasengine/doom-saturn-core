@@ -168,7 +168,8 @@ int			r_composite_ovf = 0;   // # textures stubbed (extern, overlay 'tc')
 int			r_patch_ovf = 0;
 /* SATURN 2026-08-14: R_GetColumn calls THIS FRAME that found the single-patch lump non-resident,
    i.e. calls that go to the disc.  Reset in RP_BeginFrame, latched with `g` as row-20 `d`. */
-int			r_getcol_disc = 0;
+/* r_getcol_disc REMOVED 2026-08-26 -- row-20 `d` was retired after ONE capture and the counter
+   kept incrementing on every discarded column for nobody. */
 /* SATURN 2026-08-14: textures abandoned by R_GenerateLookup because a column has no patch -- the
    vanilla printf site, which cost 46 ms A PIECE on Saturn.  Cumulative; overlay row 22 `np`.
    Non-zero is NORMAL on TNT/Plutonia; it means those textures render from the composite path. */
@@ -975,7 +976,6 @@ R_GetColumn_impl
 	       ~33 ms (row-12 `t`s / row-0 `ld`): d x 33 ms IS the frame's disc budget, in `g`'s own
 	       milliseconds, with no model in between.  `px` (r_patch_ovf) has read 0 on every capture,
 	       so the garde below never fires and every one of these calls really does go to the disc. */
-	    r_getcol_disc++;
 	    if (!Z_CanAllocate (W_LumpLength (lump) + 64))
 	    {
 		RP_StampEnd (4);

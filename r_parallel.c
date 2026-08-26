@@ -1339,8 +1339,6 @@ unsigned int rp_rend10 = 0;
    extern links even when RP_PROF is off (they then stay 0). */
 int sat_floor_vq_cur  = 0;
 int sat_floor_vq_peak = 0;
-/* pari A sizing (per-subsector "all floors/ceilings as VDP1 quads"), surfaced to the overlay. */
-int sat_prof_ss_n = 0, sat_prof_ss_q = 0, sat_prof_ss_qpk = 0, sat_prof_ss_q4pct = 0;
 
 /* SATURN overlay cost control (written by the platform pad; defined here so both ports link).
    sat_dbg_overlay_mode: 0 = full perf overlay / 1 = fps-only / 2 = off.  Gates the per-frame
@@ -1403,12 +1401,13 @@ static unsigned short rp_frt(void)
 /* SATURN 2026-08-17: `T` left row 24 on 08-16 (T - th was 2-4 ms on every capture, i.e. the game
    tic IS the thinkers).  The accumulator and its bracket are kept but the reads are gone; they cost
    the TLSF pool 1:1, so if the pool ever binds again this is the next thing to delete outright. */
-unsigned int sat_tic_total_frt = 0;
+/* sat_tic_total_frt REMOVED 2026-08-26.  The comment above already said it: "the accumulator and
+   its bracket are kept but the reads are gone ... if the pool ever binds again this is the next
+   thing to delete outright."  Two FRT reads per tic for a value nobody read.  sat_tic_think_frt
+   and sat_tic_sight_frt below STAY -- row 24 prints both. */
 unsigned int sat_tic_think_frt = 0;
 unsigned int sat_tic_sight_frt = 0;
-static unsigned short tic_total_t0, tic_think_t0, tic_sight_t0;
-void RP_TicBegin   (void) { tic_total_t0 = rp_frt(); }
-void RP_TicEnd     (void) { sat_tic_total_frt += (unsigned short)(rp_frt() - tic_total_t0); }
+static unsigned short tic_think_t0, tic_sight_t0;
 /* SATURN 2026-08-16 -- TICS PER FRAME.  `th` is a PER-FRAME mean, so it conflates two different
    things: how long one tic's thinkers take, and HOW MANY TICS landed in this frame.  The maketic
    cap is +8 ([[gametic-slowmotion-tic-cap]]), so at 3,6 fps up to EIGHT tics run inside one frame
@@ -1646,7 +1645,9 @@ static unsigned short prof_sl_t0;
 /* Bp sub-split as PERCENTAGES, latched on the frame that set the window's Bp peak (row 20 `BP`). */
 static unsigned int   prof_bp_r_pct, prof_bp_c_pct, prof_bp_g_pct, prof_bp_g_n, prof_bp_g_ms;
 static unsigned int   prof_bp_g_x;    /* worst SINGLE R_GetColumn call on the PK-Bp frame, in US */
-static unsigned int   prof_bp_g_e, prof_bp_g_a, prof_bp_g_k, prof_bp_g_z;  /* its parts, in MS */
+static unsigned int   prof_bp_g_e, prof_bp_g_a, prof_bp_g_k;  /* its parts, in MS.  `z` (slot 3,
+                                                                  Z_Malloc) removed 2026-08-26 with
+                                                                  its bracket -- see z_zone.c. */
 static unsigned int   prof_bp_g_q, prof_bp_g_c;   /* SATURN 2026-08-17: garde / W_CacheLumpNum */
 unsigned int          sat_bp_zw;     /* zone blocks walked on the PK-Bp frame (overlay row 22 `zw`) */
 static int            prof_bp_bad;   /* 1 = a ratio came out impossible -> row prints `B!` */
@@ -1689,8 +1690,6 @@ static unsigned short prof_gc_mx;       /* max single-call FRT delta this frame 
 static unsigned short prof_st_t0[6], prof_st_mx[6];
 static unsigned int   prof_st_sum[6];   /* SATURN 2026-08-23: the SUM per sub-bracket (global, not peak) */
 static int            prof_in_wp;
-static unsigned int   prof_flatalloc;   /* W_CacheLumpNum/Release per visplane c P  */
-static unsigned short prof_fc_t0;
 static unsigned int   prof_makespans;   /* R_MakeSpans walk + R_MapPlane span math c P */
 static unsigned short prof_ms_t0;
 /* SATURN 2026-08-19 (plane-fill accounting, VDP1-planes verdict probe): the MASTER's share of the
@@ -1717,9 +1716,9 @@ static int            prof_pp_cur_h;
    one-quad test, armed by pad L+B) read Q0/0 everywhere -- silhouette corners; that zero was
    data, not a bug. */
 static unsigned int   prof_plane_quadn;
-static unsigned int   prof_plane_quadpx;
 int sat_plane_quad_n   = 0;             /* per-frame publish for the platform overlay (row 8) */
-int sat_plane_quad_pct = 0;
+/* (sat_plane_quad_pct REMOVED 2026-08-26 -- row 8 prints `Q<n>` only; the percentage half lost
+   its field and kept a per-plane-run accumulator alive to compute it.  sat_plane_quad_n stays.) */
 /* SATURN 2026-08-19 (probe inc-1, "le budget avant le mécanisme"): the run count is an
    OPTIMISTIC bound -- an emitted run must be BANDED (FLOOR_HBAND rows, anti-swim) and TILED
    (a 64x64 flat cannot wrap on VDP1), so the real bill is sum(bands x u-tiles), not 1/run.
@@ -1748,14 +1747,6 @@ static unsigned int   prof_floor_vq_peak; /* monotonic peak of the VDP1 candidat
 /* Q2 probe: quads for INTERIOR surfaces only -- those NOT touching their near screen edge (bottom
    for a floor, top for a ceiling).  These are the bounded-depth patches (cheap + low-swim with
    coarse bands); the near/edge surfaces (the expensive, swim-prone ones) would stay software/RBG0. */
-static unsigned int   prof_floor_vq_int;      /* this frame: interior-only quad estimate */
-static unsigned int   prof_floor_vq_int_peak; /* monotonic peak of the interior-only cost */
-/* pari A sizing (per-subsector): cost if ALL floors/ceilings were VDP1 quads (PowerSlave model). */
-static unsigned int   prof_ss_n;      /* visible subsectors this frame */
-static unsigned int   prof_ss_surf;   /* VDP1-deportable surfaces (floor + non-sky ceiling) */
-static unsigned int   prof_ss_q;      /* geometry quad count (fan pieces, untextured) */
-static unsigned int   prof_ss_q4;     /* surfaces from <=4-sided (pure-quad) subsectors */
-static unsigned int   prof_ss_q_peak; /* monotonic peak of prof_ss_q */
 #define FLOOR_HBAND    16   /* screen rows per affine strip band (the Mode-7 strip granularity) */
 #define FLOOR_MAXTILES 16   /* clamp on 64-texel u-tiles/band (the emitter would cap too) */
 #endif
@@ -1901,7 +1892,12 @@ void RP_StampEnd(int slot)
     if (!prof_in_wp || (unsigned)slot >= 6u) return;
     d = (unsigned short)(rp_frt() - prof_st_t0[slot]);
     if (d > prof_st_mx[slot]) prof_st_mx[slot] = d;
-    prof_st_sum[slot] += d;
+    /* SATURN 2026-08-26 -- ONLY SLOT 5 IS READ.  prof_bp_g_c (row-20 `c`) is the one consumer of
+       this array; slots 0/1/2/4 were accumulated on every stamp and printed nowhere, and slot 4
+       is on the per-column path.  A compare now replaces a literal-pool load + indexed load +
+       add + store on every other stamp.  (No site stamps slot 3 at all any more -- the Z_Malloc
+       bracket was removed earlier today.) */
+    if (slot == 5) prof_st_sum[5] += d;
 #endif
 }
 
@@ -1933,16 +1929,8 @@ void RP_SegLoopLeave(void)   {
         prof_segloop += (unsigned short)(rp_frt() - prof_sl_t0);
 #endif
 }
-void RP_FlatCacheEnter(void) {
-#if RP_PROF
-    prof_fc_t0 = rp_frt();
-#endif
-}
-void RP_FlatCacheLeave(void) {
-#if RP_PROF
-    prof_flatalloc += (unsigned short)(rp_frt() - prof_fc_t0);
-#endif
-}
+/* (RP_FlatCacheEnter/Leave REMOVED 2026-08-26 -- two FRT reads per visplane for prof_flatalloc,
+   which nothing has read since its row-4 field was folded away.) */
 void RP_MakeSpansEnter(void) {
 #if RP_PROF
     prof_ms_t0 = rp_frt();
@@ -1973,22 +1961,19 @@ void RP_MPlaneLeave(void) {
    share; the slave draws the right half untimed here -- so total fill ~= 2x prof_spr_fill
    (or read the existing M row).  Projection is master-only always, so it is complete.
    All bodies compile out unless RP_PROF -> DoomJo and shipping builds link empty stubs. */
-static unsigned int   prof_spr_proj, prof_spr_fill;   /* accumulated FRT ticks, this frame */
-static unsigned short prof_spr_pj0,  prof_spr_fl0;
+static unsigned int   prof_spr_fill;   /* accumulated FRT ticks, this frame (prof_spr_proj removed 2026-08-26) */
+static unsigned short prof_spr_fl0;
 static int            prof_spr_n, prof_spr_draw;       /* things projected / vissprites filled */
 void RP_SprReset(void) {
 #if RP_PROF
-    prof_spr_proj = prof_spr_fill = 0; prof_spr_n = prof_spr_draw = 0;
+    prof_spr_fill = 0; prof_spr_n = prof_spr_draw = 0;
 #endif
 }
-void RP_SprProjEnter(void) {
-#if RP_PROF
-    prof_spr_pj0 = rp_frt();
-#endif
-}
+/* RP_SprProjEnter REMOVED 2026-08-26: its product, prof_spr_proj (`pj`), lost its field and had
+   no reader -- RP_SprStats still writes *proj10 but the platform drops it.  The COUNT half
+   (prof_spr_n, row-15 `n`) is live, so Leave stays. */
 void RP_SprProjLeave(int nthings) {
 #if RP_PROF
-    prof_spr_proj += (unsigned short)(rp_frt() - prof_spr_pj0);
     prof_spr_n += nthings;
 #else
     (void)nthings;
@@ -2008,7 +1993,7 @@ void RP_SprFillLeave(void) {
 /* getter for the platform overlay: tenths-ms (proj, fill) + counts (things, draws). */
 void RP_SprStats(int *proj10, int *fill10, int *nproj, int *ndraw) {
 #if RP_PROF
-    *proj10 = (int)(prof_spr_proj * 10u / 224u);
+    *proj10 = 0;   /* `pj` retired 2026-08-26 -- the platform drops this out-param */
     *fill10 = (int)(prof_spr_fill * 10u / 224u);
     *nproj  = prof_spr_n;
     *ndraw  = prof_spr_draw;
@@ -2042,7 +2027,6 @@ static void rpq_close(int wcols, unsigned int rpix, int rymin, int rymax, int he
     int yb;
     if (wcols < RPQ_MINW) return;
     prof_plane_quadn++;
-    prof_plane_quadpx += rpix;
     ph = (height >= viewz) ? ((fixed_t)height - viewz) : (viewz - (fixed_t)height);
     for (yb = rymin; yb <= rymax; yb += FLOOR_HBAND)
     {
@@ -2184,13 +2168,8 @@ void RP_PlanePixels(int picnum, int height, int minx, int maxx,
        visplanes near-nonexistent -- Q0/0 on every capture.  The piecewise-run pass above is v2.) */
     prof_plane_pix += pix;
     prof_floor_vq  += vq;
-    /* interior = does NOT touch the near screen edge (bottom for a floor, top for a ceiling) */
-    if (ymax >= ymin)
-    {
-        int is_floor  = (height < viewz);
-        int near_edge = is_floor ? (ymax >= viewheight - 1) : (ymin <= 0);
-        if (!near_edge) prof_floor_vq_int += vq;
-    }
+    /* (the interior/near-edge split REMOVED 2026-08-26: it ran per VISPLANE to feed
+       prof_floor_vq_int_peak, whose only reader -- a FLAT snprintf -- was cut long ago.) */
     prof_plane_n++;
     if (picnum == prof_pp_cur_pic && height == prof_pp_cur_h)
     {
@@ -2214,24 +2193,12 @@ void RP_PlanePixels(int picnum, int height, int minx, int maxx,
 #endif
 }
 
-/* SATURN (pari A sizing): per visible subsector, accumulate the would-be VDP1 quad cost if
+/* (REMOVED 2026-08-26) per visible subsector, accumulate the would-be VDP1 quad cost if
    floors+ceilings were drawn as per-subsector quads (the PowerSlave model).  numlines = side
    count; nsurf = deportable surfaces (floor + non-sky ceiling).  pieces = quad-fan pieces for an
    numlines-gon (<=4 sides -> 1 quad; VDP1 draws a 4-gon as one distorted sprite).  GEOMETRY-only
    (untextured) -- texture tiling (bands x 64-wrap) would multiply it.  No-op unless RP_PROF; pure
    C, DoomJo-safe (DoomJo links it but never reads the globals). */
-void RP_Subsector(int numlines, int nsurf)
-{
-#if RP_PROF
-    int pieces = (numlines <= 4) ? 1 : ((numlines - 2 + 1) / 2);
-    prof_ss_n++;
-    prof_ss_surf += (unsigned int)nsurf;
-    prof_ss_q    += (unsigned int)(nsurf * pieces);
-    if (numlines <= 4) prof_ss_q4 += (unsigned int)nsurf;
-#else
-    (void)numlines; (void)nsurf;
-#endif
-}
 
 static void rp_finish(void)
 {
@@ -2452,7 +2419,7 @@ void RP_BeginFrame(void)
        confident finding.  It cost a capture round and a wrong entry in the overlay legend.
        ONE reset site, both paths.  Anything per-frame added below MUST go here. */
     prof_wallprep = 0;                                                   /* Bp accumulator */
-    prof_segloop = prof_segrout = prof_flatalloc = prof_makespans = 0;   /* Phase-0a fine split */
+    prof_segloop = prof_segrout = prof_makespans = 0;                    /* Phase-0a fine split */
     prof_wallhead = prof_walltail = 0; prof_tl_armed = 0;                /* row 4 `hd`/`tl` */
     prof_mplane = 0;                                                     /* row 5 `Pm` (master plane drain) */
     prof_seg_cols = prof_seg_fill = prof_seg_px = prof_lead_px = 0;      /* row 14 `SEG` -- lp sizing */
@@ -2462,19 +2429,17 @@ void RP_BeginFrame(void)
     prof_gc_mx  = 0;                                                     /* worst single call (row 20 `x`) */
     prof_st_mx[0] = prof_st_mx[1] = prof_st_mx[2] = prof_st_mx[3] = 0;   /* row 20 e/a/k    */
     prof_st_mx[4] = prof_st_mx[5] = 0;                                   /* row 20 q/c      */
-    prof_st_sum[0] = prof_st_sum[1] = prof_st_sum[2] = prof_st_sum[3] = 0;
-    prof_st_sum[4] = prof_st_sum[5] = 0;
+    prof_st_sum[5] = 0;   /* the only slot still accumulated -- see RP_StampEnd */
     { extern int z_walk_blocks; z_walk_blocks = 0; }                     /* zone blocks walked / frame */
     /* (r_lookup_rebuilds reset REMOVED 2026-08-10 with row-20 `e` -- see core/r_data.c:507) */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
-    prof_plane_quadn = prof_plane_quadpx = 0;                            /* piecewise-quad probe (row 8 Q) */
+    prof_plane_quadn = 0;                                                /* piecewise-quad probe (row 8 Q) */
     prof_q4_px[0] = prof_q4_px[1] = prof_q4_px[2] = prof_q4_px[3] = 0u;  /* top-4 runs (row 8 E) */
     prof_q4_cmd[0] = prof_q4_cmd[1] = prof_q4_cmd[2] = prof_q4_cmd[3] = 0u;
     prof_pp_cur_sum = prof_pp_cur_vq = 0;
     prof_pp_cur_pic = -2147483647;   /* sentinel: no flat group open yet */
     prof_pp_cur_h   = 0;
-    prof_floor_vq = prof_floor_vq_dom = prof_floor_vq_int = 0;           /* VDP1 floor estimate */
-    prof_ss_n = prof_ss_surf = prof_ss_q = prof_ss_q4 = 0;               /* pari A sizing */
+    prof_floor_vq = prof_floor_vq_dom = 0;                               /* VDP1 floor estimate */
 #endif
     if (rp_disabled) { rp_active=0;
 #if RP_PROF
@@ -2575,7 +2540,6 @@ void RP_BeginMasked(void)
                                       impossible M, out-of-bounds MX -- not on a total-ms bound. */
 int sat_prof_rec_max=0;            /* window max (= p100), tenths-ms */
 int sat_prof_dropped=0;            /* glitch/transition frames excluded from the window */
-int sat_prof_pk_bw=0, sat_prof_pk_bp=0, sat_prof_pk_p=0, sat_prof_pk_m=0;  /* per-phase peaks */
 /* SATURN 2026-08-24: the peak Bp of the CURRENT 1 s overlay window -- what row 20's sub-split
    describes.  Zeroed by the platform on its window tick, so the row follows the game instead of
    freezing on the map's post-load record.  Separate from sat_prof_pk_bp on purpose (row 4's peak
@@ -2638,7 +2602,6 @@ unsigned int sat_gov_act_w = 0, sat_gov_act_l = 0;
        rewrites the four flags per view WITHOUT the max() and the governor's floor never lands. */
 unsigned int sat_gov_act_p = 0;
 int sat_gov_p_min = 1;   /* platform-published: first p rung that changes a pixel (1 or 2) */
-int sat_gov_p_bites = 0; /* platform-published: 1 = the plane floor is landing on THIS view       */
 static unsigned int gov_pr_act0 = 0;
 #define GOV_RETEST 256      /* frames a parole must ripen before the next sector change re-arms */
 extern void *sat_view_sector;                                   /* r_main.c, identity token only */
@@ -2666,7 +2629,7 @@ void RP_ProfReset(void)
     int i; prof_w_recmax=0; prof_w_recn=0;
     for (i=0;i<RP_HBUCKETS;i++) prof_hist[i]=0;
 #endif
-    sat_prof_rec_max=sat_prof_pk_bw=sat_prof_pk_bp=sat_prof_pk_p=sat_prof_pk_m=0;
+    sat_prof_rec_max=0;
     sat_prof_mx_map=sat_prof_mx_x=sat_prof_mx_y=sat_prof_mx_ang=sat_prof_mx_t=0;
     sat_prof_mx_bw=sat_prof_mx_bp=sat_prof_mx_p=sat_prof_mx_m=sat_prof_mx_b=sat_prof_mx_pb=0;
     sat_prof_dom_pct=sat_prof_plane_n=0;
@@ -3172,8 +3135,6 @@ static void rp_p3_prof_show(void)
     }
 
     if (rend <= RP_REC_SANE) {
-        if (bw10 > (unsigned)sat_prof_pk_bw) sat_prof_pk_bw = (int)bw10;
-        if (bp10 > (unsigned)sat_prof_pk_bp) sat_prof_pk_bp = (int)bp10;
         /* SATURN 2026-08-24 -- THE SUB-SPLIT NOW RIDES A 1-SECOND PEAK, NOT THE SESSION PEAK.
            It used to latch on sat_prof_pk_bp, which RP_ProfReset only clears on a map or toggle
            change: once the post-load frame set the record, row 20 froze on it and answered
@@ -3242,7 +3203,6 @@ static void rp_p3_prof_show(void)
                 prof_bp_g_e = BP_T10(prof_st_mx[0]);
                 prof_bp_g_a = BP_T10(prof_st_mx[1]);
                 prof_bp_g_k = BP_T10(prof_st_mx[2]);
-                prof_bp_g_z = BP_T10(prof_st_mx[3]);
                 prof_bp_g_q = BP_T10(prof_st_mx[4]);   /* the garde (W_LumpResident + Z_CanAllocate) */
                 prof_bp_g_c = BP_T10(prof_st_sum[5]);  /* W_CacheLumpNum single-patch, SUM (global) -- the CD-read bill */
 #undef BP_T10
@@ -3253,8 +3213,6 @@ static void rp_p3_prof_show(void)
                    question ever reopens.) */
             }
         }
-        if (p10  > (unsigned)sat_prof_pk_p)  sat_prof_pk_p  = (int)p10;
-        if (m10  > (unsigned)sat_prof_pk_m)  sat_prof_pk_m  = (int)m10;
         if (rend > prof_w_recmax) {
             prof_w_recmax = rend;
             sat_prof_mx_map=gamemap;
@@ -3364,7 +3322,7 @@ static void rp_p3_prof_show(void)
            `BP g197 n363` = 12 chars, inside the columns 0-13 the VDP1 weapon leaves. */
         /* `d` RETIRED after ONE capture, and that is the correct lifetime for it: `d0` on every
            photo, with `ld` moving +6 over the whole run as the independent witness.  The disc is
-           not in R_GetColumn's hot path.  (r_getcol_disc still exists and still counts.) */
+           not in R_GetColumn's hot path.  (r_getcol_disc was REMOVED 2026-08-26 -- no reader.) */
         /* `a` RETIRED 2026-08-14: it bracketed R_GenerateLookup's patch loop and, ever since the
            header-only fetch, reads exactly `e` on every capture -- a field that can only repeat its
            neighbour is a field that has answered.  Its slot still accumulates; only the print is
@@ -3394,7 +3352,6 @@ static void rp_p3_prof_show(void)
                  prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_g_n,
                  prof_bp_g_x, prof_bp_g_a, prof_bp_g_e, prof_bp_g_k,
                  prof_bp_g_q, prof_bp_g_c);
-        (void)prof_bp_g_z;
         dbg_print(0, 20, p);
     }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one
@@ -3407,7 +3364,6 @@ static void rp_p3_prof_show(void)
         if (prof_pp_cur_sum > prof_plane_dom) vdom = prof_pp_cur_vq;   /* fold the last open group */
         vsec = sat_vdp2_floor ? vqtot : (vqtot >= vdom ? vqtot - vdom : 0u);
         if (vsec > prof_floor_vq_peak) prof_floor_vq_peak = vsec;
-        if (prof_floor_vq_int > prof_floor_vq_int_peak) prof_floor_vq_int_peak = prof_floor_vq_int;
         sat_floor_vq_cur  = (int)vsec;
         sat_floor_vq_peak = (int)prof_floor_vq_peak;
         /* RBG0-floor sizer: the dominant single-flat share of plane pixels + visplane
@@ -3434,19 +3390,12 @@ static void rp_p3_prof_show(void)
            [[rp-disabled-kills-flat-wall-modes]] and the 2026-08-08 reset-site rot -- when a
            stat has consumers, grep BOTH copies of the block before believing a zero. */
         sat_plane_quad_n   = (int)prof_plane_quadn;
-        sat_plane_quad_pct = prof_plane_pix ? (int)(prof_plane_quadpx * 100u / prof_plane_pix) : 0;
         {   /* inc-1: increment-0's decision pair -- top-4 runs' real command bill + pixel share */
             unsigned int q4px = prof_q4_px[0] + prof_q4_px[1] + prof_q4_px[2] + prof_q4_px[3];
             sat_plane_q4cmd = (int)(prof_q4_cmd[0] + prof_q4_cmd[1] + prof_q4_cmd[2] + prof_q4_cmd[3]);
             sat_plane_q4pct = prof_plane_pix ? (int)(q4px * 100u / prof_plane_pix) : 0;
         }
     }
-    /* pari A sizing -> globals (platform shows on row 20). */
-    if (prof_ss_q > prof_ss_q_peak) prof_ss_q_peak = prof_ss_q;
-    sat_prof_ss_n     = (int)prof_ss_n;
-    sat_prof_ss_q     = (int)prof_ss_q;
-    sat_prof_ss_qpk   = (int)prof_ss_q_peak;
-    sat_prof_ss_q4pct = prof_ss_surf ? (int)(prof_ss_q4 * 100u / prof_ss_surf) : 0;
 }
 #endif
 
@@ -3537,7 +3486,6 @@ void RP_EndFrame(void)
                (rp_disabled ships and returns before reaching here -- the first three probe
                builds published ONLY from this dead block, hence the owner's Q0/0 rounds). */
             sat_plane_quad_n   = (int)prof_plane_quadn;
-            sat_plane_quad_pct = (tot > 0u) ? (int)(prof_plane_quadpx * 100u / tot) : 0;
             {
                 unsigned int q4px = prof_q4_px[0] + prof_q4_px[1] + prof_q4_px[2] + prof_q4_px[3];
                 sat_plane_q4cmd = (int)(prof_q4_cmd[0] + prof_q4_cmd[1] + prof_q4_cmd[2] + prof_q4_cmd[3]);
