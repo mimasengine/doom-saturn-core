@@ -35,6 +35,7 @@ extern  int		r_opening_ovf;       // redirects this frame (0 = no overflow)
    r_opening_ovf only fires once it is ALREADY too late; THIS is the number that sizes
    MAXOPENINGS (40 960 B of .bss against a ~31 KB TLSF pool).  Row 11 `o`, in SCREENWIDTH rows. */
 extern  int		r_opening_peak;
+extern  int		r_opening_demand;   /* SATURN: per-view request total; folded into the peak (see r_plane.c) */
 
 
 typedef void (*planefunction_t) (int top, int bottom);

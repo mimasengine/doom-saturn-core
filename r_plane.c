@@ -100,12 +100,31 @@ visplane_t*		ceilingplane;
 #ifndef VP_POOL_PLANES
 #define VP_POOL_PLANES   MAXVISPLANES   /* core default = no saving (safe). Mimas overrides via -DVP_POOL_PLANES=N in its Makefile to reclaim zone for big WADs; size to r_visplane_peak + margin. */
 #endif
-#define VP_SLICE_BYTES   (SCREENWIDTH + 2)
+/* SATURN 2026-08-25 -- THE STRIDE FOLLOWS THE VIEW, NOT THE SCREEN.  pl->minx/maxx are
+   VIEW-relative (r_segs.c hands R_CheckPlane an x in [0,viewwidth); the VP_DIAG check below
+   asserts it), and plane_pool_ptr is bump-reset PER VIEW in R_ClearPlanes -- so in a 160-px
+   3/4p quadrant the top 160 bytes of every 322-byte slice were never touched.  Deriving the
+   stride from viewwidth holds 127 planes in 4p out of the SAME 41 KB allocation, which is
+   exactly where the pool was measured overflowing (TNT MAP01 4p: vp66.2 / vp67.8, i.e. 2 then
+   8 slices served from the shared vp_fallback, whose spans are corrupt by construction).
+   The alternative -- VP_POOL_PLANES 64 -> 80 -- costs 10 304 B of the zone the big-WAD loader
+   is already short of.  This costs one load instead of a constant, ~130 calls a frame.
+   ⚠ THE STRIDE AND THE THREE SCREENWIDTH SITES BELOW MUST MOVE TOGETHER: R_FindPlane and
+   R_CheckPlane each memset SCREENWIDTH bytes into a slice and R_FindPlane inits minx to
+   SCREENWIDTH.  Leaving any of them at 320 with a 162-byte stride overruns the NEXT slice by
+   158 bytes -- silent, and it would look like a visplane corruption bug.  All four are marked
+   `SATURN fov/stride` so a grep finds the set.
+   ⚠ VP_SLICE_MAX vs VP_SLICE_BYTES: the three STATIC arrays below (vp_fallback and the two
+   overflow slices) must be sized by a compile-time constant, so they keep the 1p worst case.
+   Only the POOL ARITHMETIC uses the per-view stride. */
+#define VP_SLICE_MAX     (SCREENWIDTH + 2)            /* compile-time: static array sizing */
+static int vp_slice_bytes = VP_SLICE_MAX;             /* per view, set in R_ClearPlanes */
+#define VP_SLICE_BYTES   vp_slice_bytes
 static byte	*plane_pool;
 static byte	*plane_pool_ptr;
 static byte	*plane_pool_end;
 
-static byte vp_fallback[VP_SLICE_BYTES];   /* shared slice handed out on overflow */
+static byte vp_fallback[VP_SLICE_MAX];   /* shared slice handed out on overflow */
 static byte *R_PoolSlice (void)
 {
     byte *p = plane_pool_ptr;
@@ -138,8 +157,8 @@ static byte *R_PoolSlice (void)
    caller's memset + span writes off the zone heap. */
 int r_visplane_ovf = 0;   /* overflow hand-outs (endgame limits telemetry; peers r_visplane_peak) */
 #if SAT_VISPLANE_POOL
-static byte overflow_top_slice[VP_SLICE_BYTES];
-static byte overflow_bot_slice[VP_SLICE_BYTES];
+static byte overflow_top_slice[VP_SLICE_MAX];
+static byte overflow_bot_slice[VP_SLICE_MAX];
 #endif
 static visplane_t overflowplane;
 static visplane_t *R_OverflowPlane (fixed_t height, int picnum, int lightlevel,
@@ -200,8 +219,25 @@ static void R_HashInsert (int bucket, int idx)
     visplane_hashtail[bucket] = (short)idx;
 }
 
-// ?
-#define MAXOPENINGS	SCREENWIDTH*64
+/* 🔴 SATURN 2026-08-26 -- 64 -> 16 ROWS, sized by MEASUREMENT for the first time.
+   Vanilla's 64 is a guess carried since 1993 ("// ?" was literally the whole comment).  It cost
+   SCREENWIDTH*64*2 = 40 960 B of .bss -- MORE THAN THE ENTIRE TLSF POOL (29 088 B) -- for an
+   array nothing had ever profiled.  r_opening_demand (below) was added on 2026-08-25 precisely
+   to size it, and the answer came back the same on every capture taken since:
+     * row 11 `o1`..`o2` on 14/14 Ymir captures -- shareware E1M1 AND TNT MAP01, 1p through 4p,
+       action included -- i.e. peak per-view demand <= 640 of the 20 480 words, under 3.2 %.
+     * row 22 `op0` throughout: the overflow redirect has never once fired.
+   16 rows = 5 120 words = 10 240 B keeps a 8x margin over the worst reading and returns
+   30 720 B.  Deliberately NOT the 8 rows the first arithmetic suggested: the extra 5 KB of
+   margin is cheap next to a 30 KB win, and `o` is a high-water, not a ceiling -- the
+   theoretical worst is 3 writes x width x MAXDRAWSEGS = 245 760 words, 12x even the OLD array.
+   That gap is why the garde below is the real safety net and this number is a probability bet:
+   an overrun is a bounded HOM on those segs (never corruption), and row-22 `op` rings when it
+   happens.  ⚠ If `op` is ever non-zero on a real map, raise this -- do not remove the garde.
+   ⚠ Checked before cutting, per the ATLAS warning: row-4 `tl` reads 0.7 ms on the same frame,
+   so the four openings memcpy ARE running -- `o1` is genuine headroom and not the symptom of a
+   Mimas wall mode skipping the silhouette store. */
+#define MAXOPENINGS	SCREENWIDTH*16
 short			openings[MAXOPENINGS];
 short*			lastopening;
 /* SATURN garde-OPENINGS (crash-proof, mirrors the P0 overflowplane/pool sinks): the shared openings
@@ -219,6 +255,15 @@ int			r_opening_ovf = 0;
    fires once it is ALREADY too late (the redirect into opening_overflow).  Folded per view in
    R_ClearPlanes below; the platform keeps the ~1 s window high-water (row 11 `o`). */
 int			r_opening_peak = 0;
+/* 🔴 SATURN 2026-08-25 -- WHY THIS IS DEMAND AND NOT CONSUMPTION.  r_opening_peak used to fold
+   (lastopening - openings), which SATURATES BY CONSTRUCTION: all three sinks in r_segs.c
+   redirect into opening_overflow WITHOUT advancing lastopening, so the moment the array is too
+   small the counter pins at MAXOPENINGS and can never say BY HOW MUCH.  Cutting MAXOPENINGS on
+   a consumption reading would therefore have destroyed the only instrument that can size the
+   cut -- the classic case of an instrument that measures its own ceiling.  r_opening_demand
+   accumulates what every caller ASKED for, sink or no sink, so the reading stays meaningful at
+   any array size and the cut becomes order-independent. */
+int			r_opening_demand = 0;
 
 
 //
@@ -533,14 +578,14 @@ void R_ClearPlanes (void)
        (sizes #2 MAXVISPLANES and #1 the pooled arena -- both deterministic, so
        Ymir's reading == hardware's). */
     {
+        /* SATURN 2026-08-25: the O(visplanes) span-coverage walk that used to sit here is GONE.
+           r_visplane_coverage_peak had exactly one other mention in the whole tree -- an
+           `extern` in dg_saturn.cxx that no format string ever consumed -- so it was up to 66
+           iterations of load/compare/add PER VIEW (264 a frame in 4p) feeding a number nobody
+           read, on the one per-view block that sits OUTSIDE every phase bracket.  The peak
+           itself is kept: it is one comparison and rows 11/22 both depend on it. */
         int n = (int)(lastvisplane - visplanes);
-        visplane_t *p;
-        int cov = 0;
         if (n > r_visplane_peak) r_visplane_peak = n;
-        for (p = visplanes; p < lastvisplane; p++)
-            if (p->maxx >= p->minx)
-                cov += p->maxx - p->minx + 1;
-        if (cov > r_visplane_coverage_peak) r_visplane_coverage_peak = cov;
     }
 #if VP_DIAG
     vp_in_bad = vp_draw_bad = vp_map_bad = 0;   /* per-frame reset */
@@ -549,10 +594,14 @@ void R_ClearPlanes (void)
     /* SATURN 2026-08-25: fold the HIGH-WATER before the reset wipes it.  R_ClearPlanes runs
        once per VIEW, so this is the max over every view of the window, and the 1p full-width
        case is the maximum by construction (a 160-px quadrant cannot out-consume 320). */
-    { int op = (int)(lastopening - openings); if (op > r_opening_peak) r_opening_peak = op; }
+    { if (r_opening_demand > r_opening_peak) r_opening_peak = r_opening_demand; }
+    r_opening_demand = 0;
     lastopening = openings;
     r_opening_ovf = 0;   /* SATURN garde-OPENINGS: per-frame reset of the overflow-redirect count */
 #if SAT_VISPLANE_POOL
+    /* SATURN fov/stride: size this view's slices before the first R_PoolSlice of the pass.
+       viewwidth is 320 in 1p and 160 in 2p/3p/4p, so the same 41 KB holds 64 or 127 planes. */
+    vp_slice_bytes = viewwidth + 2;
     plane_pool_ptr = plane_pool;   /* bump-reset the span pool for the new frame */
     if (r_visplane_pool_ovf > r_visplane_pool_ovf_pk)
 	r_visplane_pool_ovf_pk = r_visplane_pool_ovf;   /* survive the per-view reset -> overlay `vp<peak>.<ovf>` */
@@ -571,8 +620,11 @@ void R_ClearPlanes (void)
     angle = (viewangle-ANG90)>>ANGLETOFINESHIFT;
 	
     // scale will be unit scale at SCREENWIDTH/2 distance
-    basexscale = FixedDiv (finecosine[angle],centerxfrac);
-    baseyscale = -FixedDiv (finesine[angle],centerxfrac);
+    /* SATURN fov: the span step divides by the FOCAL, which vanilla wrote as centerxfrac
+       because the two coincide at 90 degrees.  `projection` carries the focal now and is
+       byte-for-byte centerxfrac at the default, so this is an identity until L+Y moves it. */
+    basexscale = FixedDiv (finecosine[angle],projection);
+    baseyscale = -FixedDiv (finesine[angle],projection);
 }
 
 
@@ -648,7 +700,7 @@ R_FindPlane
     check->height = height;
     check->picnum = picnum;
     check->lightlevel = lightlevel;
-    check->minx = SCREENWIDTH;
+    check->minx = viewwidth;   /* SATURN fov/stride: the slice is viewwidth+2 wide */
     check->maxx = -1;
     if (vp_flags)
     {
@@ -666,7 +718,7 @@ R_FindPlane
     /* SATURN: explicit length (was sizeof(top)) -- correct for BOTH the inline array
        (==SCREENWIDTH, byte-identical) and the pooled pointer (sizeof would be 4!).
        Covers top[0..SCREENWIDTH-1]; the [minx-1]/[maxx+1] sentinels are set at draw. */
-    memset (check->top,0xff,SCREENWIDTH);
+    memset (check->top,0xff,viewwidth);   /* SATURN fov/stride: NOT SCREENWIDTH -- see VP_SLICE_BYTES */
 
     if (sat_visplane_hash)
         R_HashInsert (bucket, (int)(check - visplanes));
@@ -785,7 +837,7 @@ R_CheckPlane
     pl->top    = R_PoolSlice ();   /* the split plane gets its own slices */
     pl->bottom = R_PoolSlice ();
 #endif
-    memset (pl->top,0xff,SCREENWIDTH);   /* explicit length (see R_FindPlane note) */
+    memset (pl->top,0xff,viewwidth);   /* SATURN fov/stride: NOT SCREENWIDTH -- see VP_SLICE_BYTES */
 
     if (sat_visplane_hash)
     {

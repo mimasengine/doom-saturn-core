@@ -2651,6 +2651,7 @@ R_StoreWallRange_impl
 	    maskedtexture = true;
 	    // SATURN garde-OPENINGS: if the shared pool would overflow, sink this seg's masked-column
 	    // table into opening_overflow (harmless writes, garbage-column HOM) instead of corrupting RAM.
+	    r_opening_demand += rw_stopx - rw_x;   /* SATURN: DEMAND, counted on both branches */
 	    if (lastopening + (rw_stopx - rw_x) > openings_end)
 	    { ds_p->maskedtexturecol = maskedtexturecol = opening_overflow - rw_x; r_opening_ovf++; }
 	    else
@@ -2774,6 +2775,7 @@ R_StoreWallRange_impl
     if ( ((ds_p->silhouette & SIL_TOP) || maskedtexture)
 	 && !ds_p->sprtopclip)
     {
+	r_opening_demand += rw_stopx - start;   /* SATURN: DEMAND, counted on both branches */
 	if (lastopening + (rw_stopx - start) > openings_end)   /* SATURN garde-OPENINGS: sink (bounded copy = HOM, not corruption) */
 	{ memcpy (opening_overflow, ceilingclip+start, 2*(rw_stopx-start)); ds_p->sprtopclip = opening_overflow - start; r_opening_ovf++; }
 	else
@@ -2787,6 +2789,7 @@ R_StoreWallRange_impl
     if ( ((ds_p->silhouette & SIL_BOTTOM) || maskedtexture)
 	 && !ds_p->sprbottomclip)
     {
+	r_opening_demand += rw_stopx - start;   /* SATURN: DEMAND, counted on both branches */
 	if (lastopening + (rw_stopx - start) > openings_end)   /* SATURN garde-OPENINGS: sink (bounded copy = HOM, not corruption) */
 	{ memcpy (opening_overflow, floorclip+start, 2*(rw_stopx-start)); ds_p->sprbottomclip = opening_overflow - start; r_opening_ovf++; }
 	else
