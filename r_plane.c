@@ -2162,7 +2162,6 @@ void R_DrawPlanes (void)
        the deferred flat locks (no-op on the cart, where W_CacheLumpNum is a direct pointer). */
     {
         extern int sat_plane_parallel, sat_local_players;
-        extern int sat_mp_slave;         /* r_parallel.c: slave shares allowed in split (2026-08-20) */
         extern void RP_DrawPlanesSplit(int n);
         int n = plane_worklist_n, i;
         /* SATURN M7 (2026-07-17): draw the queued planes MASTER-ONLY in lowres.  The slave
@@ -2191,7 +2190,7 @@ void R_DrawPlanes (void)
            (Pm on the master, Ps on the slave, concurrently).  See RP_BeginMasked for the
            subtraction that made this bracket necessary. */
         { extern void RP_MarkP (int); RP_MarkP (1); }
-        if (sat_plane_parallel && n > 1 && (sat_local_players <= 1 || sat_mp_slave))
+        if (sat_plane_parallel && n > 1)   /* sat_mp_slave baked ON 2026-08-26: split shares the slave */
             RP_DrawPlanesSplit(n);           /* master+slave: static half-split or work-steal (pad Y).
                                                 SATURN M7 2026-07-30: the `!sat_lowres` hard-off is GONE --
                                                 HW-validated as the shipped default (SLV b23% Pb59%, to=0,

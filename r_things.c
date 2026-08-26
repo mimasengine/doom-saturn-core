@@ -176,7 +176,9 @@ int sat_thing_fill_budget = 0;
    the projection math (they subtend a few px, invisible).  Live A/B via pad R+X (platform); default
    0 = vanilla (draw every projected sprite); 1 = cull far decorations.  Shootable actors
    (monsters/barrels) are NEVER culled.  Default ON (HW-validated 2026-07-09, pad R+X to A/B off). */
-int sat_near_sprites = 1;
+/* (sat_near_sprites REMOVED 2026-08-26 -- baked ON.  It had had NO WRITER since its R+X chord
+   was reclaimed, and row-7 `ns` was cut on 2026-08-09 for printing a constant as if it were a
+   knob -- so it was neither settable nor observable.  Revive by restoring the guard below.) */
 /* SATURN 2026-08-16 -- ROLE CULL (see R_ProjectSprite).  Default ON: the owner authorised the rule
    explicitly (*"Ok pour couper les éléments AUTRES que monstres actifs, poursuivant ou attaquant le
    joueur"*), and unlike a plain distance cull it cannot make a threat disappear.  DoomJo leaves it
@@ -205,11 +207,11 @@ int sat_thing_cull_dist = 1024;
    byte-identical in 1p / when off.  HW-tune on Bp/M + SPR n (row 15).  NOTE: xscale is a DEPTH proxy
    (projection/z), so on-screen px = spritewidth*xscale/FRACUNIT -- the px figures below assume a 64px
    sprite; a 128px boss subtends ~2x, i.e. its effective cull floor is ~2x larger. */
-int sat_split_thingcull = 1;   /* DEFAULT-ON 2026-07-15: split thing-cull is impractical to A/B on HW
-                                  (needs a monster-dense room = can't stand still to read the overlay),
-                                  and the thresholds are conservative (monsters/missiles only culled
-                                  sub-~1px), so ship it on -- it only bites in a split (sat_split_active)
-                                  and only drops sprites already near-invisible.  Pad L+Left toggles. */
+/* BAKED ON 2026-08-26 (settled-toggle sweep).  sat_split_thingcull is gone, and its own
+   definition is why: it said "DEFAULT-ON 2026-07-15: split thing-cull is impractical to A/B
+   on HW (needs a monster-dense room = can't stand still to read the overlay), and the
+   thresholds are conservative".  A knob nobody can measure should not hold a pad chord.
+   Reviving it means restoring the `&& sat_split_thingcull` in R_ProjectSprite above. */
 #define SAT_SPLIT_CULL_DECOR (FRACUNIT / 12)   /* decoration/pickup depth floor (~5px of a 64px sprite) */
 #define SAT_SPLIT_CULL_ACTOR (FRACUNIT / 40)   /* actor/missile depth floor (~1.5px -- near-invisible)  */
 static char sat_thing_vdp1[MAXVISSPRITES];  /* per-vissprite (by array index): 1 = emitted on VDP1 */
@@ -766,7 +768,7 @@ void R_ProjectSprite (mobj_t* thing)
     // SATURN: nearSprites cull (FastDoom) -- a non-shootable decoration >~610 map units out on
     // either axis is a few px, invisible; reject it here before the FixedMul projection + the
     // vissprite alloc + the later sort/software-fill.  Shootable actors are always projected.
-    if (sat_near_sprites && !(thing->flags & MF_SHOOTABLE)
+    if (!(thing->flags & MF_SHOOTABLE)   /* sat_near_sprites baked ON 2026-08-26 */
 	&& (abs(tr_x) > 40000000 || abs(tr_y) > 40000000))
 	return;
 
@@ -812,14 +814,14 @@ void R_ProjectSprite (mobj_t* thing)
     // In a co-op split, drop sprites that project to near-nothing to cut the per-view vissprite
     // alloc + sort + emit across all N views.  Decorations culled harder than shootable actors.
     {
-	extern int sat_split_active, sat_split_thingcull;
+	extern int sat_split_active;   /* sat_split_thingcull baked ON 2026-08-26 */
 	// SHOOTABLE actors (monsters/barrels) AND in-flight MISSILES (rockets/fireballs/plasma -- the
 	// incoming-threat telegraph a split player must see) use the CONSERVATIVE near-1px ACTOR floor;
 	// only true decorations + pickups fall to the harsher DECOR floor.  (px estimates below assume a
 	// 64px sprite; large bosses ~110-128px subtend ~2x, so their effective cull size is ~2x larger.)
 	fixed_t culldist = (thing->flags & (MF_SHOOTABLE | MF_MISSILE))
 			   ? SAT_SPLIT_CULL_ACTOR : SAT_SPLIT_CULL_DECOR;
-	if (sat_split_thingcull && sat_split_active && xscale < culldist)
+	if (sat_split_active && xscale < culldist)
 	    return;
     }
 
@@ -2106,8 +2108,7 @@ void R_DrawMasked (void)
 	   master when the AIMD cap declines, e.g. ec0 -> th0 -> every sprite software).  Was gated off
 	   (!sat_things_emitted) as a shipping shortcut when world-things landed; measured slave busy%
 	   showed the slave sitting ~90% idle while M ran master-only -> re-enabled 2026-07-09. */
-	{ extern int sat_mp_slave;   /* r_parallel.c (2026-08-20): slave shares allowed in split */
-	if (sat_masked_parallel && (sat_local_players <= 1 || sat_mp_slave))   /* SATURN 2026-07-20: never slave-split in MP -- a New-Game-into-coop from a 1p pause renders one split frame with sat_lowres still 0, which used to dispatch the slave into a split it was never set up for -> wedge/freeze (see r_plane.c).  SATURN M7 2026-07-30: the `!sat_lowres` hard-off is GONE (shipped default) now that R_SlaveDrawVisSprite writes packed-160 (the !sat_lowres drawer guard above).  SATURN 2026-08-20: MP-off relaxed behind sat_mp_slave -- the wedge this guarded is hardened away (RP_WaitMasked 100 ms timeout + cosmetic no-draw fallback); HW 2p/3p/4p read SLV b0% all session while sprites piled on the master. */
+	if (sat_masked_parallel)   /* sat_mp_slave BAKED ON 2026-08-26 (console: 4p SLV b4-35%).  SATURN 2026-07-20: never slave-split in MP -- a New-Game-into-coop from a 1p pause renders one split frame with sat_lowres still 0, which used to dispatch the slave into a split it was never set up for -> wedge/freeze (see r_plane.c).  SATURN M7 2026-07-30: the `!sat_lowres` hard-off is GONE (shipped default) now that R_SlaveDrawVisSprite writes packed-160 (the !sat_lowres drawer guard above).  SATURN 2026-08-20: MP-off relaxed behind sat_mp_slave -- the wedge this guarded is hardened away (RP_WaitMasked 100 ms timeout + cosmetic no-draw fallback); HW 2p/3p/4p read SLV b0% all session while sprites piled on the master. */
 	{   /* SATURN: the two CPUs draw DISJOINT packed columns -- master [0,g_mask_x1=half), slave
 	       [half,viewwidth) -- and columnofs[x]=x is packed in lowres, so their fb writes never overlap.
 	       (Pre-2026-07-29 the slave upsampled its half to 320 = the mismatch that gated lowres off.) */
@@ -2135,7 +2136,7 @@ void R_DrawMasked (void)
 	    sat_masked_inflight = 1;
 	    RP_DispatchMasked (half, viewwidth);   /* slave: vissprites in [half, viewwidth) */
 	    g_mask_x1 = half;                       /* master: vissprites in [0, half)       */
-	} }   /* (outer brace = the sat_mp_slave extern scope) */
+	}
 	// draw all vissprites back to front
 	for (spr = vsprsortedhead.next ;
 	     spr != &vsprsortedhead ;

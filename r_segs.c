@@ -683,9 +683,12 @@ static unsigned char sat_seg_cpu[SAT_SEG_MAX];
    The tag is the low nibble of sat_seg_frame, so "was visible last frame" is a gap of exactly 1.
    A seg absent for exactly 16 (or 32, ...) frames aliases back onto the current tag and silently
    misses its coverage -- ~1.2s at M7 rates, and that failure mode is just today's behaviour. */
-#define SAT_SEG_ENTRY_MAX 3
-int sat_wall_entry = 1;   /* CPU frames covering a newly-visible VDP1 wall, 0..3; 0 = off.
-                             Live on pad L+Left / L+Right (1p), read back as row-13 `En<n>`. */
+/* BAKED at 1 on 2026-08-26 and the variable removed (SAT_SEG_ENTRY_MAX with it).  Its pad
+   L+Left shared a BYTE-IDENTICAL predicate with the lump-pin cycle, and this side only ever
+   DECREMENTED, with a floor at 0 -- so the first press meant to step the pin also pinned the
+   entry coverage at 0 for good, which is the pre-2026-08-02 behaviour where a wall entering the
+   view shows sky for one frame.  Reviving the knob means restoring the variable at the two
+   sites in R_SegEntryTag below. */
 int sat_seg_frame  = 0;   /* advanced ONCE PER RENDERED FRAME by the platform, after the BSP walk.
                              A port that never advances it (DoomJo) sees gap 0 -> coverage inert. */
 /* ORPHAN COUNT (2026-08-03).  Wall TIERS claimed by NEITHER path this frame -- neither the software
@@ -948,12 +951,27 @@ static void sat_lead_span_add (int yl, int yh)
    tiers = 480 spans, four views = 1920, so an UNFILTERED producer would overflow and
    sat_lead_span_drop would eat the tail.  One knob, one subject: 0 = off, else the minimum column
    height that goes to the slave.  Live on pad R+X. */
-/* [!] DEFAULT 24 SINCE 2026-08-26 (owner GO).  Measured better in every configuration tested
-   on Ymir -- 4p `lp` 17.7 against 20.4 with it off, 1p 10.2 against 11.2 -- with `st0` on every
-   capture and no visual artefact.  The one risk left is bus contention between the slave filling
-   columns and the master walking geometry, which console alone can price; it would show up as a
-   HIGHER MST, i.e. slower, never as a wrong pixel.  Pad R+X kills it in one press. */
-int sat_wallfill_min = 24;
+/* [!] DEFAULT 48 -- SET BY CONSOLE, AGAINST YMIR.  The bus contention flagged as "the one risk
+   console alone can price" is REAL, and hardware priced it exactly.  4p TNT, same spot, two
+   samples per rung (mean ms):
+
+       rung   lk   b%    hd     pr     lp     tl     Bp
+       OFF     0    4  25.6   29.8   30.8    1.8   89.3
+       48      3   11  25.4   30.3   28.2    2.0   87.6   <- -1.7
+       24      4   35  26.5   32.7   28.7    2.4   91.9   <- +2.6
+
+   `lp` falls by the SAME amount at both rungs.  What separates them is `pr` -- the VDP1 wall
+   geometry preamble, which the master walks through scattered sidedef/sector memory -- and it
+   rises with SLAVE OCCUPANCY: 29.8 at b4%, 30.3 at b11%, 32.7 at b35%.  The second CPU filling
+   columns is stealing bus cycles from a memory-bound master, and past ~b11% it costs more than
+   the fill it saved.
+   YMIR SHOWED NONE OF THIS -- it has no bus model, so its ladder was flat (lk 3/4/3 at 24/48/96)
+   and 24 looked free.  This is precisely what [[ymir-not-a-perf-oracle]] is about, and it is why
+   the threshold was shipped as a LADDER instead of an on/off: the break-even was a guess until
+   hardware priced it, and hardware put it between 24 and 48.
+   ⚠ NONE of this moves the fps counter: MST reads 250 on all four rungs because 250.2 ms is
+   exactly 15 NTSC fields.  Read `Bp`, never MST, for a change of this size. */
+int sat_wallfill_min = 48;
 static int sat_wallfill_on;      /* producer OPEN for this view: buffer present, queue reset      */
 static int sat_wallfill_live;    /* slave ACTUALLY dispatched -- i.e. at least one span exists.
 				    Split from `on` so R_WallFillDone can skip the join AND the
@@ -1248,15 +1266,15 @@ static int sat_seg_entry_cover (unsigned char *st)
     if ((unsigned char)(b >> 4) != tag)                       /* first visit this frame */
     {
 	int e = (b >> 2) & 3;
-	int n = sat_wall_entry;
-	if (n > SAT_SEG_ENTRY_MAX) n = SAT_SEG_ENTRY_MAX;
-	if (((unsigned int)(tag - (b >> 4)) & 15u) != 1u) e = n;  /* gap != 1 -> not visible last frame */
+	/* sat_wall_entry BAKED at 1 (2026-08-26), the documented default; the SAT_SEG_ENTRY_MAX
+	   clamp went with it (1 <= 3 always).  See the note at the definition site. */
+	if (((unsigned int)(tag - (b >> 4)) & 15u) != 1u) e = 1;  /* gap != 1 -> not visible last frame */
 	else if (e) e--;
 	b = (unsigned char)((tag << 4) | (e << 2) | (b & 3));
 	*st = b;
 	first = 2;
     }
-    return first | ((sat_wall_entry && (((b >> 2) & 3) != 0)) ? 1 : 0);
+    return first | ((((b >> 2) & 3) != 0) ? 1 : 0);
 }
 
 /* SATURN Phase-1 wall clamp ([[wall-clamp-world-anchored]]), below-floor side.  The failed 1b

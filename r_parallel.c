@@ -944,7 +944,9 @@ int sat_plane_parallel = 0;              /* set by the Mimas platform (src/main.
    split (each view's dispatch joins inside its own R_DrawPlanes / R_DrawMasked, so no
    cross-view state is ever live on the slave); 0 = the old MP-off behaviour (platform chord
    pad R+B, togglable from the 1p menu side and persistent into the split session). */
-int sat_mp_slave = 1;
+/* (sat_mp_slave REMOVED 2026-08-26 -- baked ON.  The fix it guarded is console-validated:
+   the 4p captures of 2026-08-26 read SLV b4%..b35% where every pre-fix video read b0%.
+   Its pad R+B also collided with the sprite-SQ chord in 1p.) */
 extern void R_DrawPlaneWorklist(int from, int to);
 
 static volatile int rp_plane_done = 1;
@@ -1711,6 +1713,18 @@ static unsigned short prof_mp_t0;
    exactly the profile the plane work-steal already exploits.  `Pv - flat` IS the parallelisable
    budget, and if it is small the offload is not worth its mechanism. */
 static unsigned short prof_fr_t0;
+/* [!] SATURN 2026-08-26 -- prof_planescan: WHAT THE Q PROBE COSTS, next to what it reports.
+   RP_PlanePixels is PURE INSTRUMENTATION -- a per-visplane, per-COLUMN rescan of top[]/bottom[]
+   feeding row-8 `Q`, the piecewise-quad estimate for the VDP1-planes study.  It early-returns
+   outside full-overlay mode, which means it runs on EXACTLY the frames the owner photographs,
+   INSIDE the `Pv` bracket, and its own header has said so since it was written: "the historical
+   'inflates P' tax, accepted until the planes verdict lands".
+   That tax was contaminating the number `Pv` exists to report.  `Pv` now EXCLUDES it (subtracted
+   at print time, not bracketed away silently), and row 8 prints `Q<n>/<ms>` so the probe declares
+   its own price beside its own answer.  A probe that hides its cost inside the phase it is
+   measuring is not a measurement, and no offload should ever be designed against one. */
+static unsigned int   prof_planescan;
+unsigned int          sat_q_scan10 = 0;   /* row 8 `Q<n>/<ms>`: the probe's own cost, tenths-ms */
 static unsigned int   prof_flatres;
 /* SATURN PERF (RBG0 candidate sizing): per-frame floor/ceiling FILL accounting.
    pix = total non-sky span pixels (the P fill workload); dom = the largest single
@@ -2094,7 +2108,21 @@ void RP_PlanePixels(int picnum, int height, int minx, int maxx,
        planes verdict lands, then this whole probe goes).  Only the LEGACY floor-sizer estimate
        (the FixedMul band loop, consumers = the cut FLT row) still hides behind sat_prof_planepix
        (pad L+B).  Overlay fps-only/off still skips everything: no measurement, no tax. */
-    if (sat_dbg_overlay_mode != 0) return;
+    /* [!] OPT-IN SINCE 2026-08-26 -- IT COST 9.1 ms AND IT WAS MEASURING ITSELF.
+       This scan went RESIDENT on 2026-08-19 on the reasoning "a pure probe should not need
+       arming".  The reasoning was right and the price was never checked: made to declare its own
+       cost, it read `Q30/9.1` against a `Pv` of 11.1 -- 82 % of the visplane-build phase this
+       project spent an evening trying to explain was the overlay observing itself, and ~9 ms of
+       row-2 `P` in 4p has been observer cost on EVERY capture ever taken.  The real build is
+       2.8 ms, 0.8 of it allocating, which killed the two-CPU split it was about to justify: you
+       do not TAS 2 ms, you delete 9.
+       Not deleted, GATED -- the VDP1-planes study it feeds is not closed in writing, so it keeps
+       its answer behind its own switch instead of billing every frame for it.  One flag, one
+       subject: sat_prof_planepix now means "run the plane rescan", legacy sizer included, and it
+       already had the pad L+B binding.  Q/E read 0 until armed; that zero is the flag, not a
+       measurement. */
+    if (sat_dbg_overlay_mode != 0 || !sat_prof_planepix) return;
+    unsigned short __ps_t0 = rp_frt();
     int x, ymin = 255, ymax = -1;
     /* v1 counted visplanes that are ONE screen quad (top[]+bottom[] linear over the whole span)
        and read Q0/0 on every owner capture.  ⚠ That zero was never a measurement: the publish
@@ -2192,6 +2220,7 @@ void RP_PlanePixels(int picnum, int height, int minx, int maxx,
        visplanes near-nonexistent -- Q0/0 on every capture.  The piecewise-run pass above is v2.) */
     prof_plane_pix += pix;
     prof_floor_vq  += vq;
+    prof_planescan += (unsigned short)(rp_frt() - __ps_t0);
     /* (the interior/near-edge split REMOVED 2026-08-26: it ran per VISPLANE to feed
        prof_floor_vq_int_peak, whose only reader -- a FLAT snprintf -- was cut long ago.) */
     prof_plane_n++;
@@ -2459,6 +2488,7 @@ void RP_BeginFrame(void)
     /* (r_lookup_rebuilds reset REMOVED 2026-08-10 with row-20 `e` -- see core/r_data.c:507) */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
     prof_plane_quadn = 0;                                                /* piecewise-quad probe (row 8 Q) */
+    prof_planescan = 0;                                                  /* ... and what it costs (row 8, Pv) */
     prof_q4_px[0] = prof_q4_px[1] = prof_q4_px[2] = prof_q4_px[3] = 0u;  /* top-4 runs (row 8 E) */
     prof_q4_cmd[0] = prof_q4_cmd[1] = prof_q4_cmd[2] = prof_q4_cmd[3] = 0u;
     prof_pp_cur_sum = prof_pp_cur_vq = 0;
@@ -2877,18 +2907,20 @@ static void rp_p3_prof_show(void)
     unsigned int mp_f = prof_mplane + prof_makespans, w_f = p3_wait_ticks;
     unsigned int pvb_f = sat_p_build10;   /* row 5 `Pv`, frame-summed below like the rest */
     unsigned int fr_f  = prof_flatres;    /* row 5 `Pv`'s 2nd half: the allocating part          */
+    unsigned int qsc_f = prof_planescan;  /* row 8 `Q<n>/<ms>`: subtracted out of `Pv` below      */
     {
         extern int sat_split_active, sat_split_view, sat_local_players;
-        static unsigned int fsb = 0, fpb = 0, fp10 = 0, fmp = 0, fw = 0, fpv = 0, ffr = 0;
+        static unsigned int fsb = 0, fpb = 0, fp10 = 0, fmp = 0, fw = 0, fpv = 0, ffr = 0, fqs = 0;
         if (sat_split_active)
         {
             int nv = sat_local_players; if (nv > 4) nv = 4; if (nv < 1) nv = 1;
             fsb += sb_d; fpb += pb_d; fp10 += p10; fpv += sat_p_build10; ffr += prof_flatres;
-            fmp += prof_mplane + prof_makespans; fw += p3_wait_ticks;
+            fmp += prof_mplane + prof_makespans; fw += p3_wait_ticks; fqs += prof_planescan;
             sb_f = fsb; pb_f = fpb; p10_f = fp10; mp_f = fmp; w_f = fw; pvb_f = fpv; fr_f = ffr;
-            if (sat_split_view >= nv - 1) { fsb = fpb = fp10 = fmp = fw = fpv = ffr = 0; }
+            qsc_f = fqs;
+            if (sat_split_view >= nv - 1) { fsb = fpb = fp10 = fmp = fw = fpv = ffr = fqs = 0; }
         }
-        else fsb = fpb = fp10 = fmp = fw = fpv = ffr = 0;   /* same rule as row 2 above */
+        else fsb = fpb = fp10 = fmp = fw = fpv = ffr = fqs = 0;   /* same rule as row 2 above */
     }
     w10 = w_f * 10u / 224u;
     unsigned int busy_pct = rp_master_ms ? (sb_f * 100u / (224u * rp_master_ms)) : 0u;
@@ -3318,8 +3350,12 @@ static void rp_p3_prof_show(void)
            = 33 %), so it spent 7 of 40 cells restating them.  `Pv` is the visplane worklist
            build and is derivable from nothing.  With it the plane budget CLOSES on one photo:
            row-2 kick + Pv + max(Pm, Ps) == row-2 P. */
-        unsigned int pv10 = pvb_f;
+        /* `Pv` MINUS THE OBSERVER.  RP_PlanePixels runs inside this bracket and only on
+           full-overlay frames, so an un-subtracted Pv measured the overlay as much as the game. */
+        unsigned int qs10 = qsc_f * 10u / 224u;
+        unsigned int pv10 = (pvb_f > qs10) ? (pvb_f - qs10) : 0u;
         unsigned int pf10 = fr_f * 10u / 224u;
+        sat_q_scan10 = qs10;
         if (pv10 > 999u) pv10 = 999u;
         if (pf10 > 999u) pf10 = 999u;
         (void)pb_pct;

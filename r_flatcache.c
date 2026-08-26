@@ -35,7 +35,9 @@ static const int flatcache_rungs[4][2] =
 extern int sat_streaming_mode;       // p_setup.c -- big-WAD CD path
 extern int sat_xsplit;               // r_main.c  -- parallel x-split render in progress
 
-int sat_flatcache_on    = 1;         // live A/B bypass (pad R+Z)
+// (sat_flatcache_on REMOVED 2026-08-26 -- baked ON.  The slab is CARVED either way, so "off"
+// only ever meant paying for the memory and then refusing to read it; the flat treadmill it
+// answers was measured and closed on 2026-08-06.  Revive by re-adding the two guards below.)
 int sat_flatcache_slots = 0;
 int sat_flatcache_live  = 0;
 int sat_flatcache_load  = 0;
@@ -97,7 +99,7 @@ byte *R_FlatCachePeek (int lumpnum)
 {
     int i;
 
-    if (!fc_slab || !sat_flatcache_on)
+    if (!fc_slab)
         return NULL;
     for (i = 0; i < sat_flatcache_slots; i++)
         if (fc_lump[i] == lumpnum)
@@ -109,7 +111,7 @@ byte *R_FlatCacheGet (int lumpnum)
 {
     int i, victim, oldest;
 
-    if (!fc_slab || !sat_flatcache_on)
+    if (!fc_slab)
         return NULL;
 
     // Hit: bump recency and hand back the slot.  Linear over <= 16 entries, once per
