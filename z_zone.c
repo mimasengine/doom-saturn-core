@@ -281,6 +281,60 @@ Z_Malloc
     if (size <= 0 || (unsigned int)size > (unsigned int)mainzone->size)
         I_Error ("Z_Malloc bad size=%i ra=%p", size, __builtin_return_address(0));
 
+    /* \[!] SATURN 2026-08-28 -- PASS 1: SERVE THE REQUEST WITHOUT EVICTING THE CACHE.
+       THE BUG, and it is vanilla Doom's, not ours: the rover scan below frees EVERY
+       PU_PURGELEVEL block it walks past while looking for a fit -- unconditionally, whatever
+       is free elsewhere in the zone.  On a PC with the WAD on a fast disk that is free.  On
+       Saturn every evicted lump is a ~29 ms synchronous CD read the next time a wall needs it.
+       MEASURED (the two 4p Ymir captures of 2026-08-28, row 0 `ld<chunks>/<refaults>`):
+       between two photos, +266 chunk commands for +171 LUMP RE-FAULTS -- about two thirds of
+       all disc traffic was re-reading lumps already loaded once, and the marginal rate (64 %)
+       was far above the cumulative one (23 % -> 32 %), i.e. the boot reads new lumps and PLAY
+       re-reads old ones.  That is the definition of thrash, and it is what the re-fault witness
+       was added to separate from churn.
+       THE FIX is not a bigger zone, it is not evicting when we do not have to: walk a BOUNDED
+       window from the rover looking ONLY at blocks that are already PU_FREE, take the BEST
+       (smallest sufficient) one, and touch nothing else.  If the window has no fit, fall
+       straight through to the vanilla scan below, unchanged -- so the worst case is the old
+       behaviour plus at most Z_KEEPCACHE_HOPS pointer hops.
+       WHY BEST-FIT AND NOT FIRST-FIT: first-fit would happily carve the LARGEST free run for a
+       2 KB patch, and that run is exactly what the level-load composite (96 KB contiguous)
+       needs -- see [[zone-contiguity-wall-loadsegs]].  Best-fit inside the window protects it.
+       WHY BOUNDED: the block list runs ~790 entries (row-22 `zw`), an unbounded non-purging
+       scan would be O(blocks) and would FAIL often (it cannot make room), so we would pay the
+       full walk twice.  64 hops is ~500 cycles against the 29 ms it is defending.
+       Z_Free coalesces with both neighbours, so a PU_FREE block's size is already the whole
+       run -- no accumulation needed here.
+       HOW TO SEE IT WORK: row-0 `ld<chunks>/<refaults>` is the receipt (refaults must stop
+       tracking `ld`).  If they do not, row-11 `zf` -- now TRUE free, not free+purgeable --
+       says which failure it is: `zf` still large means pass 1 is not firing, `zf` near zero
+       means the zone really is full and there was nothing to keep. */
+#define Z_KEEPCACHE_HOPS 64
+    {
+        memblock_t *p    = mainzone->rover;
+        memblock_t *best = NULL;
+        int hops = Z_KEEPCACHE_HOPS;
+
+        if ((byte *)p < (byte *)mainzone ||
+            (byte *)p >= (byte *)mainzone + mainzone->size)
+            p = mainzone->blocklist.next;          /* wild rover: let pass 2's guard deal with it */
+
+        while (hops-- > 0)
+        {
+            if (p->tag == PU_FREE && p->size >= size &&
+                (best == NULL || p->size < best->size))
+            {
+                best = p;
+                if (p->size <= size + MINFRAGMENT) break;   /* exact enough: stop looking */
+            }
+            p = p->next;
+            if ((byte *)p < (byte *)mainzone ||
+                (byte *)p >= (byte *)mainzone + mainzone->size)
+                break;                              /* walked off: abandon pass 1, never crash in it */
+        }
+        if (best != NULL) { base = best; goto z_got_block; }
+    }
+
     int z_emergency = 0;   // SATURN: allow ONE re-anchored retry before declaring OOM
     /* SATURN 2026-08-07: ROVER STEP COUNTER.  Z_Malloc's scan walks the block list purging every
        PU_CACHE block it passes, and on a straddle the z_emergency path RESCANS THE WHOLE LIST.  In a
@@ -411,7 +465,7 @@ Z_Malloc
 
     } while (base->tag != PU_FREE || base->size < size);
 
-    
+ z_got_block:                     /* SATURN 2026-08-28: pass 1 lands here, having purged nothing */
     // found a block big enough
     extra = base->size - size;
     
@@ -644,6 +698,25 @@ int Z_FreeMemory (void)
             free += block->size;
     }
 
+    return free;
+}
+
+/* SATURN 2026-08-28 -- FREE MEANS FREE.  Z_FreeMemory above counts PU_PURGELEVEL as free, so
+   overlay row-11 `zf` and `lg` were BOTH reporting the zone on the assumption that the whole lump
+   cache is expendable -- two views of one number, and neither could say how much of the zone is
+   actually unused.  That mattered the moment the re-fault witness proved the cache is being
+   evicted: "441 KB free" was not evidence that the zone has room, it was 441 KB of free PLUS
+   cache.  This counts only PU_FREE, so `zf` vs `lg` now reads as TRULY FREE vs OBTAINABLE BY
+   PURGING, and the gap between them IS the resident cache -- which is also the receipt for the
+   non-purging pass in Z_Malloc: if that pass fires, the cache grows and `zf` falls. */
+int Z_TrueFree (void)
+{
+    memblock_t *block;
+    int free = 0;
+    for (block = mainzone->blocklist.next ;
+         block != &mainzone->blocklist;
+         block = block->next)
+        if (block->tag == PU_FREE) free += block->size;
     return free;
 }
 
