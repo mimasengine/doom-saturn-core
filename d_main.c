@@ -373,6 +373,7 @@ void D_Display (void)
 	extern void sat_view_sq_apply (int);     /* SATURN: per-view software-quality (split-context SQ) */
 	extern void sat_view_sq_restore (void);  /* SATURN: re-apply the 1p SQ after the split loop */
 	extern void (*sat_walls_done_hook)(void);
+	extern int sat_kick_pending, sat_split_lastview, sat_split_kicked;   /* SATURN: the split late kick (r_main.c) */
 	/* was_split is now a D_Display-scope static (near the top) so the status-bar redraw test can see it. */
 	/* SATURN: split-render only a REAL co-op game (usergame).  An armed
 	   sat_local_players>1 left over the attract/demo loop (e.g. after a
@@ -416,12 +417,14 @@ void D_Display (void)
 	    sat_vdp2_sky = 0;                         /* default: software sky; the loop sets it PER-VIEW = (i==sat_sky_view) so only the elected view (Part 5) gets the HW sky */
 	    /* sat_wall_skip is set PER VIEW in the loop below (all views VDP1 when pad-X on; all software when off) */
 	    tv[0] = d_ms();
+	    sat_split_kicked = 0;   /* SATURN late kick in split: re-armed every frame */
 	    for (i = 0; i < n; i++)
 	    {
 		/* SATURN: VDP1 owns walls for ALL views (pad-X toggles all<->software).  sat_split_view
 		   tells the accumulator which view a wall belongs to (4-way command-budget split); the
 		   wall emit adds viewwindowy so bottom-row quadrants (vpy=112) land at the right screen y. */
 		sat_split_view = i;
+		sat_split_lastview = (i == n - 1);   /* SATURN: only the LAST view may arm the deferred kick */
 		sat_vdp2_floor = (sat_split_p1hw && i == sat_rbg0_view) ? 1 : 0;   /* SATURN split: only this view punches the HW floor */
 		sat_vdp2_sky   = (i == sat_sky_view) ? 1 : 0;   /* SATURN Part 5: only the ELECTED view gets the HW sky (index-0); the others draw software sky.  sat_sky_view==-1 (default) => all 0 = today's behaviour */
 		sat_wall_skip  = vdp1 ? 1 : 0;
@@ -433,7 +436,13 @@ void D_Display (void)
 		if (i == sat_sky_view) sat_sky_view_angle = viewangle;   /* elected view's angle -> platform scrolls NBG0 by it (viewangle here is THIS view's, set by R_SetupFrame) */
 		tv[i + 1] = d_ms();
 	    }
-	    if (vdp1 && sat_walls_done_hook) sat_walls_done_hook (); /* single kick: all accumulated views */
+	    /* SATURN 2026-08-26: still ONE kick for all accumulated views -- but under sat_kick_split
+	       the last view already ran it from its plane dispatch, ~3,6 ms earlier, overlapped with
+	       the slave.  Belt: a pending kick that somehow outlived its view is flushed here rather
+	       than leaking into the next frame. */
+	    if (sat_kick_pending)
+	    { sat_kick_pending = 0; sat_split_kicked = 1; if (sat_walls_done_hook) sat_walls_done_hook (); }
+	    else if (vdp1 && sat_walls_done_hook && !sat_split_kicked) sat_walls_done_hook ();
 	    td = d_ms();
 	    sat_split_active = 0;
 	    /* SATURN: 3p leaves the bottom-right quadrant empty -> fill it with a player-position

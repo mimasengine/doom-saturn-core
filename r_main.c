@@ -74,6 +74,23 @@
    ⚠ It is also a GAME change (less peripheral vision in versus), so it stays default-off
    and the owner judges it, not a benchmark. */
 int     sat_fov_half = FIELDOFVIEW/2;   /* fine-angle HALF-fov; 1024 = 45 deg = 90 deg total */
+
+/* [!] 2026-08-28 -- PER-PLAYER-COUNT DEFAULT, index = live count, [0] unused.  1024 = 90 deg,
+   740 = 65.  BAKED: the platform's count-change block is now the ONLY writer -- the R+C chord and
+   its 45-degree rung were removed the same day the values were chosen (owner: "supprime 45 et le
+   toggle.  On garde ces defauts jusqu'a nouvel ordre").  Change a default HERE, rebuild.
+   THE LAW BEHIND THE NUMBERS is Hor+ -- preserve the VERTICAL fov and let the horizontal follow the
+   viewport aspect -- which Halo's published figures show Bungie applying to the degree: CE 70 deg
+   at 4:3 becomes 108 at 8:3, Halo 2 62 becomes 44 at 8:9, and in BOTH the implied vertical fov is
+   preserved within one degree.  Mimas' 1p 3D area is 320x168 with 1,2:1 pixels => aspect 1,59 and
+   V = 64,5 deg.  Carried across: a 3/4p quadrant (160x96 after the HUD band) wants ~82 deg, and the
+   2p side-by-side view (160x208, aspect 0,64) wants ~44 -- so the CORRECT values DISAGREE between
+   the split modes, and 2p is where the shipped 90 is most wrong: its vertical fov is 109 deg today
+   against 1p's 64.
+   SHIPPED CHOICE: one value for every split mode, 65.  The owner's call and it is the right one --
+   in versus an fov difference is a competitive advantage, so it must be identical for every player
+   and stable between rounds; consistent aiming across 2p/3p/4p beats per-mode geometric purity. */
+int     sat_fov_mode[5] = { 1024, 1024, 740, 740, 740 };
 fixed_t sat_fov_mul  = FRACUNIT;        /* tan(45)/tan(half); EXACTLY FRACUNIT at the default */
 
 
@@ -1205,6 +1222,84 @@ void (*sat_walls_done_hook)(void) = 0;
    verdict -- a settled knob is not a knob ([[toggle-audit-cleanup]]). */
 int sat_kick_pending = 0;   /* a deferred kick is owed this frame -- flushed by the fallback below */
 
+/* [!] SATURN 2026-08-26 -- THE SAME LEVER IN SPLIT, and it is the OWNER'S correction that opened it.
+   I had closed this on a z-order argument: in split the per-view sprites are queued during their
+   own view and the walls flush once at the end, so bringing the wall emission forward looked like
+   it would reorder walls against sprites.  He answered: *"le z-order serait bon par vue, c'est tout
+   ce qui importe ici"*.  He is right, and it is not even a trade -- the four views own DISJOINT
+   screen quadrants, so a wall of view 0 and a sprite of view 1 can never touch the same pixel and
+   their relative position in the command list is unobservable.  Only WITHIN a view does order
+   matter, and within a view nothing moves.
+   This flag ships the CHEAP HALF of that opening: the kick stays ONE atomic call (so the command
+   budget, the things reserve and the wtex priority still see all four views at once -- the machinery
+   the 4p flicker session paid for on hardware) and only moves EARLIER, from d_main's post-loop site
+   to the LAST view's plane dispatch.  Everything it reads is already final there: `wall_acc[]` is
+   complete (view 3's R_StoreWallRange ran during its BSP walk), the thing queue is complete
+   (R_EmitWorldThingsVDP1 runs at :1358, before R_DrawPlanes), and every global it reads --
+   sat_split_view, detailshift, the view window, the split SQ -- holds the SAME value at view 3's
+   dispatch as at d_main's kick, because the view loop leaves them there.  That last sentence is the
+   whole safety argument and it was checked, not assumed.
+   THE BUDGET, before the mechanism (4p Ymir, TNT).  Planes are Pm7,0 + Ps7,3 = 14,3 ms of WORK run
+   concurrently on two CPUs; the kick is 10,5 ms and master-pinned.  Today the pair costs
+   max(7,0;7,3) + 10,5 = 17,8 ms.
+     LAST VIEW ONLY (this flag): that view holds a quarter of the plane work, 3,6 ms, split 1,8 master
+     / 1,8 slave.  Handing the master's 1,8 to the slave and spending it on the kick turns
+     1,8 + 10,5 = 12,3 into max(3,6 ; 10,5) = 10,5.  The saving is the MASTER'S SHARE OF ONE VIEW:
+     ~1,8 ms, not the view's whole plane time.  (I wrote 3,6 first and it was wrong by 2x -- the
+     slave's half was never on the critical path to begin with.)
+     PER VIEW (deferred): total work 14,3 planes + 10,5 kick over two CPUs with the kick pinned
+     balances at 12,4 ms -> ~5,4 ms, THREE TIMES the cheap half.
+   So this flag is not the prize; it is the MECHANISM TEST -- does bringing the split kick forward
+   corrupt anything, does VDP1 mind starting a frame earlier, does the B-bus tax eat it.
+
+   [!] YMIR 4p TNT A/B, SAME SPOT, IDENTICAL RENDER FINGERPRINT (Bw12,8 Bp39,4 hd8,2 lp17,9 tl0,6
+   d187 c1679).  THE MECHANISM FIRED EXACTLY AS DESIGNED -- AND THE WIN CAME FROM SOMEWHERE ELSE:
+
+                    K0        K1
+                    K0        K1 (four captures)
+       SPL v3       24        31, 32, 31, 32     kick moved INTO the last view (+8 of its ~10 ms)
+       SPL k        10         0,  0,  0,  0     ...and left its own bracket
+       SPL =        70        78, 78, 78, 78
+       Pm / Ps  7,0/7,7   4,7..5,1 / 9,6..10,0   master hands the planes to the slave, as in 1p
+       b%           12        15, 15, 15, 16
+       a (fps)     8,7       9,1 9,4 9,4 9,5  -> 9,35   (+7,5 %)
+       MST         116       105 108 106 103  -> 105,5
+       R            88        86  86  86  85  -> 85,75
+
+   THE SPLIT OF THE 10,5 ms, AND BOTH HALVES COME FROM WINDOWED MEANS ONLY:
+     `R` is DERIVED as MST - (tic + snd + blit + dg), and tic/snd/dg are flat across all five
+     captures, so MST - R IS the blit term -- and the presentation fence lives inside it (stated at
+     the `rs` note, dg_saturn.cxx).  It falls 28 -> 19,75.
+       CPU overlap  = R          : -2,25 ms   <- the 1,8 ms this note predicted.  Correct.
+       present fence = MST - R   : -8,25 ms   <- not predicted at all.
+   Firing the kick ~10 ms earlier changes the PHASE at which the frame reaches a fence that blocks
+   to a vblank edge, and phase at a fence turns into whole fields.  I costed this lever purely as
+   CPU overlap and ignored the VDP1/present latency term, which this project's own record states in
+   four words: VDP1 needs a HEAD START ([[m7-vdp1-latency-coherent-pair-hold]]).
+   ⚠ RETRACTED ON THE WAY: I first read that fence term off row-8 `<n>ms`, 16 -> 3.  That field was
+   a SINGLE frame's align-to-vblank wait, near-uniform over a field -- the next three K1 captures
+   read 3, 18 and 4 at the same spot on the same build.  Row-13 `F` is the same story at n~9:
+   40 % -> 30/50/40/20.  The conclusion survives ONLY because MST and R are 1 s means.  Both probes
+   were windowed the same hour; neither number above is quotable from the pre-fix builds.
+   I costed this lever purely as CPU overlap and ignored the VDP1/present latency term, which this
+   project's own record states in four words: VDP1 needs a HEAD START ([[m7-vdp1-latency-coherent-
+   pair-hold]]).  Sizing a lever by the one mechanism you happen to be looking at is how you get the
+   right number for the wrong reason.
+   ⚠ WHY THIS YMIR READING IS ADMISSIBLE, unusually: the half of the fence that collapsed is
+   align-to-vblank, driven by the same field clock that produces the MST quantisation Ymir models
+   correctly.  The half Ymir does NOT model -- the VDP1 plot-done gate -- read g0 on both sides, so
+   it contributes nothing either way here.  On CONSOLE the gate is real and the frame is 250 ms
+   (15 fields) instead of 105-116, so the phase win can be larger or smaller.  Still needs hardware.
+   ⚠ AND IT WEAKENS THE PER-VIEW VARIANT, not strengthens it.  Per-view emission would still START
+   VDP1 at the same instant (one kick, at the last view), so it cannot buy any MORE phase -- only
+   the extra ~3,6 ms of CPU overlap, which this A/B just showed to be the secondary term.  The cheap
+   half may already have taken most of what is there.
+   ⚠ Ymir cannot price this (ms are not its business) and the console session is tomorrow -> it
+   ships behind pad R+Z with row-7 `K`, exactly like the 1p version did for one afternoon. */
+int sat_kick_split  = 0;    /* pad R+Z: in split, kick at the LAST view's plane dispatch */
+int sat_split_lastview = 0; /* d_main: 1 while rendering the last view of the split */
+int sat_split_kicked   = 0; /* d_main: the single split kick has already been armed this frame */
+
 /* SATURN split-screen (Iter 2): set while rendering the per-player half-views.  The VDP1
    wall emit (r_segs.c) + the VDP1 kick are skipped (the VDP1/VDP2 hybrid is single-view),
    so each half renders in pure software into its framebuffer region. */
@@ -1339,11 +1434,16 @@ static void R_RenderViewPass (int last_pass)
        floors/sprites below and presents the SAME frame (no 1-frame lag vs the framebuffer).
        In x-split this fires only on the final pass so VDP1 is kicked once with every wall.
        In split-screen (sat_split_active) the VDP1 hybrid is off (it is single-view) -> no kick. */
-    if (last_pass && sat_walls_done_hook && !sat_split_active)
+    if (last_pass && sat_walls_done_hook
+        && (!sat_split_active || (sat_kick_split && sat_split_lastview)))
     {
         /* Hand it to RP_DrawPlanesSplit, which runs it the instant the slave has been launched
            onto the planes.  See the note at sat_kick_pending. */
         sat_kick_pending = 1;
+        /* Armed => fired before this view returns: RP_DrawPlanesSplit consumes it, and the
+           fallback below consumes it on every path that does not reach RP_DrawPlanesSplit.  So
+           d_main can read this as "the kick is handled" without a second flag. */
+        if (sat_split_active) sat_split_kicked = 1;
     }
 
     /* SATURN split world-things-on-VDP1: in split the kick above is skipped (d_main.c kicks ONCE

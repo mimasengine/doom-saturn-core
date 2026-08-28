@@ -228,7 +228,38 @@ R_RenderMaskedSegRange
    Exactness is not negotiable here: yl/yh are SCREEN ROWS and the clip compares below read the
    true value, so a wrapped one picks the wrong branch -- a mis-clipped wall, not a rounding.
    Non-SH builds keep the plain shift, so the C is the definition and the asm is the SH-2 spelling
-   of it. */
+   of it.
+   [!] ROUND 2, 2026-08-26 -- THE PREAMBLE SITES WERE MISSED, AND THIS NOTE SAID SO.  Round 1
+   converted the SIX sites inside the per-column loop and stopped there; the paragraph above had
+   already counted "~30 more per SEG in the routing preamble" and nothing was done with the
+   sentence.  The 4p photo is what made that matter: at c1679/d187 a quadrant averages 9,0 wall
+   columns per drawseg against 17,5 in 1p (Doom's FOV is nailed to 90 deg by centerxfrac, so a
+   160-wide viewport shows the SAME world as a 320-wide one), which puts 51 % of the 4p wall bill
+   in per-SEG fixed cost -- row-4 hd8,2 + pr11,1 over d187 = 103 us a seg against 11 us a column.
+   Round 1 optimised the half that 4p amortises BEST.
+   35 sites converted here: 4 in sat_wall_try_edge (called at :1963/:1987, i.e. inside `pr`),
+   30 in R_RenderSegLoop's routing preamble, 1 in the distance-LOD height.  Six to twelve execute
+   per seg depending on the tier mix (mid vs top+bottom, plus the squish guards and the sub-seg
+   splitters).
+   [!] AND HERE IS THE ARITHMETIC I GOT WRONG WHEN I SHIPPED IT.  I sized this at "180-360 cycles a
+   seg" -- that is the cost of the SHIFT SEQUENCES, and they do not go away: the inline spelling is
+   the same twelve `shar`.  What the inline removes is ONLY the call envelope -- jsr + delay slot +
+   rts + delay slot + the two r4 marshalling movs, about 8 cycles out of ~20 -- so the saving is
+   6..12 x 8 = 50-100 cycles a seg, x187 segs = **0,3-0,6 ms on a 116 ms frame**, not the 1-2 ms I
+   quoted.  Cost of a lever is not the same number as the SIZE of what the lever touches, and I
+   presented one as the other ([[budget-before-mechanism]]).
+   YMIR 4p TNT, same spot, identical fingerprint (d187 c1679 em9,7 hd8,2 tl0,6 Bw12,8 R88 MST116):
+       before   hd 8,2   pr 11,1   lp 18,7   Bp 40,1
+       after    hd 8,2   pr 11,3   lp 17,9   Bp 39,4
+   `pr` DID NOT MOVE and `lp` did, which is the opposite of the prediction -- every converted site
+   is inside the `pr` bracket.  The believable reading is that R_RenderSegLoop is ONE function with
+   ONE register allocator: unpinning r4 in the preamble changed allocation in the loop as well,
+   which is exactly the second mechanism the paragraph above claims and the one nobody can aim.
+   ⚠ SO: KEEP IT, BUT DO NOT SPEND CONSOLE TIME ON IT.  The change is strictly fewer instructions
+   for a bit-identical result and costs 133 bytes of pool; the expected 0,3-0,6 ms sits UNDER the
+   console noise floor measured the same day from the wall-fill videos (1,1-1,4 ms of spread on
+   `Bp` between two same-configuration captures, see sat_wallfill_min).  A one-shot hardware A/B
+   cannot resolve it, so asking for one would burn a console session to learn nothing. */
 #if HEIGHTBITS != 12
 #error "SAT_SHR12 is the SH-2 spelling of >>12 -- retune it if HEIGHTBITS moves"
 #endif
@@ -952,26 +983,107 @@ static void sat_lead_span_add (int yl, int yh)
    sat_lead_span_drop would eat the tail.  One knob, one subject: 0 = off, else the minimum column
    height that goes to the slave.  Live on pad R+X. */
 /* [!] DEFAULT 48 -- SET BY CONSOLE, AGAINST YMIR.  The bus contention flagged as "the one risk
-   console alone can price" is REAL, and hardware priced it exactly.  4p TNT, same spot, two
-   samples per rung (mean ms):
+   console alone can price" is REAL, and hardware priced it exactly.  4p TNT, same spot, all five
+   videos decoded (fingerprint identical on every frame quoted: c1679 d187 ld201/43 vp50 ds65
+   zf457 lg103), only frames with a == fps admitted:
 
-       rung   lk   b%    hd     pr     lp     tl     Bp
-       OFF     0    4  25.6   29.8   30.8    1.8   89.3
-       48      3   11  25.4   30.3   28.2    2.0   87.6   <- -1.7
-       24      4   35  26.5   32.7   28.7    2.4   91.9   <- +2.6
+       rung   video          f   lk   b%    hd     pr     lp     tl     Bp
+       OFF    mode3         49    0    4  25.6   29.8   30.8    1.8   89.3
+       96     mode2         10    3   11  26.5   30.7   28.3    1.8   88.6
+       48     mode1         10    3   11  25.4   30.3   28.2    2.0   87.6
+       24     no-mode+m4     0    4   35  26.5   32.7   28.7    2.4   91.9
 
-   `lp` falls by the SAME amount at both rungs.  What separates them is `pr` -- the VDP1 wall
+   THE 96 ROW ARRIVED 2026-08-27 AND IT SAYS SOMETHING BETTER THAN A NUMBER: 96 AND 48 SELECT THE
+   SAME COLUMNS.  `f10` and `lk3` are identical, so the same 10 candidates stay on the master and
+   the same ~39 go to the slave; `b11%` confirms it from the other side.  Read the `f` column as a
+   HISTOGRAM of the ~49 CPU-drawn candidates: f0 at rung 24 => every candidate is >= 24 rows tall;
+   f10 at rung 48 => ten of them fall in [24,48); f10 STILL at rung 96 => *zero* fall in [48,96).
+   The population is bimodal -- ten short slivers, and forty near-full-height columns, which is what
+   a 4p quadrant does to geometry: the viewport is 112 rows, so a close wall spans nearly all of it
+   and there is no middle.  So the top rung is not "worse", it is INERT at this spot, and since it
+   can only ever offload a SUBSET of what 48 offloads it can never beat it here.  Whether a higher
+   threshold helps anywhere is still UNTESTED -- this video did not test it, it re-tested 48.
+   AND IT GIVES THE NOISE FLOOR, WHICH IS THE PART THAT SHOULD CHANGE HOW THE ROWS ABOVE ARE READ.
+   Two pairs of same-configuration console captures now exist: 48 vs 96 (identical selection),
+   Bp 87.2 / 88.6, and the two rung-24 videos differ Bp 91.8 / 90.7.  **Same config, same spot:
+   1,1 to 1,4 ms of spread on Bp.**  The headline "-1,7 ms for 48 over OFF" is therefore barely
+   outside the noise of a single pair, and no future one-shot A/B on this metric should be believed
+   under ~3 ms.  What IS solid is the MONOTONE TREND, because it has four independent points:
+   `pr` = 29.8 at b4%, 30.3 and 30.7 at b11%, 32.0 and 32.2 at b35%.  A trend over four samples
+   survives a noise floor that kills any single difference.
+   `lp` falls by the SAME amount at every armed rung.  What separates them is `pr` -- the VDP1 wall
    geometry preamble, which the master walks through scattered sidedef/sector memory -- and it
-   rises with SLAVE OCCUPANCY: 29.8 at b4%, 30.3 at b11%, 32.7 at b35%.  The second CPU filling
-   columns is stealing bus cycles from a memory-bound master, and past ~b11% it costs more than
-   the fill it saved.
+   rises with SLAVE OCCUPANCY.  The second CPU filling columns is stealing bus cycles from a
+   memory-bound master, and past ~b11% it costs more than the fill it saved.
    YMIR SHOWED NONE OF THIS -- it has no bus model, so its ladder was flat (lk 3/4/3 at 24/48/96)
    and 24 looked free.  This is precisely what [[ymir-not-a-perf-oracle]] is about, and it is why
    the threshold was shipped as a LADDER instead of an on/off: the break-even was a guess until
    hardware priced it, and hardware put it between 24 and 48.
    ⚠ NONE of this moves the fps counter: MST reads 250 on all four rungs because 250.2 ms is
-   exactly 15 NTSC fields.  Read `Bp`, never MST, for a change of this size. */
-int sat_wallfill_min = 48;
+   exactly 15 NTSC fields.  Read `Bp`, never MST, for a change of this size.
+
+   [!] 2026-08-28 -- THE RUNG IS MODE-DEPENDENT, BUT *NOT* FOR THE REASON THE GEOMETRY SUGGESTS.
+   The owner asked whether the height threshold should scale with the view count, since 3/4p cuts
+   the screen horizontally and halves every column.  A full Ymir sweep of the ladder in 1p/2p/3p/4p
+   says the opposite of that intuition.  Read `f` as a HISTOGRAM of the CPU-drawn candidates (`f` =
+   the ones the master still fills, `GCS w?/<n>` = the candidate count):
+
+     mode  viewport  cand.   f(24) f(48) f(96)   => where the candidate heights actually sit
+      1p    200 rows   26      -     0     26       ALL 26 in [48, 96)      = 24..48 % of the view
+      2p    224 rows   13      0    13     13       ALL 13 in [24, 48)      = 11..21 % of the view
+      3p    112 rows   46      0     7      -       7 in [24,48), 39 >= 48  = >= 43 %
+      4p    112 rows   49      0    10     10       10 in [24,48), 39 >= 96 = >= 86 % of the quad
+
+   THE SHORTEST VIEWPORT HAS THE TALLEST CANDIDATES.  2p has the tallest viewport (224, a vertical
+   split keeps full height) and every one of its candidates is UNDER 48 rows; 4p has the shortest
+   (112) and 39 of 49 candidates fill 86 % of it.  So the population is not set by the geometry --
+   it is set by WHICH WALLS THE VDP1 BUDGET REJECTS.  In 3/4p the command budget is split four ways,
+   so the big near walls fall back to the CPU and the candidates are near-full-height; in 1p/2p
+   there is budget to spare and only slivers and edge cases fall back.
+   ⇒ A single absolute rung cannot serve modes whose candidate bands are DISJOINT.  What the sweep
+   supports as per-mode defaults, targeting the +7..+9 points of `b%` the 4p console table showed
+   to be the affordable increment:  1p -> 48 (b22->31),  2p -> 24 (b14->21),  3p -> 48 (b5->14),
+   4p -> 48 (b4->11).  96 is dominated in every mode measured.
+   ⚠ AND THE HONEST CAVEAT ON THOSE MS: this sweep is YMIR, which has NO BUS MODEL, so it can price
+   the SELECTION (`f`/`lk`/`b%` -- counts, which is what Ymir is for) and NOT the contention that is
+   the whole reason this threshold exists.  Its `Bp` spread across all four rungs was 16.1-17.1 in
+   1p and 21.2-21.7 in 2p -- i.e. nothing, at or under the 1.1-1.4 ms console noise floor.  Do not
+   read those as "the ladder is worthless"; read them as "Ymir cannot see this lever at all". */
+/* [!] 2026-08-28, SAME DAY, SECOND HALF -- THE PER-PLAYER-COUNT TABLE IS GONE AND `wh` IS WHAT
+   KILLED IT.  It was added this morning on the reading that the candidate bands are DISJOINT
+   between modes (1p in [48,96), 2p in [24,48), 3/4p bimodal at 96+).  That reading came from
+   walking the ladder across fifteen captures, one rung per scene, and the histogram -- which
+   measures the WHOLE curve in ONE frame -- refutes it on twenty-eight fresh ones:
+       4p, twenty captures, mean of `wh`   :  2,7 / 5,0 / 1,2 / 0,9   (<24 / [24,48) / [48,96) / >=96)
+       and the SPREAD WITHIN 4p            :  wh9000 (nothing at all above 24)
+                                              wh0414 (half the population at or above 48)
+   The between-mode difference is smaller than the between-SCENE difference inside a single mode,
+   by a wide margin, so a per-mode constant cannot track this population -- it just freezes one
+   scene's answer and calls it a mode.  ONE global rung, 48.
+   THE OLD TABLE'S OTHER CLAIM DIES TOO: "3/4p is bimodal with ~80 % at or above 96" came from
+   reading row-14 `f` as a histogram back when it was the only witness.  `f` counts columns SHORTER
+   than the live rung, so at a single rung it cannot separate "nothing above 48" from "everything
+   above 96" -- exactly the ambiguity `wh` was built to remove.  Bucket d (>=96) reads 0 or 1 tenth
+   in EIGHTEEN of the twenty 4p captures.
+   ⚠ AND THE LEVER ITSELF IS NOW ON TRIAL, which is the more useful finding: mean 4p `lk` at rung
+   48 is 1,35 -- 1350 offloaded pixels per frame -- because the VDP1 owns nearly every wall and the
+   CPU fallback is only ~100 columns.  Console has already priced the rungs (slave busy 4 / 11 /
+   35 %, `pr` 29,8 / 30,3 / 32,7 for OFF / 48 / 24), so rung 24 buys 3,5x those pixels for +2,4 ms
+   of B-bus tax on `pr`.  There is no case for 24 anywhere.  If the console session confirms the
+   tax at 48 as well, the whole wall-fill offload goes -- and takes `w`, `f`, `lk`, `wh` and the
+   R+X chord with it. */
+int sat_wallfill_min = 48;   /* LIVE value for the hot path -- a plain int, never an array read */
+
+/* [!] `wh<a><b><c><d>` on row 14 -- THE CANDIDATE-HEIGHT HISTOGRAM, and it exists because deriving
+   the same thing from the ladder cost FIFTEEN captures and still could not be trusted.  Walking the
+   rungs samples each one in a DIFFERENT scene (the tester is moving), which is
+   [[interbuild-perf-noise]] transposed into time.  This measures the whole selection curve in ONE
+   frame, at ANY rung: four buckets at the ladder's own boundaries, one increment per candidate
+   column, no division in the hot path.  Printed as tenths of the candidate count.
+   [!] IT NEEDS AN ARMED RUNG.  R_WallFillArm returns early at rung 0, so sat_wallfill_take is never
+   reached and `wh` reads dots.  That is honest -- no producer, no candidates -- but it means the
+   histogram cannot be read with the feature off: park on any non-zero rung to read it. */
+unsigned short sat_wf_hist[4];      /* <24 | [24,48) | [48,96) | >=96 */
 static int sat_wallfill_on;      /* producer OPEN for this view: buffer present, queue reset      */
 static int sat_wallfill_live;    /* slave ACTUALLY dispatched -- i.e. at least one span exists.
 				    Split from `on` so R_WallFillDone can skip the join AND the
@@ -983,6 +1095,12 @@ static int sat_wallfill_live;    /* slave ACTUALLY dispatched -- i.e. at least o
 static int sat_wallfill_take (int tex, int col)
 {
     if (!sat_wallfill_on || sat_dc_solid) return 0;
+    {   /* row 14 `wh` -- census EVERY candidate, before the threshold decides anything about it.
+           Three compares, no division; the buckets are the ladder's own rungs, so the digits read
+           straight off as "what each rung would select". */
+        int h = dc_yh - dc_yl + 1;
+        sat_wf_hist[h < 24 ? 0 : h < 48 ? 1 : h < 96 ? 2 : 3]++;
+    }
     if (dc_yh - dc_yl + 1 < sat_wallfill_min) return 0;
     if (sat_lead_span_n >= SAT_LEADSPAN_MAX) { sat_lead_span_drop++; return 0; }
     SAT_LEAD_KEY (tex, col);
@@ -1504,10 +1622,10 @@ static int sat_wall_try_edge(int texture, int yl1, int yh1, int yl2, int yh2,
     if (xR > rw_stopx - 1) xR = rw_stopx - 1;
     if (xR - xL < SAT_WALL_EDGE_MIN) return 0;
     dL = xL - rw_x; dR = xR - rw_x;
-    ylL = (topfrac    + topstep    * dL + HEIGHTUNIT - 1) >> HEIGHTBITS;
-    yhL = (bottomfrac + bottomstep * dL)                  >> HEIGHTBITS;
-    ylR = (topfrac    + topstep    * dR + HEIGHTUNIT - 1) >> HEIGHTBITS;
-    yhR = (bottomfrac + bottomstep * dR)                  >> HEIGHTBITS;
+    ylL = SAT_SHR12 ((topfrac    + topstep    * dL + HEIGHTUNIT - 1));
+    yhL = SAT_SHR12 ((bottomfrac + bottomstep * dL));
+    ylR = SAT_SHR12 ((topfrac    + topstep    * dR + HEIGHTUNIT - 1));
+    yhR = SAT_SHR12 ((bottomfrac + bottomstep * dR));
     if (need_floor_clear)
     {
 	int m = yhL > yhR ? yhL : yhR;
@@ -1713,8 +1831,8 @@ void R_RenderSegLoop (void)
 
 	if (midtexture && !SEG_BACKSECTOR(curline))
 	{
-	    int s1 = (bottomfrac - topfrac) >> HEIGHTBITS;
-	    int s2 = ((bottomfrac + bottomstep * n) - (topfrac + topstep * n)) >> HEIGHTBITS;
+	    int s1 = SAT_SHR12 ((bottomfrac - topfrac));
+	    int s2 = SAT_SHR12 (((bottomfrac + bottomstep * n) - (topfrac + topstep * n)));
 	    int s = s1 > s2 ? s1 : s2;
 	    unsigned char *st = segst;
 	    /* HYSTERESIS on the CPU<->VDP1 span threshold (owner 2026-08-03, read off the wall-path
@@ -1786,15 +1904,15 @@ void R_RenderSegLoop (void)
 	    int dhy = seg_hyst ? SAT_WALL_HYST : 0;
 	    if (toptexture)
 	    {
-		int s1 = (pixhigh - topfrac) >> HEIGHTBITS;
-		int s2 = ((pixhigh + pixhighstep * n) - (topfrac + topstep * n)) >> HEIGHTBITS;
+		int s1 = SAT_SHR12 ((pixhigh - topfrac));
+		int s2 = SAT_SHR12 (((pixhigh + pixhighstep * n) - (topfrac + topstep * n)));
 		int s = s1 > s2 ? s1 : s2;
 		cpu_up = (s > sat_wall_cpu_span - dhy);
 	    }
 	    if (bottomtexture)
 	    {
-		int s1 = (bottomfrac - pixlow) >> HEIGHTBITS;
-		int s2 = ((bottomfrac + bottomstep * n) - (pixlow + pixlowstep * n)) >> HEIGHTBITS;
+		int s1 = SAT_SHR12 ((bottomfrac - pixlow));
+		int s2 = SAT_SHR12 (((bottomfrac + bottomstep * n) - (pixlow + pixlowstep * n)));
 		int s = s1 > s2 ? s1 : s2;
 		cpu_lo = (s > sat_wall_cpu_span - dhy);
 	    }
@@ -1870,10 +1988,10 @@ void R_RenderSegLoop (void)
     if (sat_wall_hook && SAT_WALL_VDP1_OK && midtexture && !SEG_BACKSECTOR(curline) && rw_stopx > rw_x && (sat_v1_mid || sat_v1_mid_sub || sat_v1_mid_edge))
     {
 	int n   = rw_stopx - 1 - rw_x;
-	int yl1 = (topfrac + HEIGHTUNIT - 1) >> HEIGHTBITS;
-	int yh1 = bottomfrac >> HEIGHTBITS;
-	int yl2 = (topfrac + topstep * n + HEIGHTUNIT - 1) >> HEIGHTBITS;
-	int yh2 = (bottomfrac + bottomstep * n) >> HEIGHTBITS;
+	int yl1 = SAT_SHR12 ((topfrac + HEIGHTUNIT - 1));
+	int yh1 = SAT_SHR12 (bottomfrac);
+	int yl2 = SAT_SHR12 ((topfrac + topstep * n + HEIGHTUNIT - 1));
+	int yh2 = SAT_SHR12 ((bottomfrac + bottomstep * n));
 	/* texture u at the two ends (same perspective formula as the loop below) */
 	int a1 = (rw_centerangle + xtoviewangle[rw_x])        >> ANGLETOFINESHIFT;
 	int a2 = (rw_centerangle + xtoviewangle[rw_stopx - 1]) >> ANGLETOFINESHIFT;
@@ -1984,10 +2102,10 @@ void R_RenderSegLoop (void)
 		    int sdu = ur - ul; if (sdu < 0) sdu = -sdu;
 		    if (sdu < 1 || (long long)tw * (xr - xl + 1) > 1024LL * sdu)
 			{ sat_sw_mid = 1; sat_fb_mag_t++; break; }
-		    int yll = (topfrac    + topstep    * dnl + HEIGHTUNIT - 1) >> HEIGHTBITS;    /* EXACT */
-		    int ylr = (topfrac    + topstep    * dnr + HEIGHTUNIT - 1) >> HEIGHTBITS;
-		    int yhl = (bottomfrac + bottomstep * dnl) >> HEIGHTBITS;
-		    int yhr = (bottomfrac + bottomstep * dnr) >> HEIGHTBITS;
+		    int yll = SAT_SHR12 ((topfrac    + topstep    * dnl + HEIGHTUNIT - 1));    /* EXACT */
+		    int ylr = SAT_SHR12 ((topfrac    + topstep    * dnr + HEIGHTUNIT - 1));
+		    int yhl = SAT_SHR12 ((bottomfrac + bottomstep * dnl));
+		    int yhr = SAT_SHR12 ((bottomfrac + bottomstep * dnr));
 		    int sv0, sv1; SAT_VROWS(rw_midtexturemid, yll, yhl, sv0, sv1);
 		    if (sat_wall_hook (xl, yll, yhl, xr, ylr, yhr, midtexture, ul, ur, sv0, sv1, cm))
 			{ sat_sw_mid = 1; sat_fb_starve_t++; break; }   /* bank full -> whole wall SW */
@@ -2021,10 +2139,10 @@ void R_RenderSegLoop (void)
 	const lighttable_t *cm = walllights[_li];
 	if (toptexture && (sat_v1_up || sat_v1_up_sub))   /* ceiling -> top of the opening */
 	{
-	    int yl1 = (topfrac + HEIGHTUNIT - 1) >> HEIGHTBITS;
-	    int yl2 = (topfrac + topstep * n + HEIGHTUNIT - 1) >> HEIGHTBITS;
-	    int yh1 = pixhigh >> HEIGHTBITS;
-	    int yh2 = (pixhigh + pixhighstep * n) >> HEIGHTBITS;
+	    int yl1 = SAT_SHR12 ((topfrac + HEIGHTUNIT - 1));
+	    int yl2 = SAT_SHR12 ((topfrac + topstep * n + HEIGHTUNIT - 1));
+	    int yh1 = SAT_SHR12 (pixhigh);
+	    int yh2 = SAT_SHR12 ((pixhigh + pixhighstep * n));
 	    int v0, v1; SAT_VROWS(rw_toptexturemid, yl1, yh1, v0, v1);
 	    sat_lead_arm (&sat_lead_up, (segidx0 << 2) | 1, rw_x, rw_stopx - 1);   /* LEAD-FILL, see the mid tier */
 	    /* SATURN: same floor handling as the other tiers -- cull an upper (toptexture) wall
@@ -2077,10 +2195,10 @@ void R_RenderSegLoop (void)
 			int sdu = ur - ul; if (sdu < 0) sdu = -sdu;
 			if (sdu < 1 || (long long)tw * (xr - xl + 1) > 1024LL * sdu)
 			    { sat_sw_up = 1; sat_fb_mag_t++; break; }
-			int yll = (topfrac + topstep     * dnl + HEIGHTUNIT - 1) >> HEIGHTBITS;
-			int ylr = (topfrac + topstep     * dnr + HEIGHTUNIT - 1) >> HEIGHTBITS;
-			int yhl = (pixhigh + pixhighstep * dnl) >> HEIGHTBITS;
-			int yhr = (pixhigh + pixhighstep * dnr) >> HEIGHTBITS;
+			int yll = SAT_SHR12 ((topfrac + topstep     * dnl + HEIGHTUNIT - 1));
+			int ylr = SAT_SHR12 ((topfrac + topstep     * dnr + HEIGHTUNIT - 1));
+			int yhl = SAT_SHR12 ((pixhigh + pixhighstep * dnl));
+			int yhr = SAT_SHR12 ((pixhigh + pixhighstep * dnr));
 			int sv0, sv1; SAT_VROWS(rw_toptexturemid, yll, yhl, sv0, sv1);
 			if (sat_wall_hook (xl, yll, yhl, xr, ylr, yhr, toptexture, ul, ur, sv0, sv1, cm))
 			    { sat_sw_up = 1; sat_fb_starve_t++; break; }
@@ -2099,10 +2217,10 @@ void R_RenderSegLoop (void)
 	       (face-on step riser) has sat_v1_lo==0 + sat_sw_lo==0 (the subdivision owns it), so
 	       without it NOBODY drew the tier -> invisible riser (owner capture 2026-07-03). */
 	{
-	    int yl1 = (pixlow + HEIGHTUNIT - 1) >> HEIGHTBITS;
-	    int yl2 = (pixlow + pixlowstep * n + HEIGHTUNIT - 1) >> HEIGHTBITS;
-	    int yh1 = bottomfrac >> HEIGHTBITS;
-	    int yh2 = (bottomfrac + bottomstep * n) >> HEIGHTBITS;
+	    int yl1 = SAT_SHR12 ((pixlow + HEIGHTUNIT - 1));
+	    int yl2 = SAT_SHR12 ((pixlow + pixlowstep * n + HEIGHTUNIT - 1));
+	    int yh1 = SAT_SHR12 (bottomfrac);
+	    int yh2 = SAT_SHR12 ((bottomfrac + bottomstep * n));
 	    int v0, v1; SAT_VROWS(rw_bottomtexturemid, yl1, yh1, v0, v1);
 	    sat_lead_arm (&sat_lead_lo, (segidx0 << 2) | 2, rw_x, rw_stopx - 1);   /* LEAD-FILL, see the mid tier */
 	    /* SATURN: same floor handling as the one-sided wall -- cull a lower (bottomtexture)
@@ -2155,10 +2273,10 @@ void R_RenderSegLoop (void)
 			int sdu = ur - ul; if (sdu < 0) sdu = -sdu;
 			if (sdu < 1 || (long long)tw * (xr - xl + 1) > 1024LL * sdu)
 			    { sat_sw_lo = 1; sat_fb_mag_t++; break; }
-			int yll = (pixlow     + pixlowstep * dnl + HEIGHTUNIT - 1) >> HEIGHTBITS;
-			int ylr = (pixlow     + pixlowstep * dnr + HEIGHTUNIT - 1) >> HEIGHTBITS;
-			int yhl = (bottomfrac + bottomstep * dnl) >> HEIGHTBITS;
-			int yhr = (bottomfrac + bottomstep * dnr) >> HEIGHTBITS;
+			int yll = SAT_SHR12 ((pixlow     + pixlowstep * dnl + HEIGHTUNIT - 1));
+			int ylr = SAT_SHR12 ((pixlow     + pixlowstep * dnr + HEIGHTUNIT - 1));
+			int yhl = SAT_SHR12 ((bottomfrac + bottomstep * dnl));
+			int yhr = SAT_SHR12 ((bottomfrac + bottomstep * dnr));
 			int sv0, sv1; SAT_VROWS(rw_bottomtexturemid, yll, yhl, sv0, sv1);
 			if (sat_wall_hook (xl, yll, yhl, xr, ylr, yhr, bottomtexture, ul, ur, sv0, sv1, cm))
 			    { sat_sw_lo = 1; sat_fb_starve_t++; break; }
@@ -2235,7 +2353,7 @@ void R_RenderSegLoop (void)
 	   coordinates use two lines below (`>> HEIGHTBITS`).  Shifting by 16 divided the height by a
 	   further 16, every tier scored under the smallest rung, and all three steps flattened the
 	   WHOLE level identically: `n0 g0 cb0/0`, 1215 hits at every step. */
-	int lod_h = FixedMul (worldtop - worldbottom, rw_scale) >> HEIGHTBITS;
+	int lod_h = SAT_SHR12 (FixedMul (worldtop - worldbottom, rw_scale));
 	int lod_w = rw_stopx - rw_x;
 	if (lod_h < 0) lod_h = 0;
 	if (lod_w < 0) lod_w = 0;
