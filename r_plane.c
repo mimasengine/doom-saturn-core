@@ -1161,6 +1161,17 @@ int sat_frame_has_sky = 0;
    every sky visplane (any sky mode); sat_floor_px counts the dominant-floor skip => read both in a
    perf-sim floor-on mode (pad-Y mode 1/3).  Absolute pixel counts, reset each frame.  DoomJo-safe. */
 unsigned int sat_sky_px   = 0;
+/* SATURN 2026-08-28 -- SKY COLUMNS, and it is the unit the cost actually has.  R_DrawSkyColumn is
+   a FIXED bill per column (a 128-byte copy on a cart build; the grain/clamp setup either way) plus
+   a short per-pixel loop, so `px` alone cannot be turned into ms -- the factor swings 2-4x with
+   geometry, which is exactly why the ms bracket had to be added beside it in the first place.
+   `cols` closes that: px and cols together determine the bill, and BOTH ARE COUNTS, which is what
+   Ymir IS authoritative for.  The division of labour is then clean and neither half lies -- Ymir
+   sizes the JOB (how many columns of sky does a 4p outdoor spot actually have), the console prices
+   the RATE (ms per column).  Counted on the SOFTWARE path only, so the elected HW-sky view
+   contributes 0 by the same construction that makes its ms read 0.0. */
+unsigned int sat_sky_cols = 0;
+unsigned int sat_sky_cols_view[4] = { 0, 0, 0, 0 };
 /* sat_floor_px REMOVED 2026-08-26 -- dead work.  It was incremented once per span row and read
    by nobody: the row-13 classifier that consumed it was cut on 2026-08-06 and only the producer
    survived.  sat_sky_px stays -- it still prints. */
@@ -1469,6 +1480,7 @@ void R_DrawPlanes (void)
 
     sat_frame_has_sky = 0;   /* set below if any sky visplane is in view (platform drops NBG0 if not) */
     sat_sky_px = 0;   /* SATURN: sky coverage this frame (sat_floor_px removed 2026-08-26) */
+    sat_sky_cols = 0;                   /* SATURN 2026-08-28: and its per-COLUMN twin (row 12 `c`) */
     sat_sky_frt = 0;                    /* SATURN 2026-08-25: software-sky ms, same per-view clock */
     if (!sat_split_active || sat_split_view == sat_rbg0_view)   /* SATURN split: only the punching view resets, so P2 doesn't wipe P1's floor top */
         sat_vdp2_floor_top_y = 0x3FFF;  /* reset; the floor punch below lowers it to the floor's top screen row */
@@ -1648,6 +1660,7 @@ void R_DrawPlanes (void)
 		if (dc_yl <= dc_yh)
 		{
 		    sat_sky_px += (unsigned)(dc_yh - dc_yl + 1);   /* SATURN classifier: sky coverage (software-sky path) */
+		    sat_sky_cols++;                               /* SATURN row 12 `c`: the unit the drawer's cost actually has */
 		    angle = (viewangle + xtoviewangle[x])>>ANGLETOSKYSHIFT;
 		    dc_x = x;
 		    dc_source = R_GetColumn(skytexture, angle);

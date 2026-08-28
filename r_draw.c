@@ -308,6 +308,29 @@ static inline int R_SkyGrainTexel (int x, int row)
     h ^= h >> 5;
     return (int)(h & SKY_GRAIN_MAX);               /* real top-band texel index (same palette, keeps column density) */
 }
+/* SATURN 2026-08-28 -- THE 128-BYTE COPY IS SKIPPED IN CD MODE, and this is the sky drawers ONLY.
+   THE COPY'S OWN JUSTIFICATION (r_draw.c, R_DrawColumn) is the A-Bus: the WAD mapped in the RAM
+   cartridge is 16-bit and shared between both SH-2s, an arbitrary-stride sample costs one miss per
+   pixel, and 128 contiguous bytes collapse that to 8 sequential line fills.  On a CD disc there is
+   no cart: every lump is a zone allocation in LWRAM at 0x00200000, the CACHED mirror, so the SAME
+   8 line fills happen either way -- and the copy adds 128 stores on top of them.
+   AND THE SKY IS THE CASE WHERE IT PAYS LEAST, because its sample is nearly SEQUENTIAL: fracstep
+   is pspriteiscale (~2*FRACUNIT in split), so a span of H rows walks t with STRIDE 2 and touches
+   2H consecutive bytes -- 2 cache lines for a 15-row sliver against the copy's 8.  The rows that
+   overflow the top take R_SkyGrainTexel, whose value is `& 7`: they all land in bytes 0..7, ONE
+   line.  The rows past the bottom clamp to 127, one more.  A sky column simply never has the
+   scattered footprint the copy was built for.
+   WHY IT MATTERS: R_DrawSkyColumn is a FIXED cost per COLUMN, not per pixel -- a one-pixel sky
+   sliver pays the full 128 bytes -- so in split, where sky openings are narrow gaps between walls,
+   the copy IS the software sky's bill.  Row 12 `SKY` measures the bracket and now prints `c`, the
+   column count, beside it: the honest cross-build reading is **ms per column**, which normalises
+   out the scene ([[interbuild-perf-noise]] forbids comparing the absolutes).
+   ⚠ NOT APPLIED TO R_DrawColumn (the WALL drawer, the far hotter path) ON PURPOSE.  A wall column
+   samples with an arbitrary rw_scale-driven stride and is often taller than 128, so its footprint
+   really can be scattered -- the same reasoning does NOT carry over, and it needs a measurement,
+   not a deduction. */
+extern int w_lump_on_abus;   /* core w_wad.c: 1 = lumps live in the A-Bus cart, 0 = CD/zone */
+
 void R_DrawSkyColumn (void)
 {
     int			count;
@@ -328,14 +351,15 @@ void R_DrawSkyColumn (void)
     fracstep = dc_iscale;
     frac = dc_texturemid + (dc_yl-centery)*fracstep;
     byte col_cache[128];
-    memcpy(col_cache, dc_source, 128);
+    const byte *src = dc_source;
+    if (w_lump_on_abus) { memcpy(col_cache, dc_source, 128); src = col_cache; }
     int row = dc_yl;
     do
     {
 	int t = frac>>FRACBITS;
 	if (t < 0) t = R_SkyGrainTexel(dc_x, row);   /* top overflow: grain from the column's top band (no wrap, no streak) */
 	else if (t > 127) t = 127;
-	*dest = dc_colormap[col_cache[t]];
+	*dest = dc_colormap[src[t]];
 	dest += SCREENWIDTH;
 	frac += fracstep;
 	row++;

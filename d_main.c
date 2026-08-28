@@ -366,6 +366,7 @@ void D_Display (void)
 	extern int sat_vdp2_floor, sat_rbg0_view, sat_split_p1hw;   /* SATURN split: P1-only HW floor punch */
 	extern int sat_sky_view;                                    /* SATURN Part 5: elected HW-sky view (-1 = none) */
 	extern unsigned int sat_sky_px, sat_sky_px_view[4];         /* per-view sky coverage (election metric) */
+	extern unsigned int sat_sky_cols, sat_sky_cols_view[4];     /* per-view sky COLUMNS (row 12 `c`) */
 	extern unsigned int sat_sky_frt, sat_sky_frt_view[4];       /* per-view SOFTWARE-sky ms, FRT ticks (row 12 `SKY`) */
 	extern unsigned int sat_sky_view_angle, viewangle;          /* elected view's angle -> platform NBG0 scroll (angle_t==unsigned int) */
 	extern void R_SetViewWindow (int, int, int, int);
@@ -432,6 +433,7 @@ void D_Display (void)
 		R_SetViewWindow (vpx[i], twop ? 0 : vpy[i], hw, fh);
 		R_RenderPlayerView (&players[i]);
 		sat_sky_px_view[i] = sat_sky_px;                /* SATURN Part 5: this view's sky coverage (platform election metric) */
+		sat_sky_cols_view[i] = sat_sky_cols;            /* SATURN 2026-08-28: and its COLUMN count (row 12 `c`) */
 		sat_sky_frt_view[i] = sat_sky_frt;              /* SATURN 2026-08-25: and what its SOFTWARE sky COST (row 12 `SKY`; 0 by construction on the elected view, which draws none) */
 		if (i == sat_sky_view) sat_sky_view_angle = viewangle;   /* elected view's angle -> platform scrolls NBG0 by it (viewangle here is THIS view's, set by R_SetupFrame) */
 		tv[i + 1] = d_ms();

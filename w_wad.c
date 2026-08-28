@@ -105,6 +105,17 @@ static unsigned int   w_lump_seen_n = 0;
 // trips a loud guard there.  All read sites below use this instead of lump->wad_file.
 static wad_file_t *w_wadfile = NULL;
 
+/* SATURN 2026-08-28 -- WHICH BUS DO LUMP BYTES COME FROM?  1 = the WAD is memory-mapped in the
+   RAM cartridge (A-Bus, 16-bit, shared master/slave); 0 = CD mode, where every lump is a zone
+   allocation in LWRAM at 0x00200000 -- the CACHED mirror.  It exists because r_draw.c's column
+   drawers copy the whole 128-byte texture column to the stack before sampling it, and the ONLY
+   stated reason for that copy (r_draw.c:157) is the A-Bus: "one A-Bus cache miss per pixel (200
+   misses/column) ... 128 contiguous bytes = 8 sequential cache-line fills instead".  That
+   justification is TRUE on a cart and ABSENT on a disc, and nothing in core could tell the two
+   apart.  Set once by W_AddFile; a port that never maps reads 0 and keeps the safe path only
+   where it pays. */
+int w_lump_on_abus = 0;
+
 // SATURN R4.3c: accessor for the single WAD file -- w_checksum.c needs it now that the
 // per-lump lumpinfo.wad_file field is gone (with one file every lump is file #0).
 wad_file_t *W_MainWadFile(void) { return w_wadfile; }
@@ -219,6 +230,7 @@ wad_file_t *W_AddFile (char *filename)
     if (w_wadfile != NULL && w_wadfile != wad_file)
         I_Error ("W_AddFile: multi-file not supported (lumpinfo.wad_file dropped, R4.3c)");
     w_wadfile = wad_file;
+    w_lump_on_abus = (wad_file && wad_file->mapped != NULL) ? 1 : 0;
 
     newnumlumps = numlumps;
 
