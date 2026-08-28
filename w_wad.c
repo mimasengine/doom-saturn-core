@@ -611,6 +611,10 @@ void *W_CacheLumpNum(int lumpnum, int tag)
         // Already cached, so just switch the zone tag.
 
         result = lump->cache;
+        /* SATURN 2026-08-28: this IS the moment a resident lump proves it is still wanted -- the
+           only place in the tree that knows it.  Stamp it so Z_Malloc's rover steps over it
+           instead of evicting it in address order and paying ~29 ms to read it back. */
+        Z_Touch (lump->cache);
         /* SATURN: ...unless the lump is PINNED.  This retag is what defeats every attempt to keep
            a hot lump resident: the first R_GetColumn asking for PU_CACHE demotes it and the
            treadmill restarts.  Same defect the resident flat pool exists to fix. */
@@ -669,7 +673,10 @@ void *W_CacheLumpPrefix (int lumpnum, int nbytes)
     if (w_wadfile != NULL && w_wadfile->mapped != NULL)
         return w_wadfile->mapped + lump->position;
     if (lump->cache != NULL)
+    {
+        Z_Touch (lump->cache);      /* SATURN 2026-08-28: the prefix path is a use too */
         return lump->cache;
+    }
 
     if (nbytes > lump->size) nbytes = lump->size;
 

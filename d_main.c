@@ -224,6 +224,10 @@ void R_DrawSplitPlayerSprites (void)
 
 void D_Display (void)
 {
+    /* SATURN 2026-08-28: advance the zone's recency clock ONCE per rendered frame -- not per view.
+       All four split views share one texture working set, so a per-view tick would quarter the
+       protection window for nothing. */
+    Z_FrameTick ();
     static  boolean		viewactivestate = false;
     static  boolean		menuactivestate = false;
     static  boolean		inhelpscreensstate = false;
