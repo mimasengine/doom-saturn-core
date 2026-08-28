@@ -46,13 +46,6 @@ extern boolean W_PtrIsMapped(const void *p);
 #define MEM_ALIGN sizeof(void *)
 #define ZONEID	0x1d4a11
 
-/* SATURN 2026-08-28 -- THE FRAME CLOCK the recency purge compares against.  Advanced ONCE per
-   rendered frame by D_Display (not per view: in a 4p split all four views share one working set,
-   and protecting per view would just quarter the window).  Plain wraparound arithmetic on the
-   difference, so the 32-bit counter never needs resetting. */
-unsigned int z_frame = 0;
-void Z_FrameTick (void) { z_frame++; }
-
 // SATURN diag (SAT_ZONE_RA): tag every block with its Z_Malloc caller so the top-8 resident
 // dump can NAME the big blocks (resolve ra vs build/Mimas.map) -> attribute the RAM-diet targets.
 // +4 bytes/block header (a few KB) -- keep ON while dieting the zone, flip to 0 to ship.
@@ -77,27 +70,12 @@ void Z_FrameTick (void) { z_frame++; }
 #define SAT_ZONE_RA 0
 #endif
 
-/* [!] SATURN 2026-08-28 -- `touch`: THE FRAME THIS BLOCK WAS LAST USED.
-   Doom's rover evicts in ADDRESS order, which is uncorrelated with what the renderer is about to
-   ask for.  With a working set anywhere near the cache size, positional eviction is dramatically
-   worse than recency -- the classic result -- and on Saturn every wrong eviction is a ~29 ms
-   synchronous CD read the next time that wall is drawn.  One 32-bit stamp per block turns the
-   rover's purge into an approximate LRU: a block used within Z_KEEP_FRAMES is treated as
-   unpurgeable on the FIRST sweep, and the protection is dropped on the z_emergency rescan so it
-   can never turn a tight zone into an OOM.
-   +4 bytes per block header.  ~790 blocks (row-22 `zw`) => ~3 KB of a 1016 KB zone, and
-   sizeof(memblock_t) goes 24 -> 28, still a multiple of MEM_ALIGN (= sizeof(void*) = 4) and well
-   under MINFRAGMENT (64), so no alignment or fragment invariant moves.
-   ⚠ IT MUST BE INITIALISED EVERYWHERE A BLOCK IS BORN (Z_ClearZone, the Z_Malloc split), or a
-   garbage stamp reads "hot forever" and the block is never purged.  The z_emergency fallback is
-   the belt for exactly that. */
 typedef struct memblock_s
 {
     int			size;	// including the header and possibly tiny fragments
     void**		user;
     int			tag;	// PU_FREE if this is free
     int			id;	// should be ZONEID
-    unsigned int	touch;	// SATURN: z_frame when last allocated or used (recency purge)
     struct memblock_s*	next;
     struct memblock_s*	prev;
 #if SAT_ZONE_RA
@@ -147,7 +125,6 @@ void Z_ClearZone (memzone_t* zone)
     zone->rover = block;
 	
     block->prev = block->next = &zone->blocklist;
-    block->touch = 0;                       /* SATURN: never leave a recency stamp uninitialised */
     
     // a free block.
     block->tag = PU_FREE;
@@ -178,7 +155,6 @@ void Z_Init (void)
     mainzone->rover = block;
 	
     block->prev = block->next = &mainzone->blocklist;
-    block->touch = 0;                       /* SATURN: never leave a recency stamp uninitialised */
 
     // free block
     block->tag = PU_FREE;
@@ -333,11 +309,24 @@ Z_Malloc
        tracking `ld`).  If they do not, row-11 `zf` -- now TRUE free, not free+purgeable --
        says which failure it is: `zf` still large means pass 1 is not firing, `zf` near zero
        means the zone really is full and there was nothing to keep. */
+/* [!] AND RECENCY WAS TRIED ON TOP OF THIS, THE SAME DAY, AND PULLED THE SAME DAY.  The idea was
+   sound on paper -- stamp each block with the frame it was last used, let the rover step over what
+   the renderer is still drawing, i.e. turn positional eviction into an approximate LRU.  It cost a
+   4-byte header field, it FROZE THE TNT BOOT (stamping on allocation while z_frame stands still for
+   the whole of a load protected every block the load made, so the load could not recycle its own
+   cache), and once fixed to stamp only on re-use it moved the re-fault rate 53 % -> 40-49 %, which
+   is inside the spread between sessions.
+   WHY IT COULD NOT WIN, measured on 23 Ymir captures of TNT 2p (row 11 `zf`/`lg`/`ca`):
+       resident cache  `ca`  322-427 KB      truly free  `zf`   13-117 KB
+       largest run obtainable by purging `lg`  225 KB -- AND IT READ EXACTLY 225 IN 18 OF 23
+   So ~440 KB is reclaimable and the biggest contiguous piece of it is 225 KB: the zone is cut in
+   two by a pinned block, and 577 KB is unpurgeable.  To satisfy a LARGE request the rover must free
+   a CONTIGUOUS RUN, so it flattens whatever is adjacent, hot or cold -- recency has no choice to
+   reorder.  It can only help small allocations, and the expensive faults here are not small: row-20
+   `a`/`e` price ONE R_GenerateLookup at 73-82 ms, with `c` ~= `a`, i.e. one lump per frame.
+   THE LEVER IS CAPACITY AND CONTIGUITY, NOT POLICY.  Do not re-propose an eviction policy for this
+   zone without first showing `lg` moving. */
 #define Z_KEEPCACHE_HOPS 64
-/* Frames a purgeable block stays protected from the rover after its last use.  4 is ~0,3-0,8 s
-   at the 5-15 fps a 4p split runs at -- long enough to cover the room the player is standing in,
-   short enough that turning around releases the old walls inside a second. */
-#define Z_KEEP_FRAMES    4
     {
         memblock_t *p    = mainzone->rover;
         memblock_t *best = NULL;
@@ -469,24 +458,9 @@ Z_Malloc
 
         if (rover->tag != PU_FREE)
         {
-            /* [!] SATURN 2026-08-28 -- RECENCY.  A purgeable block used within the last
-               Z_KEEP_FRAMES frames is treated exactly like an unpurgeable one FOR THIS SWEEP.
-               That is the whole of the approximate LRU: the rover still walks in address order,
-               but it steps OVER what the renderer is demonstrably still using instead of throwing
-               it away and paying ~29 ms of CD to read it back.  Doom's eviction is POSITIONAL,
-               and address order is uncorrelated with what is about to be drawn -- with a working
-               set anywhere near the cache size that is dramatically worse than recency.
-               The protection is dropped on the z_emergency rescan (which re-anchors at the list
-               head after a full sweep found nothing), so this can change WHICH block dies but can
-               never turn a tight zone into an OOM: the second pass is byte for byte the old
-               behaviour.
-               ⚠ IT CANNOT INVENT CAPACITY.  If the resident cache is smaller than one frame's
-               working set, recency and address order perform identically and this buys nothing.
-               That is exactly what row-11 `ca` ships with it to say. */
-            if (rover->tag < PU_PURGELEVEL
-                || (!z_emergency && (unsigned int)(z_frame - rover->touch) < Z_KEEP_FRAMES))
+            if (rover->tag < PU_PURGELEVEL)
             {
-                // hit a block that can't be purged (or is still hot),
+                // hit a block that can't be purged,
                 // so move base past it
                 base = rover = rover->next;
             }
@@ -520,7 +494,6 @@ Z_Malloc
 	
         newblock->tag = PU_FREE;
         newblock->user = NULL;	
-        newblock->touch = 0;            /* SATURN: a fresh fragment is not hot */
         newblock->prev = base;
         newblock->next = base->next;
         newblock->next->prev = newblock;
@@ -534,7 +507,6 @@ Z_Malloc
 
     base->user = user;
     base->tag = tag;
-    base->touch = z_frame;          /* SATURN: what we just handed out is hot by definition */
 #if SAT_ZONE_RA
     base->ra = __builtin_return_address(0);   // who called Z_Malloc (W_CacheLumpNum / R_GenerateComposite / P_Setup...)
 #endif
@@ -746,21 +718,6 @@ int Z_FreeMemory (void)
     return free;
 }
 
-/* Mark a block as used NOW.  Called from W_CacheLumpNum's HIT path -- the one place that knows a
-   resident lump was just wanted.  A miss does not need it: Z_Malloc stamps what it hands out.
-   Cheap enough for the R_GetColumn path (one compare, one store) and silently ignores anything
-   that is not a live zone block, so a mapped-cart pointer or a NULL costs one branch. */
-void Z_Touch (void *ptr)
-{
-    memblock_t *block;
-    if (ptr == NULL) return;
-    block = (memblock_t *)((byte *)ptr - sizeof(memblock_t));
-    if ((byte *)block < (byte *)mainzone ||
-        (byte *)block >= (byte *)mainzone + mainzone->size) return;
-    if (block->id != ZONEID) return;
-    block->touch = z_frame;
-}
-
 /* SATURN 2026-08-28 -- FREE MEANS FREE.  Z_FreeMemory above counts PU_PURGELEVEL as free, so
    overlay row-11 `zf` and `lg` were BOTH reporting the zone on the assumption that the whole lump
    cache is expendable -- two views of one number, and neither could say how much of the zone is
@@ -930,7 +887,6 @@ void *Z_InitZone (void *base, int size)
     zone->rover = block;
 
     block->prev = block->next = &zone->blocklist;
-    block->touch = 0;                       /* SATURN: never leave a recency stamp uninitialised */
     block->user = NULL;
     block->id   = 0;
     block->tag  = PU_FREE;
@@ -978,7 +934,6 @@ void *Z_Malloc2 (void *zoneptr, int size, int tag)
         newblock->size = extra;
         newblock->tag  = PU_FREE;
         newblock->user = NULL;
-        newblock->touch = 0;            /* SATURN: a fresh fragment is not hot */
         newblock->prev = base;
         newblock->next = base->next;
         newblock->next->prev = newblock;

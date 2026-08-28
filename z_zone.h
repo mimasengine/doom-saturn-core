@@ -61,8 +61,6 @@ void    Z_ChangeTag2 (void *ptr, int tag, char *file, int line);
 void    Z_ChangeUser(void *ptr, void **user);
 int     Z_FreeMemory (void);
 int     Z_TrueFree (void);   /* SATURN: PU_FREE only -- `zf` vs `lg` = truly free vs purge-obtainable */
-void    Z_FrameTick (void);  /* SATURN: advance the recency clock, once per rendered frame */
-void    Z_Touch (void *ptr); /* SATURN: mark a cached block as used NOW (recency purge) */
 int     Z_LargestAllocatable (void);
 int Z_CanAllocate (int size);   /* SATURN: early-exit threshold form of the above */
 extern int z_walk_blocks;       /* SATURN: zone blocks walked this frame (reset in RP_BeginFrame) */   // largest contiguous run after purging (frag vs exhaustion)
