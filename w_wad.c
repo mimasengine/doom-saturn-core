@@ -83,6 +83,23 @@ int r_readlump_short = 0;
    sight exactly as before: the budget is inert, not broken, on a medium with no latency. */
 unsigned int w_cd_ms10 = 0;
 
+/* SATURN 2026-08-28 -- THE RE-FAULT WITNESS (row 1 `ld<chunks>/<refaults>`).
+   `w_lump_faults`   = lumps pulled off the MEDIUM (the cart memcpy below is not a medium read and
+                       is deliberately excluded, so a cart build reads 0/0 and the probe is inert).
+   `w_lump_refaults` = of those, the ones whose lump had ALREADY been pulled once this run.
+   WHY: `ld` (the platform's GFS chunk counter) climbed 583 -> 2075 across one owner session while
+   the memory says it MUST PLATEAU, and the two explanations have OPPOSITE cures -- new content
+   every frame (churn: only an async read helps) versus the zone evicting lumps under the renderer
+   and pulling them twice (thrash: keep them resident and the whole class disappears).  One bit per
+   lump separates them, and nothing else on screen can.
+   The bitmap is Z_Malloc'd PU_STATIC once, ~390 B for TNT's 3101 lumps -- from the ZONE, not the
+   TLSF pool, and never freed, so there is no purge-under-the-render hazard of the kind the R4
+   texture directories have.  If the alloc is refused the probe degrades to counting faults only. */
+unsigned int w_lump_faults   = 0;
+unsigned int w_lump_refaults = 0;
+static unsigned char *w_lump_seen = NULL;
+static unsigned int   w_lump_seen_n = 0;
+
 // SATURN R4.3c: the single WAD file backing every lump (was a per-lump lumpinfo.wad_file
 // pointer -- dropped to save 4B/lump off the zone).  Set once by W_AddFile; a second file
 // trips a loud guard there.  All read sites below use this instead of lump->wad_file.
@@ -397,6 +414,9 @@ void W_ReadLump(unsigned int lump, void *dest)
 
     I_BeginRead ();
 
+    /* SATURN 2026-08-28: everything past the cart memcpy below is a MEDIUM read -- the DRP subset
+       and the full-WAD read alike.  Counted THERE, not here, so a cart build stays at 0/0. */
+
     /* SATURN: wad_file->mapped = sat_wad_base (direct cart RAM pointer).
        Bypass Saturn_Read (which gates on sat_wad_size and can return 0 for
        lumps in the second half of the WAD) and memcpy directly from the
@@ -406,6 +426,23 @@ void W_ReadLump(unsigned int lump, void *dest)
         memcpy(dest, w_wadfile->mapped + l->position, l->size);
         I_EndRead();
         return;
+    }
+
+    /* --- MEDIUM READ from here down: count it, and say whether we have paid for THIS lump before. */
+    w_lump_faults++;
+    if (w_lump_seen_n != numlumps)
+    {
+        unsigned int nb = (numlumps + 7u) >> 3;
+        if (w_lump_seen) Z_Free(w_lump_seen);
+        w_lump_seen = Z_Malloc((int)nb, PU_STATIC, NULL);
+        if (w_lump_seen) memset(w_lump_seen, 0, nb);
+        w_lump_seen_n = w_lump_seen ? numlumps : 0u;
+    }
+    if (w_lump_seen)
+    {
+        unsigned char m = (unsigned char)(1u << (lump & 7u));
+        if (w_lump_seen[lump >> 3] & m) w_lump_refaults++;
+        else                            w_lump_seen[lump >> 3] |= m;
     }
 
 #ifdef SAT_REPACK
