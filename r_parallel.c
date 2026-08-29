@@ -2630,6 +2630,22 @@ int sat_prof_dropped=0;            /* glitch/transition frames excluded from the
    freezing on the map's post-load record.  Separate from sat_prof_pk_bp on purpose (row 4's peak
    is the A/B reference and must survive the whole toggle window). */
 int sat_prof_bp_win=0;
+/* [!] SATURN 2026-08-29 -- THE HANDSHAKE THAT PUTS ROWS 4 AND 20 ON THE SAME FRAME.
+   Set to this frame's `bp10` (tenths of ms, non-zero = hit) at the instant this frame takes the
+   1 s Bp peak, i.e. inside the SAME `if` that latches row 20's sub-split.  The platform reads it
+   at the end of DG_DrawFrame, copies its own four terms (em / hd / pr / lp) and clears it.
+   WHY IT HAD TO EXIST: row 4 printed the LAST frame and row 20 the WORST one, so every attempt to
+   say "that 190 ms `lp` is what made that frame slow" was comparing two frames up to a second
+   apart -- the exact defect the row-4 legend already records for `wp` vs `Bp` (|wp-Bp| over 25 %
+   on 7 of 23 console frames, "they were not disagreeing, they were describing frames up to a
+   second apart").  It was the last thing blocking the fluidity work: the owner's captures show
+   `lp` from 5,9 to 283,7 ms and `em` from 1,4 to 101,3, and NOTHING could say which of them owned
+   a given slow frame.
+   ⚠ The platform copies at END of frame, not here, on purpose: `em` (sat_p_emit10) is written by
+   the VDP1 kick, which is not necessarily finished when this runs.  Reading it here could latch
+   the PREVIOUS frame's emit against this frame's Bp -- a one-frame skew, silent, and worse than
+   the misalignment being fixed. */
+int sat_prof_bp_hit=0;
 /* SATURN 2026-08-15: the LOD governor's state lives in r_segs.c beside the knob it drives. */
 extern int sat_lod_eff, sat_lod_auto_step, sat_gov_debt;
 extern int sat_lead_mode, sat_wall_lead_x;   /* r_segs.c: the lead-fill's mode and depth */
@@ -3249,6 +3265,7 @@ static void rp_p3_prof_show(void)
            session semantics untouched: that peak is what the A/B toggles compare. */
         if (bp10 > (unsigned)sat_prof_bp_win) {
             sat_prof_bp_win = (int)bp10;
+            sat_prof_bp_hit = (int)bp10;   /* SATURN: tell the platform to latch row 4 on THIS frame */
             /* SATURN 2026-08-08: latch the Bp SUB-SPLIT of THIS SAME FRAME.  Three independent
                maxima would describe three different frames and prove nothing -- the lesson row 20
                already taught with `c`/`n` against `e`.  So the split always describes the frame
