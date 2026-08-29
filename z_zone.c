@@ -46,6 +46,35 @@ extern boolean W_PtrIsMapped(const void *p);
 #define MEM_ALIGN sizeof(void *)
 #define ZONEID	0x1d4a11
 
+/* [!] SATURN 2026-08-29 -- IN-PLAY LONG-LIVED ALLOCATIONS: `ip` on row 12, and it exists because
+   `sp` answered its question and pointed HERE.
+   WHAT `sp` SAID, over the owner's 54 shareware 1p captures: early in a level the best single
+   relocation was worth +208 KB (a 2 KB PU_LEVEL block splitting 234 | 206), and then `lg` fell
+   424 -> 267 in ONE step -- two lumps loaded, +2 chunks, +2 re-faults -- and from that moment the
+   best block was a 4 KB PU_STATIC worth only lg+4.  `gain - lg == the block's own size` means the
+   free run AFTER it is ZERO, i.e. it is flanked by ANOTHER unpurgeable block: they come in
+   CLUSTERS, which is why no single relocation recovers the run and why "move the splitter" died
+   as a plan the moment it was measured.
+   So the question is no longer WHICH block, it is WHO KEEPS ALLOCATING THEM.  These four counters
+   answer it: every allocation with a long-lived tag made AFTER P_SetupLevel finished -- count,
+   total, and the return address of the biggest one, which resolves against build/Mimas*.map to a
+   function name.
+   ⚠ ONE latched `ra`, not a per-block field: SAT_ZONE_RA costs 4 bytes on EVERY header and would
+   shift every allocation in the zone, i.e. it would perturb the very layout being measured.  A
+   single slot costs nothing and names the caller just as well when n/bytes say the blocks are all
+   the same size. */
+int z_ip_arm   = 0;     /* 1 while the level is being PLAYED, 0 while it is being built */
+int z_ip_n     = 0;     /* long-lived allocations since this level started */
+int z_ip_bytes = 0;     /* their total */
+int z_ip_max   = 0;     /* the biggest one */
+void *z_ip_ra  = 0;     /* who asked for it -- low 20 bits printed, resolve against the .map */
+
+void Z_InPlayArm (int on)
+{
+    z_ip_arm = on;
+    if (on) { z_ip_n = 0; z_ip_bytes = 0; z_ip_max = 0; z_ip_ra = 0; }
+}
+
 // SATURN diag (SAT_ZONE_RA): tag every block with its Z_Malloc caller so the top-8 resident
 // dump can NAME the big blocks (resolve ra vs build/Mimas.map) -> attribute the RAM-diet targets.
 // +4 bytes/block header (a few KB) -- keep ON while dieting the zone, flip to 0 to ship.
@@ -507,6 +536,13 @@ Z_Malloc
 
     base->user = user;
     base->tag = tag;
+    if (z_ip_arm && tag < PU_PURGELEVEL)   /* SATURN: see Z_InPlayArm -- the fragmenter census */
+    {
+        z_ip_n++;
+        z_ip_bytes += size;
+        if (size > z_ip_max)
+        { z_ip_max = size; z_ip_ra = __builtin_return_address(0); }
+    }
 #if SAT_ZONE_RA
     base->ra = __builtin_return_address(0);   // who called Z_Malloc (W_CacheLumpNum / R_GenerateComposite / P_Setup...)
 #endif

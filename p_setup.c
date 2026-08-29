@@ -1133,6 +1133,9 @@ void (*sat_sky_precache_hook)(void) = NULL;
 //
 // P_SetupLevel
 //
+/* SATURN 2026-08-29: the zone's fragmenter census counts only what is allocated DURING PLAY, so
+   it is disarmed for the whole of the level build and re-armed (and reset) once the build is
+   done.  Row 12 `ip<n>/<KB>@<ra>`. */
 void
 P_SetupLevel
 ( int		episode,
@@ -1144,6 +1147,8 @@ P_SetupLevel
     char	lumpname[9];
     int		lumpnum;
 	
+    Z_InPlayArm (0);      /* SATURN: the level BUILD is not what fragments the zone across a
+                             session -- only what play does after it.  Re-armed at the end. */
     totalkills = totalitems = totalsecret = wminfo.maxfrags = 0;
     wminfo.partime = 180;
     for (i=0 ; i<MAXPLAYERS ; i++)
@@ -1312,6 +1317,10 @@ P_SetupLevel
 
     //printf ("free memory: 0x%x\n", Z_FreeMemory());
 
+    /* SATURN: the build is over -- start counting the long-lived allocations that PLAY makes.
+       Everything above this line is the level itself, and it is not what fragments the zone
+       across a session; what happens after it is. */
+    Z_InPlayArm (1);
 }
 
 
