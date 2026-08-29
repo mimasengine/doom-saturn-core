@@ -1203,6 +1203,42 @@ void sat_lead_frame_begin (void)   /* once per view, from R_ClearDrawSegs */
     sat_leadh_hint = 0;
 }
 
+/* [!] SATURN 2026-08-29 -- CLAIM THE LEAD-FILL BLOCKS AT R_Init, NOT ON THE FIRST RENDERED FRAME.
+   Called once from R_Init.  The two lazy sites above and in R_WallFillArm stay as fallbacks and
+   are now normally no-ops.
+   WHY: row-12 `ip` latched THIS FILE as the biggest long-lived allocation made during play, every
+   capture of the owner's 2026-08-29 shareware session -- `@32d98`, which resolves inside
+   R_WallFillArm.  The comment above already said the dangerous half out loud: these are "LAZY
+   PU_STATIC blocks claimed on the first rendered frame -- i.e. AFTER the level has taken its share
+   of the zone".  What it did not say is where they LAND: wherever the rover happens to sit when
+   the first frame draws, which is in the middle of the free region P_SetupLevel just left.  36 KB
+   of never-purgeable block, dropped into the largest free run, permanently.  Row-11 `lg` decaying
+   424 -> 267 in one step is exactly what that looks like.
+   At R_Init the zone holds almost nothing, so the blocks sit LOW, next to the other startup
+   statics, and the run above them stays whole.
+   ⚠ IT IS THE SAME BYTES, ONLY BETTER PLACED -- `sat_wallfill_min` is baked at 48, i.e. non-zero,
+   so R_WallFillArm already claimed the span ring on frame 1 of every level: nothing new is being
+   spent.  And it RETIRES a documented fatal: the note above records SCYTHE MAP30 dying on 36888
+   bytes with `fr18K lg11K` on a level that had loaded perfectly.  At R_Init that cannot happen.
+   The Z_CanAllocate guards stay anyway -- an optional subsystem asks, it does not demand. */
+void R_LeadFillInit (void)
+{
+    int i;
+
+    if (!sat_lead_spans
+	&& Z_CanAllocate (sizeof(sat_leadspan_t) * SAT_LEADSPAN_MAX))
+	sat_lead_spans = Z_Malloc (sizeof(sat_leadspan_t) * SAT_LEADSPAN_MAX, PU_STATIC, NULL);
+
+    if (!sat_leadh[0]
+	&& Z_CanAllocate (sizeof(sat_leadq_t) * SAT_LEADH_MAX * SAT_LEADH_DEPTH))
+    {
+	sat_leadq_t* heads = Z_Malloc (sizeof(sat_leadq_t) * SAT_LEADH_MAX * SAT_LEADH_DEPTH,
+				       PU_STATIC, NULL);
+	for (i = 0 ; i < SAT_LEADH_DEPTH ; i++)
+	    sat_leadh[i] = heads + i * SAT_LEADH_MAX;
+    }
+}
+
 static void sat_lead_record (int key, int x1, int yl1, int yh1, int x2, int yl2, int yh2)
 {
     sat_leadq_t *q;

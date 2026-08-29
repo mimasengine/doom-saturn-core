@@ -983,6 +983,10 @@ void R_Init (void)
     printf (".");
     R_InitSkyMap ();
     R_InitTranslationTables ();
+    /* SATURN 2026-08-29: claim the lead-fill rings HERE, while the zone is still empty, instead of
+       on the first rendered frame of every level -- see R_LeadFillInit in r_segs.c.  Same bytes,
+       placed low instead of dropped into the middle of the run P_SetupLevel leaves behind. */
+    { extern void R_LeadFillInit (void); R_LeadFillInit (); }
     printf (".");
 	
     framecount = 0;

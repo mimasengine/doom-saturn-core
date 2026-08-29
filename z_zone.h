@@ -64,7 +64,7 @@ int     Z_TrueFree (void);   /* SATURN: PU_FREE only -- `zf` vs `lg` = truly fre
 /* SATURN: the block that costs the most contiguity, set by Z_LargestAllocatable's own pass. */
 extern int z_split_gain, z_split_size, z_split_tag, z_split_off;
 /* SATURN: the in-play long-lived allocation census -- who keeps fragmenting the zone. */
-extern int z_ip_n, z_ip_bytes, z_ip_max;
+extern int z_ip_n, z_ip_bytes, z_ip_top;
 extern void *z_ip_ra;
 void    Z_InPlayArm (int on);   /* 0 while a level is being built, 1 while it is played */
 int     Z_LargestAllocatable (void);

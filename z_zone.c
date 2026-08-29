@@ -63,16 +63,62 @@ extern boolean W_PtrIsMapped(const void *p);
    shift every allocation in the zone, i.e. it would perturb the very layout being measured.  A
    single slot costs nothing and names the caller just as well when n/bytes say the blocks are all
    the same size. */
+/* [!] REVISED 2026-08-29, SAME DAY: THE LATCH IS THE MOST *FREQUENT* SITE, NOT THE BIGGEST.
+   The first version latched the ra of the LARGEST allocation and it named a ONE-SHOT -- the
+   lead-fill span ring, 36 KB, claimed once on the first rendered frame (now moved to R_Init,
+   see R_LeadFillInit).  A real find, but it is not what makes ~700 allocations a level.  A single
+   biggest-slot cannot answer "who KEEPS allocating", which was the whole question.
+   So: a 16-slot open-addressed table keyed on the return address, counting hits.  The overlay
+   prints the top site's COUNT over the total, which makes dominance readable at a glance --
+   `ip412/692` says one caller did 60 % of them; `ip8/692` says it is spread and the fix has to be
+   structural.
+   ⚠ THE TOTAL OVER-COUNTS ON PURPOSE, AND YOU MUST KNOW IT: the tag is read AT ALLOCATION, and
+   several callers allocate PU_STATIC and immediately retag PU_CACHE (R_GenerateComposite's
+   composite, R_GenerateLookup's two column directories) or Z_Free before the frame ends
+   (patchcount).  Those are counted here and are NOT permanent fragmenters.  That is why the field
+   reports a SITE and not just a number: you resolve the ra, read that function, and decide.  A
+   probe that silently guessed which allocations were transient would be worse than one that says
+   so. */
+#define Z_IP_SITES 16
 int z_ip_arm   = 0;     /* 1 while the level is being PLAYED, 0 while it is being built */
 int z_ip_n     = 0;     /* long-lived allocations since this level started */
 int z_ip_bytes = 0;     /* their total */
-int z_ip_max   = 0;     /* the biggest one */
-void *z_ip_ra  = 0;     /* who asked for it -- low 20 bits printed, resolve against the .map */
+int z_ip_top   = 0;     /* hits of the most frequent site */
+void *z_ip_ra  = 0;     /* that site -- low 20 bits printed, resolve against build/Mimas-<Wad>.map */
+static void *z_ip_site[Z_IP_SITES];
+static int   z_ip_cnt [Z_IP_SITES];
 
 void Z_InPlayArm (int on)
 {
+    int i;
     z_ip_arm = on;
-    if (on) { z_ip_n = 0; z_ip_bytes = 0; z_ip_max = 0; z_ip_ra = 0; }
+    if (on)
+    {
+        z_ip_n = 0; z_ip_bytes = 0; z_ip_top = 0; z_ip_ra = 0;
+        for (i = 0; i < Z_IP_SITES; i++) { z_ip_site[i] = 0; z_ip_cnt[i] = 0; }
+    }
+}
+
+/* Record one long-lived allocation against its call site and keep the running leader.  Open
+   addressing over the whole table, so a full table simply stops learning new sites instead of
+   evicting -- the sites that matter are the ones that fire first and often. */
+static void Z_InPlayNote (void *ra, int size)
+{
+    int i, h = (int)(((unsigned long)ra >> 2) & (Z_IP_SITES - 1));
+
+    z_ip_n++;
+    z_ip_bytes += size;
+
+    for (i = 0; i < Z_IP_SITES; i++)
+    {
+        int k = (h + i) & (Z_IP_SITES - 1);
+        if (z_ip_site[k] == 0) { z_ip_site[k] = ra; z_ip_cnt[k] = 0; }
+        if (z_ip_site[k] == ra)
+        {
+            if (++z_ip_cnt[k] > z_ip_top) { z_ip_top = z_ip_cnt[k]; z_ip_ra = ra; }
+            return;
+        }
+    }
 }
 
 // SATURN diag (SAT_ZONE_RA): tag every block with its Z_Malloc caller so the top-8 resident
@@ -537,12 +583,7 @@ Z_Malloc
     base->user = user;
     base->tag = tag;
     if (z_ip_arm && tag < PU_PURGELEVEL)   /* SATURN: see Z_InPlayArm -- the fragmenter census */
-    {
-        z_ip_n++;
-        z_ip_bytes += size;
-        if (size > z_ip_max)
-        { z_ip_max = size; z_ip_ra = __builtin_return_address(0); }
-    }
+        Z_InPlayNote (__builtin_return_address(0), size);
 #if SAT_ZONE_RA
     base->ra = __builtin_return_address(0);   // who called Z_Malloc (W_CacheLumpNum / R_GenerateComposite / P_Setup...)
 #endif
