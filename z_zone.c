@@ -654,6 +654,32 @@ Z_FreeTags
 
 
 
+/* [!] SATURN 2026-08-29 -- RE-ANCHOR THE ROVER AT THE BOTTOM.  Called from P_SetupLevel right
+   after Z_FreeTags(PU_LEVEL) and R_ClearFlatCache, i.e. at the one instant in the whole run when
+   the old level's space has just been handed back and the new one has not been carved yet.
+   THIS IS THE ONE-LINE ANSWER TO A CLIFF THREE SESSIONS OLD.  Z_FreeTags never touches the rover
+   (see just above -- it only walks and frees), so after it runs the rover is still standing
+   wherever the LAST allocation of the previous level left it: high, inside the cache region.  The
+   new map's SEGS / LINEDEFS / NODES are then carved from THERE, straight through the middle of the
+   biggest free run, and they are PU_LEVEL -- unpurgeable for the whole map.  That is the cliff the
+   owner has photographed at every single level change:
+       402 -> 151 -> 83   then   336 -> 128 -> 108   (row-11 `lg`, flat inside each level)
+   Flat inside a level, a cliff at every load: the damage is done ONCE, by the load, exactly where
+   the rover happened to be standing.
+   ⚠ AND IT IS WHY THE LOW-END PRE-PASS ABOVE DID NOTHING.  That pass anchors long-lived requests
+   at the list head, which is right -- but it is bounded at Z_LOWEND_HOPS, and the bottom of the
+   zone is hundreds of small boot statics (lumpinfo, colormaps, the DRP tables, the lead-fill
+   rings).  256 hops does not even REACH the freed region, so it found nothing and fell through to
+   the rover every time.  The reset fixes that too: the main scan is unbounded, so it walks the
+   statics (unpurgeable -> skipped, nothing purged) and lands in the space the old level just
+   vacated.  Cost is a few hundred pointer hops, once per level, against a permanent bisection.
+   ⚠ It re-anchors, it does not defragment: contiguity already lost stays lost. */
+void Z_ResetRover (void)
+{
+    mainzone->rover = mainzone->blocklist.next;
+}
+
+
 //
 // Z_DumpHeap
 // Note: TFileDumpHeap( stdout ) ?

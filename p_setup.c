@@ -1178,6 +1178,17 @@ P_SetupLevel
        re-carve after the geometry has landed. */
     R_ClearFlatCache ();
 
+    /* [!] SATURN 2026-08-29 -- RE-ANCHOR THE ROVER AT THE BOTTOM, HERE AND NOWHERE ELSE.
+       This is the one instant when the old level's space has just been handed back (the
+       Z_FreeTags above, plus the flat slab) and the new one has not been carved yet.
+       Z_FreeTags does not touch the rover, so without this the new map's SEGS / LINEDEFS /
+       NODES are carved from wherever the LAST allocation of the previous level left it --
+       high, inside the cache region -- and they are PU_LEVEL, i.e. unpurgeable for the whole
+       map.  Row-11 `lg` has photographed the result at every level change for three
+       sessions: 402 -> 151 -> 83, then 336 -> 128 -> 108, flat inside each level and a cliff
+       at every load.  See Z_ResetRover in z_zone.c. */
+    Z_ResetRover ();
+
     // UNUSED W_Profile ();
     P_InitThinkers ();
 	   
