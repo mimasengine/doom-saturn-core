@@ -402,10 +402,30 @@ Z_Malloc
    THE LEVER IS CAPACITY AND CONTIGUITY, NOT POLICY.  Do not re-propose an eviction policy for this
    zone without first showing `lg` moving. */
 #define Z_KEEPCACHE_HOPS 64
+/* [!] SATURN 2026-08-29 -- AND A LONG-LIVED BLOCK LOOKS FROM THE **BOTTOM**, NOT FROM THE ROVER.
+   THE EVIDENCE, three sessions deep and now unambiguous.  Once the DRP scratch stopped making 454
+   long-lived allocations a level (w_drp_saturn.cxx), row-12 `ip` fell to 103-147 per level and
+   36 KB of bytes -- in-play allocation is no longer the fragmenter.  And yet row-11 `lg` STILL
+   collapses from one map to the next: 402 on E1M1, 151 on E1M2, 83 on E1M3, each one flat across
+   twenty captures.  Flat inside a level, a cliff at every load.  So it is not play that shreds the
+   zone any more, IT IS THE LOAD -- P_SetupLevel interleaving level data (unpurgeable, forever) with
+   lumps it caches on the way (purgeable), wherever the rover happens to be standing.
+   The fix needs no knowledge of WHO allocates what: give the two classes opposite ends.  A block
+   tagged below PU_PURGELEVEL anchors its non-purging search at the LIST HEAD, so long-lived data
+   packs low and fills the holes it already made; PU_CACHE keeps the rover.  The big run stays where
+   the cache lives instead of being cut in half by the next map's SEGS.
+   Best-fit, not first-fit, for the same reason as the rover window: first-fit would carve the
+   largest low run for a 2 KB request.  Bounded, because this is a pre-pass, not a search of record:
+   the vanilla scan below is unchanged and still runs when the window comes up empty, so this can
+   only ever move a block that was going to be placed anyway.
+   ⚠ IT CANNOT RECOVER CONTIGUITY ALREADY LOST -- it stops new interleaving, it does not undo old.
+   Judge it on `lg` ACROSS a level load, not within one. */
+#define Z_LOWEND_HOPS    256
     {
-        memblock_t *p    = mainzone->rover;
+        int longlived = (tag < PU_PURGELEVEL);
+        memblock_t *p    = longlived ? mainzone->blocklist.next : mainzone->rover;
         memblock_t *best = NULL;
-        int hops = Z_KEEPCACHE_HOPS;
+        int hops = longlived ? Z_LOWEND_HOPS : Z_KEEPCACHE_HOPS;
 
         if ((byte *)p < (byte *)mainzone ||
             (byte *)p >= (byte *)mainzone + mainzone->size)
