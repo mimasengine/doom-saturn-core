@@ -828,12 +828,37 @@ int Z_CanAllocate (int size)
     return 0;
 }
 
+/* [!] SATURN 2026-08-29 -- THE SPLITTER.  Set by Z_LargestAllocatable in its own single pass.
+   WHY THIS AND NOT AN EVICTION POLICY: the run below is broken ONLY by UNPURGEABLE blocks -- the
+   loop treats every PU_PURGELEVEL block as free -- so `lg` already means "the largest contiguous
+   run obtainable AFTER purging absolutely everything".  A cache purge therefore CANNOT raise it,
+   by construction, and the blocks costing us contiguity are necessarily PU_STATIC / PU_LEVEL.
+   That is proved, not conjectured, and it is why the recency lever above could never have worked.
+   WHAT THE OWNER'S 65 SHAREWARE CAPTURES OF 2026-08-28 SHOW: `lg` decays 224 -> 220 -> 189 -> 159
+   -> 70 KB across one session and NEVER recovers, while `ca` stays at 347-560 KB.  Plenty of
+   reclaimable memory, none of it assemblable.  The marginal re-fault rate tracks it exactly: ~32 %
+   while lg = 224, 70-87 % once lg = 70.  And it crossed a LEVEL LOAD getting worse (159 -> 70,
+   with `zf` going UP 55 -> 146), so the fragmenters survive P_SetupLevel: they accumulate.
+   SCORING: for each unpurgeable block, what its removal WOULD merge = the free run ending at it,
+   plus its own size, plus the free run starting after it.  The maximum names the ONE block worth
+   relocating and says what relocating it buys -- which is the number that decides whether the fix
+   is worth writing.  `gain` is always > `lg` when any unpurgeable block exists. */
+int z_split_gain = 0;   /* bytes the largest run would become if this block moved elsewhere */
+int z_split_size = 0;   /* bytes -- match against the zone census in this file's header */
+int z_split_tag  = 0;   /* 1=STATIC 2=SOUND 3=MUSIC 5=LEVEL 6=LEVSPEC (NOT vanilla's 50/51 --
+                           this enum has no explicit values past PU_STATIC; the halt message
+                           below has said 50/51 since it was written and is wrong about it) */
+int z_split_off  = 0;   /* byte offset from mainzone: same block twice = the same offset */
+
 int Z_LargestAllocatable (void)
 {
     memblock_t*	block;
     int		run = 0;
     int		largest = 0;
     int		nblk = 0;
+    /* pending = the last unpurgeable block seen; its "run after" is not known until the NEXT one */
+    int		p_valid = 0, p_before = 0, p_size = 0, p_tag = 0, p_off = 0;
+    int		b_gain = 0, b_size = 0, b_tag = 0, b_off = 0;
 
 
     for (block = mainzone->blocklist.next ;
@@ -848,8 +873,29 @@ int Z_LargestAllocatable (void)
                 largest = run;
         }
         else
+        {
+            if (p_valid)
+            {
+                int merged = p_before + p_size + run;   /* `run` is the run AFTER the pending block */
+                if (merged > b_gain)
+                { b_gain = merged; b_size = p_size; b_tag = p_tag; b_off = p_off; }
+            }
+            p_valid  = 1;
+            p_before = run;
+            p_size   = block->size;
+            p_tag    = block->tag;
+            p_off    = (int)((char *)block - (char *)mainzone);
             run = 0;   // unpurgeable block breaks the contiguous run
+        }
     }
+    if (p_valid)                       /* the last one: its run-after is the tail of the list */
+    {
+        int merged = p_before + p_size + run;
+        if (merged > b_gain)
+        { b_gain = merged; b_size = p_size; b_tag = p_tag; b_off = p_off; }
+    }
+    z_split_gain = b_gain; z_split_size = b_size;
+    z_split_tag  = b_tag;  z_split_off  = b_off;
 
     z_walk_blocks += nblk;
     return largest;

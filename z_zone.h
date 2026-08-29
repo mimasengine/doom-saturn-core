@@ -61,6 +61,8 @@ void    Z_ChangeTag2 (void *ptr, int tag, char *file, int line);
 void    Z_ChangeUser(void *ptr, void **user);
 int     Z_FreeMemory (void);
 int     Z_TrueFree (void);   /* SATURN: PU_FREE only -- `zf` vs `lg` = truly free vs purge-obtainable */
+/* SATURN: the block that costs the most contiguity, set by Z_LargestAllocatable's own pass. */
+extern int z_split_gain, z_split_size, z_split_tag, z_split_off;
 int     Z_LargestAllocatable (void);
 int Z_CanAllocate (int size);   /* SATURN: early-exit threshold form of the above */
 extern int z_walk_blocks;       /* SATURN: zone blocks walked this frame (reset in RP_BeginFrame) */   // largest contiguous run after purging (frag vs exhaustion)
