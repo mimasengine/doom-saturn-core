@@ -63,10 +63,9 @@ int     Z_FreeMemory (void);
 int     Z_TrueFree (void);   /* SATURN: PU_FREE only -- `zf` vs `lg` = truly free vs purge-obtainable */
 /* SATURN: the block that costs the most contiguity, set by Z_LargestAllocatable's own pass. */
 extern int z_split_gain, z_split_size, z_split_tag, z_split_off;
-/* SATURN: the in-play long-lived allocation census -- who keeps fragmenting the zone. */
-extern int z_ip_n, z_ip_bytes, z_ip_top;
-extern void *z_ip_ra;
-void    Z_InPlayArm (int on);   /* 0 while a level is being built, 1 while it is played */
+/* SATURN: the pinned census -- how much of the zone can never be reclaimed, and its biggest
+   single block.  Set by Z_LargestAllocatable's own pass.  Row 12 `pn<total>/<max>`. */
+extern int z_pinned_bytes, z_pinned_max;
 void    Z_ResetRover (void);    /* SATURN: re-anchor at the bottom -- call after Z_FreeTags(PU_LEVEL) */
 int     Z_LargestAllocatable (void);
 int Z_CanAllocate (int size);   /* SATURN: early-exit threshold form of the above */

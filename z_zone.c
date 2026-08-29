@@ -46,81 +46,6 @@ extern boolean W_PtrIsMapped(const void *p);
 #define MEM_ALIGN sizeof(void *)
 #define ZONEID	0x1d4a11
 
-/* [!] SATURN 2026-08-29 -- IN-PLAY LONG-LIVED ALLOCATIONS: `ip` on row 12, and it exists because
-   `sp` answered its question and pointed HERE.
-   WHAT `sp` SAID, over the owner's 54 shareware 1p captures: early in a level the best single
-   relocation was worth +208 KB (a 2 KB PU_LEVEL block splitting 234 | 206), and then `lg` fell
-   424 -> 267 in ONE step -- two lumps loaded, +2 chunks, +2 re-faults -- and from that moment the
-   best block was a 4 KB PU_STATIC worth only lg+4.  `gain - lg == the block's own size` means the
-   free run AFTER it is ZERO, i.e. it is flanked by ANOTHER unpurgeable block: they come in
-   CLUSTERS, which is why no single relocation recovers the run and why "move the splitter" died
-   as a plan the moment it was measured.
-   So the question is no longer WHICH block, it is WHO KEEPS ALLOCATING THEM.  These four counters
-   answer it: every allocation with a long-lived tag made AFTER P_SetupLevel finished -- count,
-   total, and the return address of the biggest one, which resolves against build/Mimas*.map to a
-   function name.
-   ⚠ ONE latched `ra`, not a per-block field: SAT_ZONE_RA costs 4 bytes on EVERY header and would
-   shift every allocation in the zone, i.e. it would perturb the very layout being measured.  A
-   single slot costs nothing and names the caller just as well when n/bytes say the blocks are all
-   the same size. */
-/* [!] REVISED 2026-08-29, SAME DAY: THE LATCH IS THE MOST *FREQUENT* SITE, NOT THE BIGGEST.
-   The first version latched the ra of the LARGEST allocation and it named a ONE-SHOT -- the
-   lead-fill span ring, 36 KB, claimed once on the first rendered frame (now moved to R_Init,
-   see R_LeadFillInit).  A real find, but it is not what makes ~700 allocations a level.  A single
-   biggest-slot cannot answer "who KEEPS allocating", which was the whole question.
-   So: a 16-slot open-addressed table keyed on the return address, counting hits.  The overlay
-   prints the top site's COUNT over the total, which makes dominance readable at a glance --
-   `ip412/692` says one caller did 60 % of them; `ip8/692` says it is spread and the fix has to be
-   structural.
-   ⚠ THE TOTAL OVER-COUNTS ON PURPOSE, AND YOU MUST KNOW IT: the tag is read AT ALLOCATION, and
-   several callers allocate PU_STATIC and immediately retag PU_CACHE (R_GenerateComposite's
-   composite, R_GenerateLookup's two column directories) or Z_Free before the frame ends
-   (patchcount).  Those are counted here and are NOT permanent fragmenters.  That is why the field
-   reports a SITE and not just a number: you resolve the ra, read that function, and decide.  A
-   probe that silently guessed which allocations were transient would be worse than one that says
-   so. */
-#define Z_IP_SITES 16
-int z_ip_arm   = 0;     /* 1 while the level is being PLAYED, 0 while it is being built */
-int z_ip_n     = 0;     /* long-lived allocations since this level started */
-int z_ip_bytes = 0;     /* their total */
-int z_ip_top   = 0;     /* hits of the most frequent site */
-void *z_ip_ra  = 0;     /* that site -- low 20 bits printed, resolve against build/Mimas-<Wad>.map */
-static void *z_ip_site[Z_IP_SITES];
-static int   z_ip_cnt [Z_IP_SITES];
-
-void Z_InPlayArm (int on)
-{
-    int i;
-    z_ip_arm = on;
-    if (on)
-    {
-        z_ip_n = 0; z_ip_bytes = 0; z_ip_top = 0; z_ip_ra = 0;
-        for (i = 0; i < Z_IP_SITES; i++) { z_ip_site[i] = 0; z_ip_cnt[i] = 0; }
-    }
-}
-
-/* Record one long-lived allocation against its call site and keep the running leader.  Open
-   addressing over the whole table, so a full table simply stops learning new sites instead of
-   evicting -- the sites that matter are the ones that fire first and often. */
-static void Z_InPlayNote (void *ra, int size)
-{
-    int i, h = (int)(((unsigned long)ra >> 2) & (Z_IP_SITES - 1));
-
-    z_ip_n++;
-    z_ip_bytes += size;
-
-    for (i = 0; i < Z_IP_SITES; i++)
-    {
-        int k = (h + i) & (Z_IP_SITES - 1);
-        if (z_ip_site[k] == 0) { z_ip_site[k] = ra; z_ip_cnt[k] = 0; }
-        if (z_ip_site[k] == ra)
-        {
-            if (++z_ip_cnt[k] > z_ip_top) { z_ip_top = z_ip_cnt[k]; z_ip_ra = ra; }
-            return;
-        }
-    }
-}
-
 // SATURN diag (SAT_ZONE_RA): tag every block with its Z_Malloc caller so the top-8 resident
 // dump can NAME the big blocks (resolve ra vs build/Mimas.map) -> attribute the RAM-diet targets.
 // +4 bytes/block header (a few KB) -- keep ON while dieting the zone, flip to 0 to ship.
@@ -602,8 +527,6 @@ Z_Malloc
 
     base->user = user;
     base->tag = tag;
-    if (z_ip_arm && tag < PU_PURGELEVEL)   /* SATURN: see Z_InPlayArm -- the fragmenter census */
-        Z_InPlayNote (__builtin_return_address(0), size);
 #if SAT_ZONE_RA
     base->ra = __builtin_return_address(0);   // who called Z_Malloc (W_CacheLumpNum / R_GenerateComposite / P_Setup...)
 #endif
@@ -966,6 +889,23 @@ int Z_CanAllocate (int size)
    plus its own size, plus the free run starting after it.  The maximum names the ONE block worth
    relocating and says what relocating it buys -- which is the number that decides whether the fix
    is worth writing.  `gain` is always > `lg` when any unpurgeable block exists. */
+/* [!] SATURN 2026-08-29 -- THE PINNED CENSUS, and it REPLACES the in-play one, which answered.
+   `ip` named the DRP LZSS scratch (fixed: one persistent buffer) and after that reported nothing
+   but R_GenerateLookup's two column directories -- retagged PU_CACHE at the end of that function,
+   i.e. exactly the over-count its own legend warned about.  No question left, so no cells.
+   THE NEW QUESTION, and the captures are unambiguous.  Re-anchoring the rover at each level load
+   moved row-11 `lg` from 336 to 491 on E1M1 and from 128 to 279 on E1M2 -- +46 % and +118 % of
+   contiguity -- AND THE RE-FAULT RATE DID NOT MOVE (27 % / 50 % against 26 % / 45 %).  Contiguity
+   has therefore stopped being the binding constraint.  What binds now is on the same row: `zf`
+   reads 3-33 KB through the whole of E1M2 while `ca` holds ~400.  The zone is SATURATED -- cache
+   plus a rounding error of free space -- so every new texture evicts an old one however tidily the
+   free space is arranged.
+   That makes the next lever CAPACITY: what is pinned.  Nothing on screen has ever said how much
+   that is.  `pn` = every block with a long-lived tag, summed, plus the biggest single one.  Read
+   it against the 1016 KB zone and against `ca` + `zf`: the three account for all of it. */
+int z_pinned_bytes = 0;   /* sum of every tag < PU_PURGELEVEL block */
+int z_pinned_max   = 0;   /* the biggest of them */
+
 int z_split_gain = 0;   /* bytes the largest run would become if this block moved elsewhere */
 int z_split_size = 0;   /* bytes -- match against the zone census in this file's header */
 int z_split_tag  = 0;   /* 1=STATIC 2=SOUND 3=MUSIC 5=LEVEL 6=LEVSPEC (NOT vanilla's 50/51 --
@@ -982,6 +922,7 @@ int Z_LargestAllocatable (void)
     /* pending = the last unpurgeable block seen; its "run after" is not known until the NEXT one */
     int		p_valid = 0, p_before = 0, p_size = 0, p_tag = 0, p_off = 0;
     int		b_gain = 0, b_size = 0, b_tag = 0, b_off = 0;
+    int		pin = 0, pinmax = 0;      /* SATURN: the pinned census, in the same single pass */
 
 
     for (block = mainzone->blocklist.next ;
@@ -1008,6 +949,8 @@ int Z_LargestAllocatable (void)
             p_size   = block->size;
             p_tag    = block->tag;
             p_off    = (int)((char *)block - (char *)mainzone);
+            pin += block->size;
+            if (block->size > pinmax) pinmax = block->size;
             run = 0;   // unpurgeable block breaks the contiguous run
         }
     }
@@ -1017,6 +960,7 @@ int Z_LargestAllocatable (void)
         if (merged > b_gain)
         { b_gain = merged; b_size = p_size; b_tag = p_tag; b_off = p_off; }
     }
+    z_pinned_bytes = pin; z_pinned_max = pinmax;
     z_split_gain = b_gain; z_split_size = b_size;
     z_split_tag  = b_tag;  z_split_off  = b_off;
 
