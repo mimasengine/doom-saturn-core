@@ -1672,6 +1672,7 @@ static unsigned int   prof_bp_g_e, prof_bp_g_a, prof_bp_g_k;  /* its parts, in M
                                                                   Z_Malloc) removed 2026-08-26 with
                                                                   its bracket -- see z_zone.c. */
 static unsigned int   prof_bp_g_q, prof_bp_g_c;   /* SATURN 2026-08-17: garde / W_CacheLumpNum */
+static unsigned int   prof_bp_g_lz;  /* SATURN 2026-08-30: the LZSS decode alone -- see RP_LzssLeave */
 unsigned int          sat_bp_zw;     /* zone blocks walked on the PK-Bp frame (overlay row 22 `zw`) */
 static int            prof_bp_bad;   /* 1 = a ratio came out impossible -> row prints `B!` */
 /* SATURN 2026-08-08: R_GetColumn's own share of Bp -- the PER-COLUMN half of the ~60% that the
@@ -1746,6 +1747,8 @@ static unsigned short prof_fr_t0;
 static unsigned int   prof_planescan;
 unsigned int          sat_q_scan10 = 0;   /* row 8 `Q<n>/<ms>`: the probe's own cost, tenths-ms */
 static unsigned int   prof_flatres;
+static unsigned int   prof_lzss;      /* row 20 `lz`: LZSS decode, wall-prep window, FRT ticks */
+static unsigned short prof_lz_t0;
 /* SATURN PERF (RBG0 candidate sizing): per-frame floor/ceiling FILL accounting.
    pix = total non-sky span pixels (the P fill workload); dom = the largest single
    (picnum,height) flat group's pixels (the RBG0 offload prize); n = non-sky
@@ -1997,6 +2000,35 @@ void RP_FlatResEnter(void) {
 void RP_FlatResLeave(void) {
 #if RP_PROF
     prof_flatres += (unsigned short)(rp_frt() - prof_fr_t0);
+#endif
+}
+
+/* [!] SATURN 2026-08-30 -- ROW 20 `lz`: THE LZSS DECODE, BRACKETED ALONE.  It exists to split ONE
+   number that has been ambiguous since the .DRP landed: row-20 `c`, the W_CacheLumpNum bill, which
+   is READ + DECODE + zone allocation in a single bracket.  The owner's 28 Ymir captures of today
+   separated two spike shapes cleanly -- five with `a`/`e` fat (the directory rebuild) and six with
+   `a0 e0` and `c` alone at 35-99.9 ms -- and for that second shape nothing on screen can say
+   whether the cost is the disc or the decompressor.  The two have OPPOSITE fixes, and the DRP memo
+   of 2026-08-29 removes the READ only: drp_lzss_decode runs on every call BY DESIGN, including on
+   a memo hit, because `need` differs between callers.
+   READ IT AS: `c - lz` = the read plus the zone allocation.  `lz ~= c` => the decompressor, and
+   the memo could never have helped.  `lz ~= 0` => the disc, and the memo's remaining misses are
+   the target.
+   GATED ON prof_in_wp, like `c`, so the two are comparable.  /!\ On a frame where `a`/`e` are
+   NON-ZERO, `lz` also carries R_GenerateLookup's prefix decodes, which live in `a`/`e` and NOT in
+   `c` -- so the subtraction is only clean on the `a0 e0` shape, which is exactly the shape it was
+   added for.  A whole-frame variant (ungated, catching the flat resolve's and the emit's decodes)
+   is the obvious follow-up and is deliberately not this field.
+   Begin is UNGATED and End is gated: reading the FRT twice costs less than a branch that could
+   leave t0 stale across the gate opening. */
+void RP_LzssBegin(void) {
+#if RP_PROF
+    prof_lz_t0 = rp_frt();
+#endif
+}
+void RP_LzssLeave(void) {
+#if RP_PROF
+    if (prof_in_wp) prof_lzss += (unsigned short)(rp_frt() - prof_lz_t0);
 #endif
 }
 void RP_MPlaneEnter(void) {
@@ -2496,6 +2528,7 @@ void RP_BeginFrame(void)
     prof_wallhead = prof_walltail = 0; prof_tl_armed = 0;                /* row 4 `hd`/`tl` */
     prof_mplane = 0;                                                     /* row 5 `Pm` (master plane drain) */
     prof_flatres = 0;                                                    /* row 5 `Pv` 2nd half (flat resolve) */
+    prof_lzss = 0;                                                       /* row 20 `lz` (LZSS decode) */
     prof_seg_cols = prof_seg_fill = prof_seg_px = prof_lead_px = 0;      /* row 14 `SEG` -- lp sizing */
     prof_gc_st[0] = prof_gc_st[1] = prof_gc_st[2] = prof_gc_st[3] = 0;   /* row 16 `GCS` -- who calls */
     prof_gc_sn[0] = prof_gc_sn[1] = prof_gc_sn[2] = prof_gc_sn[3] = 0;
@@ -3324,8 +3357,9 @@ static void rp_p3_prof_show(void)
                 prof_bp_g_e = BP_T10(prof_st_mx[0]);
                 prof_bp_g_a = BP_T10(prof_st_mx[1]);
                 prof_bp_g_k = BP_T10(prof_st_mx[2]);
-                prof_bp_g_q = BP_T10(prof_st_mx[4]);   /* the garde (W_LumpResident + Z_CanAllocate) */
-                prof_bp_g_c = BP_T10(prof_st_sum[5]);  /* W_CacheLumpNum single-patch, SUM (global) -- the CD-read bill */
+                prof_bp_g_q = BP_T10(prof_st_mx[4]);   /* the garde -- still accumulated, print retired */
+                prof_bp_g_c = BP_T10(prof_st_sum[5]);  /* W_CacheLumpNum single-patch, SUM (global) -- read + decode + alloc */
+                prof_bp_g_lz = BP_T10(prof_lzss);      /* ...of which the LZSS decode alone, SUM */
 #undef BP_T10
                 /* (`b` = per-frame composite count RETIRED 2026-08-12, one capture after it was
                    added.  It did its job: g30/b0 and g197/b4 killed R_GenerateComposite as the
@@ -3393,8 +3427,24 @@ static void rp_p3_prof_show(void)
         unsigned int pv10 = (pvb_f > qs10) ? (pvb_f - qs10) : 0u;
         unsigned int pf10 = fr_f * 10u / 224u;
         sat_q_scan10 = qs10;
-        if (pv10 > 999u) pv10 = 999u;
-        if (pf10 > 999u) pf10 = 999u;
+        /* [!] SATURN 2026-08-30 -- WHOLE MS, CLAMP 999.  Both halves read 99.9/99.9 -- SATURATED --
+           on the owner's console capture of the MST500 frame, where row-2 `P` was 251.2 ms against
+           `Pm0.0 Ps5.7`: the plane phase was ~98 % NOT fill, and the two fields that name what it
+           IS were both pinned at their ceiling and could say nothing.  A field that saturates on
+           the frame it exists to explain has no value at that precision.
+           The tenth is the right thing to spend: on a 3-digit millisecond it is noise (the same
+           argument row 14 used for `w`/`m`), and the calm case still reads `Pv0/0`, which is the
+           honest answer for "under a millisecond, negligible".
+           WHAT THE SECOND HALF IS: prof_flatres, the ALLOCATING part of the plane resolve -- flat
+           lumps, i.e. the disc.  Row-12 `t` (cumulative CD seconds) is its free cross-check: it
+           moved 54s -> 56s across 2.8 s of that capture, ~2 s of CD over about five frames.
+           /!\ THIS DOES NOT LIFT THE 293 ms FRT CEILING.  Every bracket feeding these is an
+           `unsigned short` delta (65536 x 4.47 us), and in 1p there is ONE view, so a single
+           phase over 293 ms still aliases modulo 293.  The clamp is above the ceiling on purpose:
+           a number that cannot legitimately occur must be visible, not hidden by a clamp at 293.
+           Read this row only on a photo whose row 4 says `BPS`, never `BP!`. */
+        if (pv10 > 9999u) pv10 = 9999u;
+        if (pf10 > 9999u) pf10 = 9999u;
         (void)pb_pct;
         /* [!] PADDED TO 40 AND CUT AT 40, like the BPS row.  The 4p capture of 2026-08-26 read
            "... mw0 1": a glyph from a LONGER previous render surviving past the end of a shorter
@@ -3406,10 +3456,10 @@ static void rp_p3_prof_show(void)
            them into sum/max is the coherent spelling AND it buys the four cells `Pv`'s second
            half needs.  `mw` keeps its meaning: the LONGEST single wait this window, read against
            RP_WAIT_TIMEOUT_FRT (100 ms); pinned at the ceiling = a dying slave. */
-        snprintf(p, sizeof p, "SLV b%u%% Pm%u.%u Ps%u.%u Pv%u.%u/%u.%u w%u.%u/%u"
+        snprintf(p, sizeof p, "SLV b%u%% Pm%u.%u Ps%u.%u Pv%u/%u w%u.%u/%u"
                               "                                        ",
                  busy_pct, mp10/10, mp10%10, ps10/10, ps10%10,
-                 pv10/10, pv10%10, pf10/10, pf10%10,
+                 pv10/10, pf10/10,
                  w10/10, w10%10, (unsigned int)(rp_wait_mx / 224u));
         p[40] = 0;
         rp_wait_mx = 0;
@@ -3496,10 +3546,20 @@ static void rp_p3_prof_show(void)
            (whole ms -> tenths only widens the small values, while g/n/x shrink to 0 the moment
            the walls all ride VDP1).  The owner's 4p capture read `BP g0 n0 x0 a0 e0 k0 q0 c0 87`
            -- the `87` is the tail of a previous, longer line.  Pad to the widest form. */
-        snprintf(p, sizeof p, "%s g%u n%u x%u a%u e%u k%u q%u c%u                    ",
+        /* [!] SATURN 2026-08-30 -- `k` AND `q` RETIRED, `lz` TAKES THEIR CELLS.  Both are settled and
+           both have said so for a long time: `k` (R_GenerateComposite) read **k0 on all 28 Ymir
+           captures of today** and its question was answered NO on 2026-08-12 ("COMPOSITES ARE NOT
+           THE HOLE"); `q` (the garde: W_LumpResident + Z_CanAllocate) read **q0 on 26 of those 28,
+           q1 and q3 on the other two**, and its decision -- "is the garde fat?" -- is therefore
+           made, with row-22 `zw` (291..1069 blocks walked) as the independent witness.
+           Both slots still ACCUMULATE and both are still latched above; only the print is gone, so
+           either comes back in one line.  Width: the realistic worst
+           `B! g286 n379 x99999 a999 e999 lz999 c999` is 40 cells, against 43 for the form it
+           replaces -- this row got shorter, not longer. */
+        snprintf(p, sizeof p, "%s g%u n%u x%u a%u e%u lz%u c%u                    ",
                  prof_bp_bad ? "B!" : "BP", prof_bp_g_ms, prof_bp_g_n,
-                 prof_bp_g_x, prof_bp_g_a, prof_bp_g_e, prof_bp_g_k,
-                 prof_bp_g_q, prof_bp_g_c);
+                 prof_bp_g_x, prof_bp_g_a, prof_bp_g_e, prof_bp_g_lz,
+                 prof_bp_g_c);
         dbg_print(0, 20, p);
     }
     /* SATURN (VDP1-floor inc-0): surface the floor-quad estimate.  This P3 path is the one

@@ -1200,8 +1200,17 @@ int R_WallPotatoColor (int tex)
    draw replaces it with the true dominant colour.
    Returns -1 when it cannot look cheaply (no patch, oversized offset table, empty first column) --
    the caller then uses the neutral index and counts it (`nocol`). */
+/* [!] SATURN 2026-08-29 -- "cannot be seeded cheaply".  See the note inside R_WallPotatoSeed:
+   the six failing exits used to return without writing the cache, so every failure was re-paid
+   on every seg of every frame, for ever.  -2 is safe in the short cache because every reader
+   already treats "negative" as "no colour" (R_WallPotatoColorPeek) or demands bit 8
+   (R_WallPotatoColor), so self-healing is untouched. */
+#define WALLPOT_NOSEED  (-2)
+static int wallpot_map = -1;   /* re-arm NOSEED per map: the repack subset changes with it */
+
 int R_WallPotatoSeed (int tex)
 {
+    extern int  gamemap;
     texture_t  *t;
     patch_t    *ph;
     const byte *post;
@@ -1213,28 +1222,57 @@ int R_WallPotatoSeed (int tex)
 	wallpot_cache = Z_Malloc(numtextures * (int)sizeof(short), PU_STATIC, 0);
 	for (i = 0; i < numtextures; i++) wallpot_cache[i] = -1;
     }
+    /* [!] SATURN 2026-08-29 -- REMEMBER THE FAILURES TOO.  Six of the seven exits below returned
+       -1 WITHOUT touching the cache, so a texture that cannot be seeded re-ran the whole thing on
+       every seg of every frame.  Several of those failures are PERMANENT properties of the patch:
+       an empty first column (`post[0] == 0xff`) never becomes non-empty.  That is a latched
+       failure with the sign flipped -- nothing is latched, so the cost is paid for ever.
+       AND THE COST IS NOT THE "~0,4 ms" THE COMMENT ABOVE CLAIMS: each of the two
+       W_CacheLumpPrefix calls is a FULL CD read of the compressed patch, because the DRP layer
+       must pull the whole LZSS stream to serve any prefix of it (w_drp_saturn.cxx,
+       drp_scratch_lump).  This site sits in R_RenderSegLoop's ROUTING PREAMBLE via
+       sat_wall_io_flat, and the owner's Ymir capture of 2026-08-29 read row-4 `pr` at 172.8 ms
+       with `g4 x35 a0 e0 c10` -- R_GetColumn exonerated by its own numbers, the preamble owning
+       the frame.  One capture cannot prove this is the cause rather than a legitimate burst of
+       first-sighted textures, but the fix is correct under both readings.
+       SELF-HEALING IS INTACT: R_WallPotatoColor's early return demands bit 8, which NOSEED does
+       not carry, so the first close-up textured draw still overwrites it with the true dominant
+       colour; and R_WallPotatoColorPeek already answers -1 to anything negative.
+       RE-ARMED PER MAP, the shape R_LPinAdd uses: W_CacheLumpPrefix can also answer NULL because
+       the lump is outside THIS map's repack subset, and that one is not permanent. */
+    if (gamemap != wallpot_map)
+    {
+	for (i = 0; i < numtextures; i++)
+	    if (wallpot_cache[i] == WALLPOT_NOSEED) wallpot_cache[i] = -1;
+	wallpot_map = gamemap;
+    }
+    if (wallpot_cache[tex] == WALLPOT_NOSEED) return -1;
     if (wallpot_cache[tex] >= 0) return wallpot_cache[tex] & 0xff;
 
     t = textures[tex];
-    if (!t || t->patchcount <= 0) return -1;
+    if (!t || t->patchcount <= 0) goto noseed;
     lump = t->patches[0].patch;
 
     ph = (patch_t *) W_CacheLumpPrefix (lump, 8);          /* just the header, for `width` */
-    if (!ph) return -1;
+    if (!ph) goto noseed;
     w = SHORT(ph->width);
-    if (w <= 0) return -1;
+    if (w <= 0) goto noseed;
 
     want = 8 + 4 * w + 8;                                  /* + one post header + one texel */
     ph = (patch_t *) W_CacheLumpPrefix (lump, want);
-    if (!ph) return -1;
+    if (!ph) goto noseed;
 
     ofs = LONG(ph->columnofs[0]);
-    if (ofs < 8 + 4 * w || ofs + 4 > want) return -1;      /* first column outside what we decoded */
+    if (ofs < 8 + 4 * w || ofs + 4 > want) goto noseed;    /* first column outside what we decoded */
     post = (const byte *)ph + ofs;
-    if (post[0] == 0xff || post[1] == 0) return -1;        /* column empty -> no honest colour */
+    if (post[0] == 0xff || post[1] == 0) goto noseed;      /* column empty -> no honest colour */
 
     wallpot_cache[tex] = (short)(post[3] & 0xff);          /* topdelta, length, pad, then texels */
     return wallpot_cache[tex] & 0xff;                      /* bit 8 clear = CHEAP, upgradable */
+
+noseed:
+    wallpot_cache[tex] = WALLPOT_NOSEED;
+    return -1;
 }
 
 /* SATURN: the dominant colour PEEKED -- returns it if already computed, -1 otherwise, and NEVER

@@ -345,7 +345,29 @@ Z_Malloc
    only ever move a block that was going to be placed anyway.
    ⚠ IT CANNOT RECOVER CONTIGUITY ALREADY LOST -- it stops new interleaving, it does not undo old.
    Judge it on `lg` ACROSS a level load, not within one. */
-#define Z_LOWEND_HOPS    256
+/* [!] SATURN 2026-08-30 -- 256 -> 4096, BECAUSE THE PRE-PASS WAS DEAD CODE AND THIS FILE ALREADY
+   SAID SO.  The note further down (search Z_ResetRover) reads: *"it is bounded at Z_LOWEND_HOPS,
+   and the bottom of the zone is hundreds of small boot statics (lumpinfo, colormaps, the DRP
+   tables, the lead-fill rings).  256 hops does not even REACH the freed region, so it found
+   nothing and fell through to the rover every time."*  That was written about the level-load case
+   and fixed there by Z_ResetRover -- but the SAME bound still applies to every long-lived
+   allocation made DURING PLAY, and nothing re-anchors the rover then.  So each one landed wherever
+   the rover happened to be, interleaved with cache, which is exactly what costs `lg`.
+   WHAT MEASURED IT (Ymir, 2026-08-30): the refault ratio on row 0, `ld<chunks>/<refaults>`, climbs
+   monotonically over a session -- 12 % -> 31 % across 15 captures, 12-19 % on E1M1 and 23-31 % on
+   E1M2 where `lg` reads 113.  A refault is a lump that was loaded, purged and must be read AGAIN;
+   no read-side deduplication can touch one (the DRP memo of 2026-08-29 was tried and row-20 `c`
+   did not move), and the only lever is contiguity.
+   WHY 4096 AND NOT UNBOUNDED: the whole block list is ~2000 entries at its worst (row-22 `zw`
+   peaks at 1742), so 4096 walks all of it in practice while still capping a corrupt list instead
+   of hanging on it.
+   WHY IT IS CHEAP: this pass only INSPECTS (`p->tag == PU_FREE`) -- it never purges, unlike the
+   vanilla rover scan below -- and it runs only for `tag < PU_PURGELEVEL`, of which row-12 `ip`
+   measured 103-147 per level once the DRP scratch stopped making 454 of them.  ~150 list walks per
+   level is nothing; `zw` on row 22 is the watchdog if that is wrong.
+   ⚠ Judge it on `lg` and on the REFAULT RATIO, not on fps: it stops new interleaving, it does not
+   undo old, and it does not make a single lump load faster. */
+#define Z_LOWEND_HOPS    4096
     {
         int longlived = (tag < PU_PURGELEVEL);
         memblock_t *p    = longlived ? mainzone->blocklist.next : mainzone->rover;
