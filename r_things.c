@@ -146,6 +146,8 @@ int (*sat_thing_hook)(patch_t *patch, int lump, const unsigned char *cmap,
 int sat_things_emitted = 0;                 /* 1 = things went to VDP1 this view -> R_DrawMasked skips them */
 int sat_things_occ = 0;                     /* fully-occluded sprites skipped this frame (occlusion metric) */
 int sat_thing_cap = 4;                      /* platform sets = VDP1 thing slots/frame (VRAM cap); nearest win */
+int sat_thing_cur_vis = -1;                 /* SATURN PSW: vissprite index of the sprite currently offered to
+                                               sat_thing_hook -- the painter-rank key (subsector watermarks) */
 /* SATURN per-frame texture LOAD BUDGET, sprite third (walls own the budget in r_segs.c). */
 extern int sat_tex_load_budget, sat_tex_load_spent;
 extern int R_LoadBudgetLeft (void);   /* SATURN: r_segs.c -- 1 = the frame can still afford a fault */
@@ -2079,6 +2081,7 @@ void R_EmitWorldThingsVDP1 (void)
 	   So: keep the monster on VDP1, and drop the grate columns a NEARER VDP1 sprite covers.
 	   sat_v1spr_sc[] publishes the nearest VDP1 sprite's scale per column; r_segs.c's
 	   R_RenderMaskedSegRange consults it.  Row 24 `mk` now counts HIDDEN GRATE COLUMNS. */
+	sat_thing_cur_vis = idx;
 	if (sat_thing_hook (patch, spr->patch, spr->colormap, R_ThingXlat (spr),
 			    x0s, y0s, x1s, y1s, cx0, cy0, cx1, cy1, (int)(spr->xiscale < 0)))
 	    sat_thing_vdp1[idx] = 1;

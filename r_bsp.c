@@ -597,10 +597,12 @@ extern int sat_psw_active;           /* platform: latched at the frame boundary 
 extern int firstflat;                /* r_data.c: flat lump base                */
 extern int *flattranslation;         /* r_data.c: animated-flat indirection     */
 /* platform recorder: (subnum, floor_h, ceil_h, floorpic, floor_lump, ceil_lump
-   [-1 = sky], lightlevel), called ONCE per visited subsector BEFORE its walls
-   are queued, in BSP visit order = near-first. */
+   [-1 = sky], lightlevel, vis0 = live vissprite count), called ONCE per visited
+   subsector BEFORE its walls are queued AND before R_AddSprites, in BSP visit
+   order = near-first -- so vis0 is a per-subsector sprite watermark exactly
+   like the platform's wall_acc one. */
 void (*sat_psw_sub_hook)(int subnum, int fh, int ch, int fpic,
-                         int flump, int clump, int light) = 0;
+                         int flump, int clump, int light, int vis0) = 0;
 
 int             psw_polys_ok = 0;    /* 1 = pools below are valid for this level */
 fixed_t        *psw_pvx = 0, *psw_pvy = 0;   /* vertex pool (world, 16.16)      */
@@ -791,7 +793,8 @@ void R_Subsector (int num)
 	                 firstflat + flattranslation[frontsector->floorpic],
 	                 (frontsector->ceilingpic == skyflatnum) ? -1
 	                     : firstflat + flattranslation[frontsector->ceilingpic],
-	                 frontsector->lightlevel);
+	                 frontsector->lightlevel,
+	                 (int)(vissprite_p - vissprites));
 #endif
 
     if (frontsector->floorheight < viewz)
