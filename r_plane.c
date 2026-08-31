@@ -1578,6 +1578,33 @@ void R_DrawPlanes (void)
 	}
     }
 
+#ifndef SAT_PSW
+#define SAT_PSW 0
+#endif
+#if SAT_PSW
+    /* SATURN PSW (psw-world experiment, docs/PSW_WORLD_PLAN.md): painter mode -- no
+       span fill, no punch, no sky columns.  The dominant election ABOVE already ran
+       (with empty visplane coverage the dominant pick degrades to its under-eye
+       fallback, which is exactly the PSW step-1 spec).  Two things the platform still
+       needs from this frame:
+         - sky presence: any sky visplane touched by the walk (coverage not needed --
+           R_FindPlane created it from a visited subsector);
+         - the RBG0/sky boundary: centery, the vanishing line of every horizontal
+           plane.  Rows below it that no VDP1 quad covers show the RBG0 dominant
+           floor (the intended failure mode); rows above are sky/ceiling territory. */
+    {
+	extern int sat_psw_active;   /* platform: latched at the frame boundary */
+	if (sat_psw_active)
+	{
+	    visplane_t *p;
+	    for (p = visplanes ; p < lastvisplane ; p++)
+		if (p->picnum == skyflatnum) { sat_frame_has_sky = 1; break; }
+	    sat_vdp2_floor_top_y = centery;
+	    return;
+	}
+    }
+#endif
+
     /* SATURN: insertion-sort visplanes by picnum so consecutive R_MakeSpans calls
        share the same 4KB flat in the SH-2 D-cache instead of evicting it.
        n ≤ 128 → O(n²) is negligible.                                          */

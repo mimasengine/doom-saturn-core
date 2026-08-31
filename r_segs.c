@@ -2710,8 +2710,252 @@ static walljob_t walljobs[MAXDRAWSEGS];
 int  walljob_n = 0;
 int  sat_wallprep_defer = 0;
 
+/* ============================================================================
+ * SATURN PSW (psw-world experiment, docs/PSW_WORLD_PLAN.md) -- painter-mode wall
+ * producer.  When sat_psw_active, RP_QueueWall routes here INSTEAD of
+ * R_StoreWallRange: the same prologue math (distance, end scales, tier heights,
+ * pegging, u offset), but NO per-column loop, NO drawsegs/openings, NO visplane
+ * marking, NO clip-array writes -- each visible tier goes to sat_wall_hook as ONE
+ * screen trapezoid (perspective-subdivided when magnified, same formulas as the
+ * claim block above).  wall_acc accumulates near-first (BSP order) and the
+ * platform flush emits it in reverse = painter far->near, so a hook rejection
+ * (list/px budget full) simply sheds the FARTHEST remainder: count it, never
+ * fall back to software (there is none in this mode).  Compiled out entirely
+ * unless the build sets SAT_PSW (make SAT_PSW=1 / build.ps1 -Psw). */
+#ifndef SAT_PSW
+#define SAT_PSW 0
+#endif
+#if SAT_PSW
+extern int sat_psw_active;          /* platform (dg_saturn.cxx): latched at the frame boundary */
+int sat_psw_tiers = 0;              /* per-frame: tier quads accepted by the hook (overlay row 13) */
+int sat_psw_ref   = 0;              /* per-frame: tier quads rejected (budget/list full = far shed) */
+
+static void R_PswEmitTier (int texnum, fixed_t texmid,
+                           fixed_t tf, fixed_t ts,    /* top edge frac/step (HEIGHTBITS) */
+                           fixed_t bf, fixed_t bs,    /* bottom edge frac/step */
+                           const unsigned char *cm)
+{
+    int n  = rw_stopx - 1 - rw_x;
+    int a1 = (rw_centerangle + xtoviewangle[rw_x])         >> ANGLETOFINESHIFT;
+    int a2 = (rw_centerangle + xtoviewangle[rw_stopx - 1]) >> ANGLETOFINESHIFT;
+    int u1 = (rw_offset - FixedMul(finetangent[a1], rw_distance)) >> FRACBITS;
+    int u2 = (rw_offset - FixedMul(finetangent[a2], rw_distance)) >> FRACBITS;
+    int yl1 = SAT_SHR12 (tf + HEIGHTUNIT - 1);
+    int yl2 = SAT_SHR12 (tf + ts * n + HEIGHTUNIT - 1);
+    int yh1 = SAT_SHR12 (bf);
+    int yh2 = SAT_SHR12 (bf + bs * n);
+    unsigned int is = (rw_scale > 0) ? (0xffffffffu / (unsigned int)rw_scale) : 1u;
+    int v0 = (int)((texmid + (fixed_t)((yl1 - centery) * (int)is)) >> FRACBITS);
+    int v1 = (int)((texmid + (fixed_t)((yh1 - centery) * (int)is)) >> FRACBITS);
+    int sx = rw_stopx - rw_x;
+    int mdu = u2 - u1; if (mdu < 0) mdu = -mdu; if (mdu < 1) mdu = 1;
+
+    if (sx > mdu)
+    {
+        /* magnified (more columns than texels): perspective subdivision, same math as the
+           claim block's SAT_WALL_SUBDIV path.  The squish guard is NOT applied -- with no
+           software fallback a clamped/squished near wall beats a hole in front of the
+           player; the platform's wall_ext window absorbs the extrapolation. */
+        int N = 1 + sx / mdu; if (N < 2) N = 2;
+        { int cap = (sat_opt >= 4) ? sat_wall_subdiv_max : SAT_WALL_SUBDIV_MAX; if (N > cap) N = cap; }
+        {
+        int prev_b = rw_x, k;
+        for (k = 1; k <= N; k++)
+        {
+            int b = rw_x + (sx * k) / N;
+            int xl = prev_b, xr = b - 1; prev_b = b;
+            if (xr < xl) continue;
+            {
+                int dnl = xl - rw_x, dnr = xr - rw_x;
+                int al  = (rw_centerangle + xtoviewangle[xl]) >> ANGLETOFINESHIFT;
+                int ar  = (rw_centerangle + xtoviewangle[xr]) >> ANGLETOFINESHIFT;
+                int ul  = (rw_offset - FixedMul(finetangent[al], rw_distance)) >> FRACBITS;
+                int ur  = (rw_offset - FixedMul(finetangent[ar], rw_distance)) >> FRACBITS;
+                int yll = SAT_SHR12 (tf + ts * dnl + HEIGHTUNIT - 1);
+                int ylr = SAT_SHR12 (tf + ts * dnr + HEIGHTUNIT - 1);
+                int yhl = SAT_SHR12 (bf + bs * dnl);
+                int yhr = SAT_SHR12 (bf + bs * dnr);
+                int sv0 = (int)((texmid + (fixed_t)((yll - centery) * (int)is)) >> FRACBITS);
+                int sv1 = (int)((texmid + (fixed_t)((yhl - centery) * (int)is)) >> FRACBITS);
+                if (sat_wall_hook (xl, yll, yhl, xr, ylr, yhr, texnum, ul, ur, sv0, sv1, cm))
+                    { sat_psw_ref++; return; }
+                sat_psw_tiers++;
+            }
+        }
+        }
+        return;
+    }
+
+    if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, texnum, u1, u2, v0, v1, cm))
+        sat_psw_ref++;
+    else
+        sat_psw_tiers++;
+}
+
+static void R_PswWallRange (int start, int stop)
+{
+    fixed_t hyp, sineval;
+    angle_t distangle, offsetangle;
+    fixed_t vtop;
+    fixed_t scale2;
+    const unsigned char *cm;
+
+    if (!sat_wall_hook)
+        return;
+
+    sidedef = SEG_SIDEDEF(curline);
+    linedef = SEG_LINEDEF(curline);
+    linedef->flags |= ML_MAPPED;               /* the automap still learns the wall */
+
+    rw_normalangle = SEG_ANGLE(curline) + ANG90;
+    offsetangle = abs(rw_normalangle-rw_angle1);
+    if (offsetangle > ANG90)
+	offsetangle = ANG90;
+    distangle = ANG90 - offsetangle;
+    hyp = R_PointToDist (SEG_V1(curline)->x, SEG_V1(curline)->y);
+    sineval = finesine[distangle>>ANGLETOFINESHIFT];
+    rw_distance = FixedMul (hyp, sineval);
+
+    rw_x = start;
+    rw_stopx = stop+1;
+    rw_scale = R_ScaleFromGlobalAngle (viewangle + xtoviewangle[start]);
+    if (stop > start)
+    {
+	scale2 = R_ScaleFromGlobalAngle (viewangle + xtoviewangle[stop]);
+	rw_scalestep = (scale2 - rw_scale) / (stop-start);
+    }
+    else
+    {
+	scale2 = rw_scale;
+	rw_scalestep = 0;
+    }
+
+    worldtop = frontsector->ceilingheight - viewz;
+    worldbottom = frontsector->floorheight - viewz;
+    midtexture = toptexture = bottomtexture = 0;
+
+    if (!backsector)
+    {
+	midtexture = texturetranslation[sidedef->midtexture];
+	if (linedef->flags & ML_DONTPEGBOTTOM)
+	{
+	    vtop = frontsector->floorheight + textureheight[sidedef->midtexture];
+	    rw_midtexturemid = vtop - viewz;
+	}
+	else
+	    rw_midtexturemid = worldtop;
+	rw_midtexturemid += sidedef->rowoffset;
+    }
+    else
+    {
+	worldhigh = backsector->ceilingheight - viewz;
+	worldlow  = backsector->floorheight - viewz;
+	/* sky hack: no tier between two sky ceilings */
+	if (frontsector->ceilingpic == skyflatnum
+	    && backsector->ceilingpic == skyflatnum)
+	    worldtop = worldhigh;
+	if (worldhigh < worldtop)
+	{
+	    toptexture = texturetranslation[sidedef->toptexture];
+	    if (linedef->flags & ML_DONTPEGTOP)
+		rw_toptexturemid = worldtop;
+	    else
+	    {
+		vtop = backsector->ceilingheight + textureheight[sidedef->toptexture];
+		rw_toptexturemid = vtop - viewz;
+	    }
+	    rw_toptexturemid += sidedef->rowoffset;
+	}
+	if (worldlow > worldbottom)
+	{
+	    bottomtexture = texturetranslation[sidedef->bottomtexture];
+	    rw_bottomtexturemid = (linedef->flags & ML_DONTPEGBOTTOM) ? worldtop : worldlow;
+	    rw_bottomtexturemid += sidedef->rowoffset;
+	}
+	/* two-sided masked mid (grates/fences): not drawn in PSW step 1 */
+    }
+
+    if (!midtexture && !toptexture && !bottomtexture)
+	return;
+
+    offsetangle = rw_normalangle-rw_angle1;
+    if (offsetangle > ANG180)
+	offsetangle = -offsetangle;
+    if (offsetangle > ANG90)
+	offsetangle = ANG90;
+    sineval = finesine[offsetangle >>ANGLETOFINESHIFT];
+    rw_offset = FixedMul (hyp, sineval);
+    if (rw_normalangle-rw_angle1 < ANG180)
+	rw_offset = -rw_offset;
+    rw_offset += sidedef->textureoffset + SEG_OFFSET(curline);
+    rw_centerangle = ANG90 + viewangle - rw_normalangle;
+
+    /* light: orientation bump + distance shade at the NEAR end (max scale) */
+    if (fixedcolormap)
+	cm = fixedcolormap;
+    else
+    {
+	int lightnum = (frontsector->lightlevel >> LIGHTSEGSHIFT)+extralight;
+	int li;
+	fixed_t smax = rw_scale > scale2 ? rw_scale : scale2;
+	if (SEG_V1(curline)->y == SEG_V2(curline)->y)
+	    lightnum--;
+	else if (SEG_V1(curline)->x == SEG_V2(curline)->x)
+	    lightnum++;
+	if (lightnum < 0) lightnum = 0;
+	else if (lightnum >= LIGHTLEVELS) lightnum = LIGHTLEVELS-1;
+	li = smax >> LIGHTSCALESHIFT;
+	if (li >= MAXLIGHTSCALE) li = MAXLIGHTSCALE-1; else if (li < 0) li = 0;
+	cm = scalelight[lightnum][li];
+    }
+
+    worldtop >>= 4;
+    worldbottom >>= 4;
+    topstep = -FixedMul (rw_scalestep, worldtop);
+    topfrac = (centeryfrac>>4) - FixedMul (worldtop, rw_scale);
+    bottomstep = -FixedMul (rw_scalestep,worldbottom);
+    bottomfrac = (centeryfrac>>4) - FixedMul (worldbottom, rw_scale);
+    if (backsector)
+    {
+	worldhigh >>= 4;
+	worldlow >>= 4;
+	if (toptexture)
+	{
+	    pixhigh = (centeryfrac>>4) - FixedMul (worldhigh, rw_scale);
+	    pixhighstep = -FixedMul (rw_scalestep,worldhigh);
+	}
+	if (bottomtexture)
+	{
+	    pixlow = (centeryfrac>>4) - FixedMul (worldlow, rw_scale);
+	    pixlowstep = -FixedMul (rw_scalestep,worldlow);
+	}
+    }
+
+    if (midtexture)
+	R_PswEmitTier (midtexture, rw_midtexturemid,
+	               topfrac, topstep, bottomfrac, bottomstep, cm);
+    if (toptexture)
+	R_PswEmitTier (toptexture, rw_toptexturemid,
+	               topfrac, topstep, pixhigh, pixhighstep, cm);
+    if (bottomtexture)
+	R_PswEmitTier (bottomtexture, rw_bottomtexturemid,
+	               pixlow, pixlowstep, bottomfrac, bottomstep, cm);
+}
+#endif /* SAT_PSW */
+
 void RP_QueueWall(int start, int stop)
 {
+#if SAT_PSW
+    if (sat_psw_active)
+    {
+	/* painter mode: same Bp bracket as the software producer, so row-2 `Bp` stays
+	   the A/B-comparable "wall production" cost in both modes */
+	RP_WallPrepEnter();
+	R_PswWallRange(start, stop);
+	RP_WallPrepLeave();
+	return;
+    }
+#endif
 #if !SAT_WALLPREP_DEFER
     R_StoreWallRange(start, stop);   /* queue compiled out -- see the note at walljobs[] */
     return;
