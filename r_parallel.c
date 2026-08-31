@@ -1948,7 +1948,13 @@ void RP_StampEnd(int slot)
        is on the per-column path.  A compare now replaces a literal-pool load + indexed load +
        add + store on every other stamp.  (No site stamps slot 3 at all any more -- the Z_Malloc
        bracket was removed earlier today.) */
-    if (slot == 5) prof_st_sum[5] += d;
+    /* [!] SATURN 2026-08-31 -- SLOT 0 (`e`, the R4 lazy directory rebuild) IS SUMMED TOO.
+       `e` has always been a MAX, and the owner's 14 captures of 2026-08-31 hit its ceiling:
+       C10 printed `a999 e999 x99999`, all three clamped, on a frame with `Bp166.8 lp160.5`.
+       A saturated MAX cannot say whether that frame did ONE 99.9 ms rebuild or five 30 ms
+       ones -- and that factor is the multiplier on every estimate built from this field.
+       Summed, `e` is directly comparable to row-4 `Bp` on the SAME latched frame. */
+    if (slot == 5 || slot == 0) prof_st_sum[slot] += d;
 #endif
 }
 
@@ -2536,7 +2542,7 @@ void RP_BeginFrame(void)
     prof_gc_mx  = 0;                                                     /* worst single call (row 20 `x`) */
     prof_st_mx[0] = prof_st_mx[1] = prof_st_mx[2] = prof_st_mx[3] = 0;   /* row 20 e/a/k    */
     prof_st_mx[4] = prof_st_mx[5] = 0;                                   /* row 20 q/c      */
-    prof_st_sum[5] = 0;   /* the only slot still accumulated -- see RP_StampEnd */
+    prof_st_sum[0] = prof_st_sum[5] = 0;  /* the two slots accumulated -- see RP_StampEnd */
     { extern int z_walk_blocks; z_walk_blocks = 0; }                     /* zone blocks walked / frame */
     /* (r_lookup_rebuilds reset REMOVED 2026-08-10 with row-20 `e` -- see core/r_data.c:507) */
     prof_plane_pix = prof_plane_dom = prof_plane_n = 0;                  /* RBG0 candidate sizing */
@@ -3354,7 +3360,7 @@ static void rp_p3_prof_show(void)
                    unchanged in the common case (1,4 ms prints `14` where it printed `1`).
                    Clamp at 999 = 99,9 ms; a bracket past that is a `B!` frame anyway. */
 #define BP_T10(v) (((v) * 10u / 224u) > 999u ? 999u : ((v) * 10u / 224u))
-                prof_bp_g_e = BP_T10(prof_st_mx[0]);
+                prof_bp_g_e = BP_T10(prof_st_sum[0]);   /* SUM over the frame, not the worst one */
                 prof_bp_g_a = BP_T10(prof_st_mx[1]);
                 prof_bp_g_k = BP_T10(prof_st_mx[2]);
                 prof_bp_g_q = BP_T10(prof_st_mx[4]);   /* the garde -- still accumulated, print retired */
