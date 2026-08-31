@@ -638,7 +638,14 @@ static int psw_clip_line (const pswclip_t *L, const fixed_t *ax, const fixed_t *
 	    long long d = ca - cb;
 	    if (d != 0 && m < PSW_CLIP_VMAX)
 	    {
-		fixed_t t = (fixed_t)((ca << 16) / d);          /* 16.16, 0..1 */
+		/* crosses of 16.16 deltas reach ~2^57 on a real map, so ca<<16 would
+		   overflow 64 bits; shrink both equally first (|d| >= |ca| when the
+		   signs differ, so nd cannot hit zero before na). */
+		long long na = ca, nd = d;
+		fixed_t t;
+		while (na >= (1LL << 46) || na <= -(1LL << 46)) { na >>= 8; nd >>= 8; }
+		t = nd ? (fixed_t)((na << 16) / nd) : 0;        /* 16.16, 0..1 */
+		if (t < 0) t = 0; else if (t > FRACUNIT) t = FRACUNIT;
 		bx[m] = ax[i] + (fixed_t)(((long long)(ax[j] - ax[i]) * t) >> 16);
 		by[m] = ay[i] + (fixed_t)(((long long)(ay[j] - ay[i]) * t) >> 16);
 		m++;
