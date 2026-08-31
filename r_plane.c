@@ -1596,10 +1596,12 @@ void R_DrawPlanes (void)
 	extern int sat_psw_active;   /* platform: latched at the frame boundary */
 	if (sat_psw_active)
 	{
+	    extern void R_PswPolysEnsure (void);   /* r_bsp.c: lazy per-level polygon build */
 	    visplane_t *p;
 	    for (p = visplanes ; p < lastvisplane ; p++)
 		if (p->picnum == skyflatnum) { sat_frame_has_sky = 1; break; }
 	    sat_vdp2_floor_top_y = centery;
+	    R_PswPolysEnsure();      /* the kick (walls+flats flush) runs AFTER this */
 	    return;
 	}
     }

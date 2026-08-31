@@ -577,6 +577,177 @@ boolean R_CheckBBox (const short*	bspcoord)
 
 
 
+/* ============================================================================
+ * SATURN PSW (psw-world experiment, step 2 -- docs/PSW_WORLD_PLAN.md).
+ * Subsector POLYGONS, built lazily once per level: the BSP guarantees every
+ * subsector is convex, but its segs alone do not close the polygon (the implicit
+ * edges cut by ancestor splitlines are not stored).  Reconstruction = clip the
+ * padded map bbox by every ancestor splitline along the leaf's path (keep-side),
+ * then by the subsector's own seg lines (a seg always FACES its subsector, so
+ * the interior is its front side).  Two identical walks: count then fill, into
+ * one PU_LEVEL pool (auto-freed at the next P_SetupLevel).  The platform fans
+ * each polygon into DISTORSP quads (stretched full flat) in painter order.
+ * Compiled out entirely unless SAT_PSW. */
+#ifndef SAT_PSW
+#define SAT_PSW 0
+#endif
+#if SAT_PSW
+#include "z_zone.h"                  /* Z_Malloc / PU_LEVEL (polygon pools)     */
+extern int sat_psw_active;           /* platform: latched at the frame boundary */
+extern int firstflat;                /* r_data.c: flat lump base                */
+extern int *flattranslation;         /* r_data.c: animated-flat indirection     */
+/* platform recorder: (subnum, floor_h, ceil_h, floorpic, floor_lump, ceil_lump
+   [-1 = sky], lightlevel), called ONCE per visited subsector BEFORE its walls
+   are queued, in BSP visit order = near-first. */
+void (*sat_psw_sub_hook)(int subnum, int fh, int ch, int fpic,
+                         int flump, int clump, int light) = 0;
+
+int             psw_polys_ok = 0;    /* 1 = pools below are valid for this level */
+fixed_t        *psw_pvx = 0, *psw_pvy = 0;   /* vertex pool (world, 16.16)      */
+unsigned short *psw_pvi = 0;         /* per-subsector: pool start index          */
+unsigned char  *psw_pvn = 0;         /* per-subsector: vertex count (0 = none)   */
+static void    *psw_poly_level = 0;  /* level identity = subsectors[] pointer    */
+
+#define PSW_POLY_VMAX 20
+#define PSW_CLIP_VMAX 40
+#define PSW_SUBS_MAX  900            /* big-WAD guard: beyond this, walls-only PSW */
+#define PSW_VERT_MAX  9000           /* pool guard (~72 KB of PU_LEVEL zone)       */
+#define PSW_PATH_MAX  96
+
+typedef struct { fixed_t ox, oy, dx, dy; } pswclip_t;   /* keep: dx*(y-oy)-dy*(x-ox) <= 0 */
+static pswclip_t psw_path[PSW_PATH_MAX];
+static int       psw_depth;
+static fixed_t   psw_bbx0, psw_bby0, psw_bbx1, psw_bby1;
+static int       psw_vtotal, psw_fillpos, psw_pass;
+
+/* Sutherland-Hodgman against one keep-line; 64-bit crosses (load-time only). */
+static int psw_clip_line (const pswclip_t *L, const fixed_t *ax, const fixed_t *ay,
+                          int n, fixed_t *bx, fixed_t *by)
+{
+    int i, m = 0;
+    long long ca, cb;
+    if (n < 3) return 0;
+    ca = (long long)L->dx * (ay[0] - L->oy) - (long long)L->dy * (ax[0] - L->ox);
+    for (i = 0; i < n; ++i)
+    {
+	int j = (i + 1 == n) ? 0 : i + 1;
+	cb = (long long)L->dx * (ay[j] - L->oy) - (long long)L->dy * (ax[j] - L->ox);
+	if (ca <= 0 && m < PSW_CLIP_VMAX) { bx[m] = ax[i]; by[m] = ay[i]; m++; }
+	if ((ca <= 0) != (cb <= 0))
+	{
+	    long long d = ca - cb;
+	    if (d != 0 && m < PSW_CLIP_VMAX)
+	    {
+		fixed_t t = (fixed_t)((ca << 16) / d);          /* 16.16, 0..1 */
+		bx[m] = ax[i] + (fixed_t)(((long long)(ax[j] - ax[i]) * t) >> 16);
+		by[m] = ay[i] + (fixed_t)(((long long)(ay[j] - ay[i]) * t) >> 16);
+		m++;
+	    }
+	}
+	ca = cb;
+    }
+    return m;
+}
+
+static void psw_leaf_poly (int num)
+{
+    static fixed_t wxa[PSW_CLIP_VMAX], wya[PSW_CLIP_VMAX];
+    static fixed_t wxb[PSW_CLIP_VMAX], wyb[PSW_CLIP_VMAX];
+    fixed_t *ax = wxa, *ay = wya, *bx = wxb, *by = wyb, *sw;
+    subsector_t *sub = &subsectors[num];
+    int n = 4, i;
+    ax[0] = psw_bbx0; ay[0] = psw_bby0;
+    ax[1] = psw_bbx1; ay[1] = psw_bby0;
+    ax[2] = psw_bbx1; ay[2] = psw_bby1;
+    ax[3] = psw_bbx0; ay[3] = psw_bby1;
+    for (i = 0; i < psw_depth && n >= 3; ++i)
+    {
+	n = psw_clip_line(&psw_path[i], ax, ay, n, bx, by);
+	sw = ax; ax = bx; bx = sw;  sw = ay; ay = by; by = sw;
+    }
+    for (i = 0; i < sub->numlines && n >= 3; ++i)
+    {
+	seg_t *sg = &segs[sub->firstline + i];
+	pswclip_t L;
+	L.ox = SEG_V1(sg)->x;             L.oy = SEG_V1(sg)->y;
+	L.dx = SEG_V2(sg)->x - L.ox;      L.dy = SEG_V2(sg)->y - L.oy;
+	n = psw_clip_line(&L, ax, ay, n, bx, by);
+	sw = ax; ax = bx; bx = sw;  sw = ay; ay = by; by = sw;
+    }
+    if (n > PSW_POLY_VMAX) n = PSW_POLY_VMAX;   /* convex: dropping tail verts = mild shave */
+    if (n < 3) n = 0;
+    if (psw_pass == 0) { psw_vtotal += n; return; }
+    psw_pvi[num] = (unsigned short)psw_fillpos;
+    psw_pvn[num] = (unsigned char)n;
+    for (i = 0; i < n; ++i) { psw_pvx[psw_fillpos + i] = ax[i]; psw_pvy[psw_fillpos + i] = ay[i]; }
+    psw_fillpos += n;
+}
+
+static void psw_poly_walk (int bspnum)
+{
+    node_t *bsp;
+    if (bspnum & NF_SUBSECTOR)
+    {
+	psw_leaf_poly(bspnum == -1 ? 0 : (bspnum & ~NF_SUBSECTOR));
+	return;
+    }
+    bsp = &nodes[bspnum];
+    if (psw_depth < PSW_PATH_MAX)
+    {
+	pswclip_t *L = &psw_path[psw_depth++];
+	L->ox = NODE_X(bsp);  L->oy = NODE_Y(bsp);
+	/* front child (0): R_PointOnSide returns front when ndx*dy - ndy*dx < 0,
+	   which is exactly the keep-rule's cross <= 0 (boundary given to both sides
+	   = a hairline overlap, harmless). */
+	L->dx = NODE_DX(bsp); L->dy = NODE_DY(bsp);
+	psw_poly_walk(bsp->children[0]);
+	L->dx = -L->dx; L->dy = -L->dy;                 /* back child: keep the other side */
+	psw_poly_walk(bsp->children[1]);
+	psw_depth--;
+    }
+    else
+    {   /* path overflow (pathological BSP depth): children go unclipped by this line --
+	   their polygons come out too large; the platform's near-clip + painter order
+	   absorb it (oversize flats are overdrawn by nearer geometry). */
+	psw_poly_walk(bsp->children[0]);
+	psw_poly_walk(bsp->children[1]);
+    }
+}
+
+/* (Re)build for the current level; called once per PSW frame from R_DrawPlanes'
+   PSW block (cheap identity check after the first build). */
+void R_PswPolysEnsure (void)
+{
+    int i;
+    if (psw_poly_level == (void *)subsectors) return;
+    psw_poly_level = (void *)subsectors;
+    psw_polys_ok = 0;
+    psw_pvx = psw_pvy = 0; psw_pvi = 0; psw_pvn = 0;    /* old blocks died with PU_LEVEL */
+    if (numsubsectors < 1 || numsubsectors > PSW_SUBS_MAX || numnodes < 1) return;
+    psw_bbx0 = psw_bby0 = 0x7fffffff; psw_bbx1 = psw_bby1 = (fixed_t)0x80000000;
+    for (i = 0; i < numvertexes; ++i)
+    {
+	if (vertexes[i].x < psw_bbx0) psw_bbx0 = vertexes[i].x;
+	if (vertexes[i].x > psw_bbx1) psw_bbx1 = vertexes[i].x;
+	if (vertexes[i].y < psw_bby0) psw_bby0 = vertexes[i].y;
+	if (vertexes[i].y > psw_bby1) psw_bby1 = vertexes[i].y;
+    }
+    psw_bbx0 -= 128 << FRACBITS; psw_bby0 -= 128 << FRACBITS;
+    psw_bbx1 += 128 << FRACBITS; psw_bby1 += 128 << FRACBITS;
+    psw_pass = 0; psw_vtotal = 0; psw_depth = 0;
+    psw_poly_walk(numnodes - 1);
+    if (psw_vtotal < 3 || psw_vtotal > PSW_VERT_MAX) return;
+    psw_pvx = Z_Malloc(psw_vtotal * (int)sizeof(fixed_t), PU_LEVEL, 0);
+    psw_pvy = Z_Malloc(psw_vtotal * (int)sizeof(fixed_t), PU_LEVEL, 0);
+    psw_pvi = Z_Malloc(numsubsectors * (int)sizeof(unsigned short), PU_LEVEL, 0);
+    psw_pvn = Z_Malloc(numsubsectors, PU_LEVEL, 0);
+    memset(psw_pvn, 0, numsubsectors);
+    psw_pass = 1; psw_fillpos = 0; psw_depth = 0;
+    psw_poly_walk(numnodes - 1);
+    psw_polys_ok = 1;
+}
+#endif /* SAT_PSW */
+
 //
 // R_Subsector
 // Determine floor/ceiling planes.
@@ -601,6 +772,20 @@ void R_Subsector (int num)
     frontsector = sub->sector;
     count = sub->numlines;
     line = &segs[sub->firstline];
+
+#if SAT_PSW
+    /* PSW: record the visit (near-first painter order) BEFORE this subsector's walls
+       are queued -- the platform interleaves its floor/ceiling quads with its wall
+       slice at flush time.  Ceiling lump -1 = sky (never emitted). */
+    if (sat_psw_active && sat_psw_sub_hook)
+	sat_psw_sub_hook(num,
+	                 frontsector->floorheight, frontsector->ceilingheight,
+	                 frontsector->floorpic,
+	                 firstflat + flattranslation[frontsector->floorpic],
+	                 (frontsector->ceilingpic == skyflatnum) ? -1
+	                     : firstflat + flattranslation[frontsector->ceilingpic],
+	                 frontsector->lightlevel);
+#endif
 
     if (frontsector->floorheight < viewz)
     {
