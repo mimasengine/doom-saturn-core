@@ -608,6 +608,8 @@ int             psw_polys_ok = 0;    /* 1 = pools below are valid for this level
 fixed_t        *psw_pvx = 0, *psw_pvy = 0;   /* vertex pool (world, 16.16)      */
 unsigned short *psw_pvi = 0;         /* per-subsector: pool start index          */
 unsigned char  *psw_pvn = 0;         /* per-subsector: vertex count (0 = none)   */
+int            *psw_pva = 0;         /* per-subsector: polygon world area (map-units^2) */
+fixed_t        *psw_pcx = 0, *psw_pcy = 0;   /* per-subsector: polygon centroid (16.16) */
 static void    *psw_poly_level = 0;  /* level identity = subsectors[] pointer    */
 
 #define PSW_POLY_VMAX 20
@@ -690,6 +692,21 @@ static void psw_leaf_poly (int num)
     psw_pvn[num] = (unsigned char)n;
     for (i = 0; i < n; ++i) { psw_pvx[psw_fillpos + i] = ax[i]; psw_pvy[psw_fillpos + i] = ay[i]; }
     psw_fillpos += n;
+    {   /* world area (shoelace) + centroid: the platform's flat FILL budget estimates
+	   this polygon's screen pixels as area * (px-per-unit at the centroid)^2. */
+	long long a2 = 0, sx = 0, sy = 0;
+	for (i = 0; i < n; ++i)
+	{
+	    int j = (i + 1 == n) ? 0 : i + 1;
+	    a2 += (long long)(ax[i] >> 8) * (ay[j] >> 8)
+	        - (long long)(ax[j] >> 8) * (ay[i] >> 8);
+	    sx += ax[i]; sy += ay[i];
+	}
+	if (a2 < 0) a2 = -a2;
+	psw_pva[num] = (int)(a2 >> 17);        /* (u<<8)^2 products, /2 -> map-units^2 */
+	psw_pcx[num] = (fixed_t)(sx / n);
+	psw_pcy[num] = (fixed_t)(sy / n);
+    }
 }
 
 static void psw_poly_walk (int bspnum)
@@ -732,6 +749,7 @@ void R_PswPolysEnsure (void)
     psw_poly_level = (void *)subsectors;
     psw_polys_ok = 0;
     psw_pvx = psw_pvy = 0; psw_pvi = 0; psw_pvn = 0;    /* old blocks died with PU_LEVEL */
+    psw_pva = 0; psw_pcx = psw_pcy = 0;
     if (numsubsectors < 1 || numsubsectors > PSW_SUBS_MAX || numnodes < 1) return;
     psw_bbx0 = psw_bby0 = 0x7fffffff; psw_bbx1 = psw_bby1 = (fixed_t)0x80000000;
     for (i = 0; i < numvertexes; ++i)
@@ -750,7 +768,11 @@ void R_PswPolysEnsure (void)
     psw_pvy = Z_Malloc(psw_vtotal * (int)sizeof(fixed_t), PU_LEVEL, 0);
     psw_pvi = Z_Malloc(numsubsectors * (int)sizeof(unsigned short), PU_LEVEL, 0);
     psw_pvn = Z_Malloc(numsubsectors, PU_LEVEL, 0);
+    psw_pva = Z_Malloc(numsubsectors * (int)sizeof(int), PU_LEVEL, 0);
+    psw_pcx = Z_Malloc(numsubsectors * (int)sizeof(fixed_t), PU_LEVEL, 0);
+    psw_pcy = Z_Malloc(numsubsectors * (int)sizeof(fixed_t), PU_LEVEL, 0);
     memset(psw_pvn, 0, numsubsectors);
+    memset(psw_pva, 0, numsubsectors * (int)sizeof(int));   /* n<3 leaves: area 0 = free */
     psw_pass = 1; psw_fillpos = 0; psw_depth = 0;
     psw_poly_walk(numnodes - 1);
     psw_polys_ok = 1;
