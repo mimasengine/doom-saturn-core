@@ -604,6 +604,14 @@ extern int *flattranslation;         /* r_data.c: animated-flat indirection     
 void (*sat_psw_sub_hook)(int subnum, int fh, int ch, int fpic,
                          int flump, int clump, int light, int vis0) = 0;
 
+/* floor height at a world point (the platform's pit-visibility cull: one
+   sightline/dominant-crossing test per tile).  Pure node walk, no allocation --
+   safe at flush time. */
+int R_PswFloorAt (fixed_t x, fixed_t y)
+{
+    return R_PointInSubsector (x, y)->sector->floorheight;
+}
+
 int             psw_polys_ok = 0;    /* 1 = pools below are valid for this level */
 fixed_t        *psw_pvx = 0, *psw_pvy = 0;   /* vertex pool (world, 16.16)      */
 unsigned short *psw_pvi = 0;         /* per-subsector: pool start index          */
