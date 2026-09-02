@@ -323,6 +323,16 @@ void R_ClearClipSegs (void)
     solidsegs[1].first = x1;             /* [x1, ..]  = solid (off to the right)  */
     solidsegs[1].last = 0x7fffffff;
     newend = solidsegs+2;
+
+#if SAT_PSW
+    {   /* PSW portal bands (r_segs.c): fresh open bands for this walk.  This is
+	   the one pre-walk chokepoint, same as solidsegs. */
+	extern int  sat_psw_active;
+	extern void R_PswBandsReset (void);
+	if (sat_psw_active)
+	    R_PswBandsReset ();
+    }
+#endif
 }
 
 //

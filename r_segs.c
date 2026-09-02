@@ -2730,6 +2730,47 @@ extern int sat_psw_active;          /* platform (dg_saturn.cxx): latched at the 
 int sat_psw_tiers = 0;              /* per-frame: tier quads accepted by the hook (overlay row 13) */
 int sat_psw_ref   = 0;              /* per-frame: tier quads rejected (budget/list full = far shed) */
 
+/* PSW PORTAL BANDS (round 9 -- the PowerSlave occlusion, done the way the
+   software renderer does it).  One open vertical interval [bt, bb] per screen
+   COLUMN, folded during the near-first BSP walk: a one-sided seg seals its
+   columns outright (the solidsegs assumption -- sealed maps), a two-sided seg
+   narrows the band to its portal opening (upper/lower tier + the front
+   sector's ceiling/floor plane regions, exactly vanilla's ceilingclip /
+   floorclip bookkeeping).  Everything QUEUED LATER -- farther walls' tiers,
+   farther subsectors' flats (tested from the platform's note hook via
+   R_PswBandBoxHidden), and the overflow tail -- is tested against the state
+   built so far = strictly nearer occluders only.  The round-8 8-px bucket
+   scheme never culled anything (console c0: without folding the FLAT regions,
+   a full-height band is only ever touched by walls at the screen edges); the
+   per-column fold of the plane regions is what makes the bands bite. */
+short sat_psw_bt[SCREENWIDTH];      /* first open row per column */
+short sat_psw_bb[SCREENWIDTH];      /* last open row per column (bt > bb = sealed) */
+int   sat_psw_wcull = 0;            /* tier quads culled by the bands (overlay row 13 `c`) */
+
+void R_PswBandsReset (void)
+{
+    int x;
+    for (x = 0; x < viewwidth; ++x)
+    {
+	sat_psw_bt[x] = 0;
+	sat_psw_bb[x] = (short)(viewheight - 1);
+    }
+}
+
+/* 1 = the box [xl,xr]x[yt,yb] (view-relative columns/rows) meets NO open band:
+   proven hidden behind strictly nearer geometry.  Conservative: the caller's
+   box is a bbox superset of the real shape, and the bands only shrink where
+   real opaque regions were folded. */
+int R_PswBandBoxHidden (int xl, int xr, int yt, int yb)
+{
+    int x;
+    if (xl < 0) xl = 0;
+    if (xr >= viewwidth) xr = viewwidth - 1;
+    for (x = xl; x <= xr; ++x)
+	if (yb >= sat_psw_bt[x] && yt <= sat_psw_bb[x]) return 0;
+    return 1;
+}
+
 static void R_PswEmitTier (int texnum, fixed_t texmid,
                            fixed_t tf, fixed_t ts,    /* top edge frac/step (HEIGHTBITS) */
                            fixed_t bf, fixed_t bs,    /* bottom edge frac/step */
@@ -2749,6 +2790,22 @@ static void R_PswEmitTier (int texnum, fixed_t texmid,
     int v1 = (int)((texmid + (fixed_t)((yh1 - centery) * (int)is)) >> FRACBITS);
     int sx = rw_stopx - rw_x;
     int mdu = u2 - u1; if (mdu < 0) mdu = -mdu; if (mdu < 1) mdu = 1;
+
+    {   /* PORTAL-BAND CULL: this tier vs the bands of strictly NEARER segs
+	   (the fold runs after a seg's tiers, so a seg never tests against
+	   itself).  Visible tiers exit on their first open column -- only a
+	   fully hidden tier pays the whole range walk. */
+	fixed_t tfx = tf, bfx = bf;
+	int x, vis = 0;
+	for (x = rw_x; x < rw_stopx; ++x)
+	{
+	    int yl = SAT_SHR12 (tfx + HEIGHTUNIT - 1);
+	    int yh = SAT_SHR12 (bfx);
+	    if (yh >= sat_psw_bt[x] && yl <= sat_psw_bb[x]) { vis = 1; break; }
+	    tfx += ts; bfx += bs;
+	}
+	if (!vis) { sat_psw_wcull++; return; }
+    }
 
     if (sx > mdu)
     {
@@ -2940,6 +2997,56 @@ static void R_PswWallRange (int start, int stop)
     if (bottomtexture)
 	R_PswEmitTier (bottomtexture, rw_bottomtexturemid,
 	               pixlow, pixlowstep, bottomfrac, bottomstep, cm);
+
+    {   /* PORTAL-BAND FOLD -- after this seg's tiers were tested (a tier never
+	   occludes itself).  Vanilla ceilingclip/floorclip semantics per column:
+	   - one-sided: the column is SEALED (nothing farther can show -- the
+	     solidsegs assumption on sealed maps);
+	   - two-sided: the front CEILING plane region [band top .. wall top-1]
+	     is opaque when that plane is visible (ceiling above the eye, or
+	     sky), and the upper tier extends the closure down to pixhigh; the
+	     floor side mirrors with pixlow.  A tier whose region does not
+	     reach the current band edge (no visible plane above/below it)
+	     folds only when it touches the edge -- a floating middle quad
+	     narrows nothing (conservative: nothing visible is ever culled). */
+	int ceilvis  = (frontsector->ceilingheight > viewz
+	                || frontsector->ceilingpic == skyflatnum);
+	int floorvis = (frontsector->floorheight < viewz);
+	fixed_t tfx = topfrac, bfx = bottomfrac;
+	fixed_t phx = pixhigh, plx = pixlow;   /* valid only when their tier exists */
+	int x;
+	for (x = rw_x; x < rw_stopx; ++x)
+	{
+	    if (midtexture)
+		sat_psw_bt[x] = (short)viewheight;         /* sealed */
+	    else
+	    {
+		int yl = SAT_SHR12 (tfx + HEIGHTUNIT - 1);
+		int yh = SAT_SHR12 (bfx);
+		int nt = sat_psw_bt[x], nb = sat_psw_bb[x];
+		if (yl < 0) yl = 0; else if (yl > viewheight) yl = viewheight;
+		if (yh < -1) yh = -1; else if (yh >= viewheight) yh = viewheight - 1;
+		if (toptexture)
+		{
+		    int ph = SAT_SHR12 (phx);
+		    if (ph >= viewheight) ph = viewheight - 1;
+		    if ((ceilvis || yl <= nt) && ph + 1 > nt) nt = ph + 1;
+		    phx += pixhighstep;
+		}
+		else if (ceilvis && yl > nt) nt = yl;
+		if (bottomtexture)
+		{
+		    int pl = SAT_SHR12 (plx);
+		    if (pl < 0) pl = 0;
+		    if ((floorvis || yh >= nb) && pl - 1 < nb) nb = pl - 1;
+		    plx += pixlowstep;
+		}
+		else if (floorvis && yh < nb) nb = yh;
+		sat_psw_bt[x] = (short)nt; sat_psw_bb[x] = (short)nb;
+	    }
+	    tfx += topstep; bfx += bottomstep;
+	}
+    }
 }
 #endif /* SAT_PSW */
 
