@@ -612,6 +612,13 @@ int R_PswFloorAt (fixed_t x, fixed_t y)
     return R_PointInSubsector (x, y)->sector->floorheight;
 }
 
+/* ceiling twin (the symmetric cull).  A SKY ceiling occludes at its height too:
+   that is exactly Doom's sky-hack convention (nothing shows above a sky edge). */
+int R_PswCeilingAt (fixed_t x, fixed_t y)
+{
+    return R_PointInSubsector (x, y)->sector->ceilingheight;
+}
+
 int             psw_polys_ok = 0;    /* 1 = pools below are valid for this level */
 fixed_t        *psw_pvx = 0, *psw_pvy = 0;   /* vertex pool (world, 16.16)      */
 unsigned short *psw_pvi = 0;         /* per-subsector: pool start index          */
