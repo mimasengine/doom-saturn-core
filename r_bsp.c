@@ -683,6 +683,33 @@ static int psw_clip_line (const pswclip_t *L, const fixed_t *ax, const fixed_t *
     return m;
 }
 
+/* n > cap: remove the FLATTEST corners (smallest |cross| at the vertex), one at
+   a time.  The old `n = PSW_POLY_VMAX` tail-chop closed the polygon with a
+   CHORD from vertex cap-1 back to vertex 0 and cut a whole WEDGE out of the
+   subsector -- a fixed-spot floor/ceiling hole on every big leaf (console
+   2026-09-02, "trous dans les plafonds": ceilings show it, the dominant floor
+   hides it under RBG0).  Load-time only, O(n^2) is fine. */
+static int psw_poly_shave (fixed_t *ax, fixed_t *ay, int n, int cap)
+{
+    while (n > cap)
+    {
+	int i, best = 0;
+	long long bestc = -1;
+	for (i = 0; i < n; ++i)
+	{
+	    int p = (i == 0) ? n - 1 : i - 1;
+	    int j = (i + 1 == n) ? 0 : i + 1;
+	    long long c = (long long)(ax[i] - ax[p]) * (ay[j] - ay[i])
+	                - (long long)(ay[i] - ay[p]) * (ax[j] - ax[i]);
+	    if (c < 0) c = -c;
+	    if (bestc < 0 || c < bestc) { bestc = c; best = i; }
+	}
+	for (i = best; i + 1 < n; ++i) { ax[i] = ax[i + 1]; ay[i] = ay[i + 1]; }
+	n--;
+    }
+    return n;
+}
+
 static void psw_leaf_poly (int num)
 {
     static fixed_t wxa[PSW_CLIP_VMAX], wya[PSW_CLIP_VMAX];
@@ -698,6 +725,10 @@ static void psw_leaf_poly (int num)
     {
 	n = psw_clip_line(&psw_path[i], ax, ay, n, bx, by);
 	sw = ax; ax = bx; bx = sw;  sw = ay; ay = by; by = sw;
+	if (n > PSW_CLIP_VMAX - 6)                  /* headroom: psw_clip_line must
+	                                               never hit ITS cap (same silent
+	                                               vertex-drop corruption) */
+	    n = psw_poly_shave(ax, ay, n, PSW_CLIP_VMAX - 6);
     }
     for (i = 0; i < sub->numlines && n >= 3; ++i)
     {
@@ -707,8 +738,11 @@ static void psw_leaf_poly (int num)
 	L.dx = SEG_V2(sg)->x - L.ox;      L.dy = SEG_V2(sg)->y - L.oy;
 	n = psw_clip_line(&L, ax, ay, n, bx, by);
 	sw = ax; ax = bx; bx = sw;  sw = ay; ay = by; by = sw;
+	if (n > PSW_CLIP_VMAX - 6)
+	    n = psw_poly_shave(ax, ay, n, PSW_CLIP_VMAX - 6);
     }
-    if (n > PSW_POLY_VMAX) n = PSW_POLY_VMAX;   /* convex: dropping tail verts = mild shave */
+    if (n > PSW_POLY_VMAX)
+	n = psw_poly_shave(ax, ay, n, PSW_POLY_VMAX);
     if (n < 3) n = 0;
     if (psw_pass == 0) { psw_vtotal += n; return; }
     psw_pvi[num] = (unsigned short)psw_fillpos;
