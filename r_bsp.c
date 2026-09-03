@@ -629,6 +629,49 @@ int R_PswCeilingAt (fixed_t x, fixed_t y)
     return R_PointInSubsector (x, y)->sector->ceilingheight;
 }
 
+/* SATURN PSW round 22 (owner's full-square model: "on peut tout faire avec les
+   64x64 en carre, quitte a deborder derriere le mur").  A grid square may
+   overdraw ANY border whose far side gets repainted over it: a one-sided wall
+   or a facing tier (its seg fronts the viewer's side = drawn AFTER this sub's
+   flats), a BSP split chord (same sector, same flat, grid-aligned = pixel-
+   identical texels), or nearer content (painted later by far->near order).
+   The ONLY borders that do NOT cover are the sub's AWAY-FACING two-sided segs
+   whose far side is open past the plane -- floor dropping beyond (the step
+   wall faces away = backface-culled), or ceiling rising beyond / SKY (VDP2,
+   below VDP1, unerasable).  This returns those SOFT lines (capped): tiles
+   crossing one must clip; every other tile is a full square. */
+int R_PswSoftLines (int subnum, int psign, fixed_t h,
+                    fixed_t *lx1, fixed_t *ly1, fixed_t *lx2, fixed_t *ly2,
+                    int maxn)
+{
+    subsector_t *ss = &subsectors[subnum];
+    int i, n = 0;
+    for (i = 0; i < ss->numlines && n < maxn; ++i)
+    {
+	seg_t    *sg = &segs[ss->firstline + i];
+	sector_t *bs = SEG_BACKSECTOR (sg);
+	vertex_t *sv1, *sv2;
+	if (!bs) continue;                             /* one-sided: covered */
+	if (psign > 0)
+	{   /* floor: soft iff the far floor is LOWER (drop beyond) */
+	    if (bs->floorheight >= h) continue;
+	}
+	else
+	{   /* ceiling: soft iff the far ceiling is HIGHER, or sky */
+	    if (bs->ceilingheight <= h && bs->ceilingpic != skyflatnum) continue;
+	}
+	/* viewer on the seg's FRONT (interior) side = crossing it goes AWAY
+	   from the viewer = a far border.  Near borders (viewer on the back)
+	   are covered by nearer content and stay hard. */
+	if (R_PointOnSegSide (viewx, viewy, sg) != 0) continue;
+	sv1 = SEG_V1 (sg); sv2 = SEG_V2 (sg);
+	lx1[n] = sv1->x; ly1[n] = sv1->y;
+	lx2[n] = sv2->x; ly2[n] = sv2->y;
+	n++;
+    }
+    return n;
+}
+
 int             psw_polys_ok = 0;    /* 1 = pools below are valid for this level */
 fixed_t        *psw_pvx = 0, *psw_pvy = 0;   /* vertex pool (world, 16.16)      */
 unsigned short *psw_pvi = 0;         /* per-subsector: pool start index          */
