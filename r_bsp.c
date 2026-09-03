@@ -629,63 +629,24 @@ int R_PswCeilingAt (fixed_t x, fixed_t y)
     return R_PointInSubsector (x, y)->sector->ceilingheight;
 }
 
-/* SATURN PSW round 22 (owner's full-square model: "on peut tout faire avec les
-   64x64 en carre, quitte a deborder derriere le mur").  A grid square may
-   overdraw ANY border whose far side gets repainted over it: a one-sided wall
-   or a facing tier (its seg fronts the viewer's side = drawn AFTER this sub's
-   flats), a BSP split chord (same sector, same flat, grid-aligned = pixel-
-   identical texels), or nearer content (painted later by far->near order).
-   Round 24 tightened WHICH far borders cover: only an EXACT continuation of
-   the plane (same height, same flat) does.  Everything else on an away-facing
-   two-sided seg is SOFT -- a drop beyond (step wall backface-culled), a RISE
-   beyond (the riser covers only its own span; overdraw past it lands ON the
-   farther step top -- console 2026-09-03), a same-height flat change (no wall
-   at all), or SKY (VDP2, below VDP1, unerasable).  This returns those SOFT
-   lines (capped): tiles crossing one must clip; every other tile is a full
-   square. */
-int R_PswSoftLines (int subnum, int psign, fixed_t h,
-                    fixed_t *lx1, fixed_t *ly1, fixed_t *lx2, fixed_t *ly2,
-                    int maxn)
-{
-    subsector_t *ss = &subsectors[subnum];
-    int i, n = 0;
-    for (i = 0; i < ss->numlines && n < maxn; ++i)
-    {
-	seg_t    *sg = &segs[ss->firstline + i];
-	sector_t *bs = SEG_BACKSECTOR (sg);
-	vertex_t *sv1, *sv2;
-	if (!bs) continue;                             /* one-sided: covered */
-	if (psign > 0)
-	{   /* floor: HARD only when the far side CONTINUES this plane exactly
-	       (same height AND same flat).  A HIGHER far floor used to stay
-	       hard "because the riser covers" -- but the riser covers only up
-	       to its own top edge: the overdraw past it projects ABOVE it,
-	       onto the step top of a FARTHER sub already painted (console
-	       2026-09-03, "des deux cotes de chaque marche, une tuile avec la
-	       texture du sol en dessous").  Same height + different flat is a
-	       wall-less border too: overdraw would repaint the neighbour's
-	       flat with ours up to a tile deep. */
-	    if (bs->floorheight == h && bs->floorpic == ss->sector->floorpic)
-		continue;
-	}
-	else
-	{   /* ceiling: mirrored -- hard only on an exact continuation; sky
-	       beyond is always soft (the sky-hack region must not be painted) */
-	    if (bs->ceilingheight == h && bs->ceilingpic == ss->sector->ceilingpic
-	        && bs->ceilingpic != skyflatnum) continue;
-	}
-	/* viewer on the seg's FRONT (interior) side = crossing it goes AWAY
-	   from the viewer = a far border.  Near borders (viewer on the back)
-	   are covered by nearer content and stay hard. */
-	if (R_PointOnSegSide (viewx, viewy, sg) != 0) continue;
-	sv1 = SEG_V1 (sg); sv2 = SEG_V2 (sg);
-	lx1[n] = sv1->x; ly1[n] = sv1->y;
-	lx2[n] = sv2->x; ly2[n] = sv2->y;
-	n++;
-    }
-    return n;
-}
-
+/* SATURN PSW round 26 -- THE OVERDRAW MODEL IS DEAD (owner: "les murs doivent
+   s'afficher par dessus les plans, a distance equivalente au moins").  Rounds
+   22-25 let a full grid square overdraw its leaf border under a "something
+   covers it" rule (facing walls / risers / nearer subs / soft-line
+   classification), and every version of that rule leaked, for measured
+   reasons: BSP order between side-by-side subs is arbitrary (the covering
+   wall may emit FIRST), the seg list is structurally blind to sector borders
+   on bare BSP splitlines (a partition picked ALONG a linedef leaves the far
+   cell segless there), zero-thickness double-faced walls hide real content
+   behind "one-sided = covered", and every static classification of "what
+   lies beyond an edge" is a sampling (offline sweeps: 248-1092 leaking
+   borders/tiles across the 9 shareware maps depending on the rule).  The
+   platform emitter now enforces CONTAINMENT instead: a 1-cmd full square or
+   strip only for tiles FULLY INSIDE the leaf polygon, the exact clipped
+   piece for every border tile -- a flat can never paint a texel outside its
+   own leaf, so it can never touch a wall, on any WAD, in any order.  The
+   soft-line machinery (R_PswSoftLines + the round-26 edge-neighbour probes)
+   is deleted; the pools below are the whole contract. */
 int             psw_polys_ok = 0;    /* 1 = pools below are valid for this level */
 fixed_t        *psw_pvx = 0, *psw_pvy = 0;   /* vertex pool (world, 16.16)      */
 unsigned short *psw_pvi = 0;         /* per-subsector: pool start index          */
