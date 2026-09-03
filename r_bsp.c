@@ -635,11 +635,14 @@ int R_PswCeilingAt (fixed_t x, fixed_t y)
    or a facing tier (its seg fronts the viewer's side = drawn AFTER this sub's
    flats), a BSP split chord (same sector, same flat, grid-aligned = pixel-
    identical texels), or nearer content (painted later by far->near order).
-   The ONLY borders that do NOT cover are the sub's AWAY-FACING two-sided segs
-   whose far side is open past the plane -- floor dropping beyond (the step
-   wall faces away = backface-culled), or ceiling rising beyond / SKY (VDP2,
-   below VDP1, unerasable).  This returns those SOFT lines (capped): tiles
-   crossing one must clip; every other tile is a full square. */
+   Round 24 tightened WHICH far borders cover: only an EXACT continuation of
+   the plane (same height, same flat) does.  Everything else on an away-facing
+   two-sided seg is SOFT -- a drop beyond (step wall backface-culled), a RISE
+   beyond (the riser covers only its own span; overdraw past it lands ON the
+   farther step top -- console 2026-09-03), a same-height flat change (no wall
+   at all), or SKY (VDP2, below VDP1, unerasable).  This returns those SOFT
+   lines (capped): tiles crossing one must clip; every other tile is a full
+   square. */
 int R_PswSoftLines (int subnum, int psign, fixed_t h,
                     fixed_t *lx1, fixed_t *ly1, fixed_t *lx2, fixed_t *ly2,
                     int maxn)
@@ -653,12 +656,23 @@ int R_PswSoftLines (int subnum, int psign, fixed_t h,
 	vertex_t *sv1, *sv2;
 	if (!bs) continue;                             /* one-sided: covered */
 	if (psign > 0)
-	{   /* floor: soft iff the far floor is LOWER (drop beyond) */
-	    if (bs->floorheight >= h) continue;
+	{   /* floor: HARD only when the far side CONTINUES this plane exactly
+	       (same height AND same flat).  A HIGHER far floor used to stay
+	       hard "because the riser covers" -- but the riser covers only up
+	       to its own top edge: the overdraw past it projects ABOVE it,
+	       onto the step top of a FARTHER sub already painted (console
+	       2026-09-03, "des deux cotes de chaque marche, une tuile avec la
+	       texture du sol en dessous").  Same height + different flat is a
+	       wall-less border too: overdraw would repaint the neighbour's
+	       flat with ours up to a tile deep. */
+	    if (bs->floorheight == h && bs->floorpic == ss->sector->floorpic)
+		continue;
 	}
 	else
-	{   /* ceiling: soft iff the far ceiling is HIGHER, or sky */
-	    if (bs->ceilingheight <= h && bs->ceilingpic != skyflatnum) continue;
+	{   /* ceiling: mirrored -- hard only on an exact continuation; sky
+	       beyond is always soft (the sky-hack region must not be painted) */
+	    if (bs->ceilingheight == h && bs->ceilingpic == ss->sector->ceilingpic
+	        && bs->ceilingpic != skyflatnum) continue;
 	}
 	/* viewer on the seg's FRONT (interior) side = crossing it goes AWAY
 	   from the viewer = a far border.  Near borders (viewer on the back)
