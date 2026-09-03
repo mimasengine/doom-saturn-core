@@ -1597,20 +1597,14 @@ void R_DrawPlanes (void)
 	if (sat_psw_active)
 	{
 	    extern void R_PswPolysEnsure (void);   /* r_bsp.c: lazy per-level polygon build */
-	    extern byte *R_FlatCacheGet (int lumpnum);   /* r_flatcache.c: LRU dalle fill */
-	    visplane_t *p;
-	    for (p = visplanes ; p < lastvisplane ; p++)
-	    {
-		if (p->picnum == skyflatnum) { sat_frame_has_sky = 1; continue; }
-		/* PSW flats feed off the flat cache (the platform's slot upload and its
-		   solid fallback both PEEK, never read the disc): with the span path
-		   dead nothing filled the dalle any more -- console read row 13 d40 =
-		   quads dropped for want of a peekable flat.  Resolve every visited
-		   plane's flat exactly as the span path used to: one disc read per
-		   residency, then the LRU dalle holds it (`ld` caps once resident). */
-		if (p->picnum >= 0)
-		    R_FlatCacheGet (firstflat + flattranslation[p->picnum]);
-	    }
+	    /* SATURN round 29: the visplane walk that lived here (sky presence +
+	       flat-dalle residency) moved to the platform, fed by its own notes --
+	       R_Subsector skips R_FindPlane entirely under PSW, so there are no
+	       visplanes to walk (and the dominant election above, whose coverage
+	       sums were all zero without span marking, keeps taking the same
+	       under-eye fallback it always took in this mode). */
+	    extern void R_PswFrameFlats (void);    /* platform: sky flag + R_FlatCacheGet per noted lump */
+	    R_PswFrameFlats ();
 	    sat_vdp2_floor_top_y = centery;
 	    R_PswPolysEnsure();      /* the kick (walls+flats flush) runs AFTER this */
 	    return;

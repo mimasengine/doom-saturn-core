@@ -874,7 +874,17 @@ void R_Subsector (int num)
 	                 (int)(vissprite_p - vissprites));
 #endif
 
-    if (frontsector->floorheight < viewz)
+    /* SATURN PSW round 29: no visplanes in painter mode -- their only PSW
+       consumers (sky presence, flat-dalle residency) read the platform's notes
+       now (R_PswFrameFlats), and the dominant election's coverage sums were
+       already all zero without span marking.  R_PswWallRange never touches
+       floorplane/ceilingplane. */
+    int psw_skip_planes = 0;
+#if SAT_PSW
+    { extern int sat_psw_active; psw_skip_planes = sat_psw_active; }
+#endif
+
+    if (!psw_skip_planes && frontsector->floorheight < viewz)
     {
 	floorplane = R_FindPlane (frontsector->floorheight,
 				  frontsector->floorpic,
@@ -883,9 +893,10 @@ void R_Subsector (int num)
     }
     else
 	floorplane = NULL;
-    
-    if (frontsector->ceilingheight > viewz 
-	|| frontsector->ceilingpic == skyflatnum)
+
+    if (!psw_skip_planes
+	&& (frontsector->ceilingheight > viewz
+	    || frontsector->ceilingpic == skyflatnum))
     {
 	ceilingplane = R_FindPlane (frontsector->ceilingheight,
 				    frontsector->ceilingpic,
