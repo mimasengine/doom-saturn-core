@@ -701,28 +701,83 @@ static int psw_clip_line (const pswclip_t *L, const fixed_t *ax, const fixed_t *
     return m;
 }
 
-/* n > cap: remove the FLATTEST corners (smallest |cross| at the vertex), one at
-   a time.  The old `n = PSW_POLY_VMAX` tail-chop closed the polygon with a
-   CHORD from vertex cap-1 back to vertex 0 and cut a whole WEDGE out of the
-   subsector -- a fixed-spot floor/ceiling hole on every big leaf (console
-   2026-09-02, "trous dans les plafonds": ceilings show it, the dominant floor
-   hides it under RBG0).  Load-time only, O(n^2) is fine. */
+/* ROUND 40 -- THE SHAVE MUST NEVER REMOVE AREA.
+   A leaf over the vertex cap has to lose vertices, and the ONLY safe direction is
+   outward: this polygon is what the painter believes the subsector covers, so any
+   area it loses is a region no floor and no ceiling will ever be drawn on.
+   History of this function, all of it the same bug in different sizes:
+     - the original `n = PSW_POLY_VMAX` tail-chop closed the polygon with a CHORD
+       from vertex cap-1 back to vertex 0 and cut a whole WEDGE out of the leaf;
+     - its replacement removed the FLATTEST CORNER instead -- smaller wedges, one
+       triangle per shave, but still INWARD, still unpaintable, still a fixed-spot
+       hole that no runtime probe can see because nothing was ever refused.
+   Console 2026-09-06, the owner's cyan mask of the hole: a long thin TRIANGLE
+   with the sky showing through it, at a fixed spot, immune to every A/B toggle
+   (budget, portal bands, near clip, master-vs-slave flats) and painted by no
+   refusal marker -- because the plane IS emitted, just smaller than its own leaf.
+   The fix is to drop an EDGE rather than a vertex: extend the two edges flanking
+   it until they meet, and replace both endpoints with that intersection.  For a
+   convex polygon that always ADDS area, so the leaf can never develop a hole --
+   the cost is a sliver of overdraw, which the painter absorbs by construction
+   (nearer geometry is emitted later and paints over it).  Pick the edge whose
+   removal adds the least area; skip near-parallel pairs, whose intersection
+   runs away.  Load-time only, O(n^2) is fine. */
+int sat_psw_shaved = 0;      /* leaves that needed a shave (row 13 `s<n>`) */
+
 static int psw_poly_shave (fixed_t *ax, fixed_t *ay, int n, int cap)
 {
-    while (n > cap)
+    if (n > cap) sat_psw_shaved++;
+    while (n > cap && n > 3)
     {
-	int i, best = 0;
-	long long bestc = -1;
-	for (i = 0; i < n; ++i)
+	int i, best = -1, bi = 0;
+	long long bestc = 0;
+	fixed_t bx = 0, by = 0;
+	for (i = 0; i + 1 < n; ++i)          /* edge (i, i+1); never wraps */
 	{
-	    int p = (i == 0) ? n - 1 : i - 1;
-	    int j = (i + 1 == n) ? 0 : i + 1;
-	    long long c = (long long)(ax[i] - ax[p]) * (ay[j] - ay[i])
-	                - (long long)(ay[i] - ay[p]) * (ax[j] - ax[i]);
-	    if (c < 0) c = -c;
-	    if (bestc < 0 || c < bestc) { bestc = c; best = i; }
+	    int j  = i + 1;
+	    int h  = (i == 0) ? n - 1 : i - 1;
+	    int k2 = (j + 1 == n) ? 0 : j + 1;
+	    /* >> 8 first: the deltas are 16.16 world coords and the products
+	       below would otherwise reach 2^62 on a full-size map */
+	    long long d1x = (ax[i]  - ax[h]) >> 8, d1y = (ay[i]  - ay[h]) >> 8;
+	    long long d2x = (ax[k2] - ax[j]) >> 8, d2y = (ay[k2] - ay[j]) >> 8;
+	    long long den = d1x * d2y - d1y * d2x;
+	    long long wx, wy, q, ex1, ey1, ex2, ey2, area;
+	    fixed_t px, py;
+	    if (den == 0) continue;                        /* parallel: no meet   */
+	    wx = (ax[j] - ax[i]) >> 8;
+	    wy = (ay[j] - ay[i]) >> 8;
+	    q  = ((wx * d2y - wy * d2x) << 16) / den;      /* 16.16 along d1      */
+	    if (q < -(16 << 16) || q > (16 << 16)) continue;  /* runaway meet     */
+	    px = ax[i] + (fixed_t)(((d1x << 8) * q) >> 16);
+	    py = ay[i] + (fixed_t)(((d1y << 8) * q) >> 16);
+	    ex1 = (ax[i] - px) >> 8; ey1 = (ay[i] - py) >> 8;
+	    ex2 = (ax[j] - px) >> 8; ey2 = (ay[j] - py) >> 8;
+	    area = ex1 * ey2 - ex2 * ey1;
+	    if (area < 0) area = -area;                    /* added, never lost   */
+	    if (best < 0 || area < bestc) { bestc = area; best = i; bi = j; bx = px; by = py; }
 	}
-	for (i = best; i + 1 < n; ++i) { ax[i] = ax[i + 1]; ay[i] = ay[i + 1]; }
+	if (best < 0)
+	{   /* every pair parallel or runaway: fall back to the inward corner cut
+	       so the loop still terminates.  Rare, and bounded to one triangle. */
+	    int p, j2;
+	    long long c, bc = -1;
+	    best = 0;
+	    for (i = 0; i < n; ++i)
+	    {
+		p = (i == 0) ? n - 1 : i - 1;
+		j2 = (i + 1 == n) ? 0 : i + 1;
+		c = (long long)(ax[i] - ax[p]) * (ay[j2] - ay[i])
+		  - (long long)(ay[i] - ay[p]) * (ax[j2] - ax[i]);
+		if (c < 0) c = -c;
+		if (bc < 0 || c < bc) { bc = c; best = i; }
+	    }
+	    for (i = best; i + 1 < n; ++i) { ax[i] = ax[i + 1]; ay[i] = ay[i + 1]; }
+	    n--;
+	    continue;
+	}
+	ax[best] = bx; ay[best] = by;                      /* the two become one  */
+	for (i = bi; i + 1 < n; ++i) { ax[i] = ax[i + 1]; ay[i] = ay[i + 1]; }
 	n--;
     }
     return n;
@@ -847,6 +902,8 @@ void R_PswPolysEnsure (void)
     psw_pvn = Z_Malloc(numsubsectors, PU_LEVEL, 0);
     memset(psw_pvn, 0, numsubsectors);
     psw_pass = 1; psw_fillpos = 0; psw_depth = 0;
+    sat_psw_shaved = 0;           /* r40: count the FILLING pass only (the sizing
+                                     pass walks the same tree and would double it) */
     psw_poly_walk(numnodes - 1);
     psw_polys_ok = 1;
 }
