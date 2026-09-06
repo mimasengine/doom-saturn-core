@@ -662,6 +662,10 @@ static void    *psw_poly_level = 0;  /* level identity = subsectors[] pointer   
 typedef struct { fixed_t ox, oy, dx, dy; } pswclip_t;   /* keep: dx*(y-oy)-dy*(x-ox) <= 0 */
 static pswclip_t psw_path[PSW_PATH_MAX];
 static int       psw_depth;
+/* round 37: segs whose keep-line would have emptied their own leaf's cell, over
+   the whole level build.  Constant per level; row 13 `s<n>`.  s0 with the
+   triangle still missing means the collapse is NOT where I looked. */
+int              sat_psw_segskip = 0;
 static fixed_t   psw_bbx0, psw_bby0, psw_bbx1, psw_bby1;
 static int       psw_vtotal, psw_fillpos, psw_pass;
 
@@ -752,9 +756,25 @@ static void psw_leaf_poly (int num)
     {
 	seg_t *sg = &segs[sub->firstline + i];
 	pswclip_t L;
+	int m;
 	L.ox = SEG_V1(sg)->x;             L.oy = SEG_V1(sg)->y;
 	L.dx = SEG_V2(sg)->x - L.ox;      L.dy = SEG_V2(sg)->y - L.oy;
-	n = psw_clip_line(&L, ax, ay, n, bx, by);
+	m = psw_clip_line(&L, ax, ay, n, bx, by);
+	/* ROUND 37 -- A SEG THAT DISCARDS THE WHOLE CELL IS SKIPPED, NOT OBEYED.
+	   The keep-rule assumes every seg runs with the subsector's own sector on
+	   its RIGHT.  A seg that does not (mis-oriented, zero-length after the
+	   node builder's splits, or a numerically borderline one on a leaf the
+	   ancestors already pinched to a sliver) clips the cell away ENTIRELY,
+	   psw_pvn lands at 0, and the platform then has no polygon at all: the
+	   plane is refused at the note for the whole life of the level.  That is
+	   the owner's "triangle systematiquement la, c'est du calcul" -- a
+	   load-time verdict, which is exactly why no runtime A/B (budget, portal
+	   bands, near clip) has ever moved it.  Keeping the cell can only make
+	   the polygon TOO BIG, and oversize flats are overdrawn by nearer
+	   geometry -- the same trade this file already accepts on path overflow
+	   (psw_poly_walk).  A hole is not recoverable; an overdraw is. */
+	if (m < 3) { sat_psw_segskip++; continue; }
+	n = m;
 	sw = ax; ax = bx; bx = sw;  sw = ay; ay = by; by = sw;
 	if (n > PSW_CLIP_VMAX - 6)
 	    n = psw_poly_shave(ax, ay, n, PSW_CLIP_VMAX - 6);
@@ -829,6 +849,8 @@ void R_PswPolysEnsure (void)
     psw_pvn = Z_Malloc(numsubsectors, PU_LEVEL, 0);
     memset(psw_pvn, 0, numsubsectors);
     psw_pass = 1; psw_fillpos = 0; psw_depth = 0;
+    sat_psw_segskip = 0;          /* r37: count the FILLING pass only (the sizing
+                                     pass walks the same tree and would double it) */
     psw_poly_walk(numnodes - 1);
     psw_polys_ok = 1;
 }
