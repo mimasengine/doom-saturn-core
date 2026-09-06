@@ -2747,6 +2747,22 @@ short sat_psw_bt[SCREENWIDTH];      /* first open row per column */
 short sat_psw_bb[SCREENWIDTH];      /* last open row per column (bt > bb = sealed) */
 int   sat_psw_wcull = 0;            /* tier quads culled by the bands (overlay row 13 `c`) */
 
+/* ROUND 36 -- THE FOLD MAY ONLY CLAIM WHAT THE PAINTER WILL ACTUALLY PAINT.
+   The fold below closes a column's band over the front sector's ceiling/floor
+   REGION on the strength of `ceilvis`/`floorvis` alone -- geometric predicates
+   ("the ceiling is above the eye") that say the region WOULD be drawn by a
+   vanilla renderer.  In the painter that region is a separate VDP1 candidate
+   which the platform's note hook can refuse (degenerate clipped leaf, already
+   band-hidden).  A refused plane still had its region claimed opaque, so every
+   plane BEHIND it was band-culled by a promise nothing honoured -- one refusal
+   seeding a corridor of them.  The hook publishes what it really kept, here,
+   just before this subsector's segs are stored (R_Subsector: hook -> AddLine).
+   1 = will be painted (including sky: the HW sky fills it, and the dominant
+   floor: RBG0 fills it).  Bands only ever SHRINK, so a weaker claim can never
+   cull something that was visible -- this direction cannot make a new hole. */
+int   sat_psw_fold_cvis = 0;
+int   sat_psw_fold_fvis = 0;
+
 void R_PswBandsReset (void)
 {
     int x;
@@ -3010,8 +3026,10 @@ static void R_PswWallRange (int start, int stop)
 	     folds only when it touches the edge -- a floating middle quad
 	     narrows nothing (conservative: nothing visible is ever culled). */
 	int ceilvis  = (frontsector->ceilingheight > viewz
-	                || frontsector->ceilingpic == skyflatnum);
-	int floorvis = (frontsector->floorheight < viewz);
+	                || frontsector->ceilingpic == skyflatnum)
+	               && sat_psw_fold_cvis;          /* r36: and REALLY painted */
+	int floorvis = (frontsector->floorheight < viewz)
+	               && sat_psw_fold_fvis;
 	fixed_t tfx = topfrac, bfx = bottomfrac;
 	fixed_t phx = pixhigh, plx = pixlow;   /* valid only when their tier exists */
 	int x;
