@@ -648,6 +648,15 @@ int R_PswCeilingAt (fixed_t x, fixed_t y)
    soft-line machinery (R_PswSoftLines + the round-26 edge-neighbour probes)
    is deleted; the pools below are the whole contract. */
 int             psw_polys_ok = 0;    /* 1 = pools below are valid for this level */
+/* ROUND 46 -- the load-time verdict, finally counted.  Round 37 diagnosed this
+   exactly ("a seg that clips the cell away ENTIRELY, psw_pvn lands at 0, the
+   plane is refused at the note FOR THE WHOLE LIFE OF THE LEVEL -- a load-time
+   verdict, which is why no runtime A/B has ever moved it") and guarded only the
+   SEG loop.  Console then read s0 -- the seg guard never fires -- and that zero
+   was taken as "the theory is wrong".  It was not: the BSP-PATH loop above it
+   has the same failure and has never been guarded OR counted. */
+int             sat_psw_noleaf = 0;  /* subsectors that ended the build with NO polygon */
+int             sat_psw_pathskip = 0;/* partition clips that would have emptied a cell */
 fixed_t        *psw_pvx = 0, *psw_pvy = 0;   /* vertex pool (world, 16.16)      */
 unsigned short *psw_pvi = 0;         /* per-subsector: pool start index          */
 unsigned char  *psw_pvn = 0;         /* per-subsector: vertex count (0 = none)   */
@@ -794,7 +803,22 @@ static void psw_leaf_poly (int num)
     ax[3] = psw_bbx0; ay[3] = psw_bby1;
     for (i = 0; i < psw_depth && n >= 3; ++i)
     {
-	n = psw_clip_line(&psw_path[i], ax, ay, n, bx, by);
+	int m = psw_clip_line(&psw_path[i], ax, ay, n, bx, by);
+	/* ROUND 46 -- THE ROUND-37 LAW, ON THE LOOP THAT NEEDED IT.  A partition
+	   that discards the WHOLE cell cannot be right: the leaf exists, so its
+	   cell is non-empty by construction, and an empty result means the clip
+	   was degenerate (a sliver cell the ancestors already pinched, a
+	   boundary-hugging partition -- the keep rule gives the boundary to both
+	   sides).  Obeying it sets psw_pvn to 0 and the subsector then has no
+	   ceiling FOR THE WHOLE LEVEL, in every mode, at every viewpoint: the
+	   platform refuses it at the note (overlay `h<clip>`), which is exactly
+	   the class that survives BOTH diagnostic crans -- master-inline flats
+	   AND raw-ceilings-with-every-refusal-disarmed.  Keeping the cell can
+	   only make the polygon TOO BIG, and oversize flats are overdrawn by
+	   nearer geometry -- the same trade psw_poly_walk already takes on path
+	   overflow.  A hole is not recoverable; an overdraw is. */
+	if (m < 3) { if (psw_pass) sat_psw_pathskip++; continue; }
+	n = m;
 	sw = ax; ax = bx; bx = sw;  sw = ay; ay = by; by = sw;
 	if (n > PSW_CLIP_VMAX - 6)                  /* headroom: psw_clip_line must
 	                                               never hit ITS cap (same silent
@@ -833,6 +857,7 @@ static void psw_leaf_poly (int num)
     if (n > PSW_POLY_VMAX)
 	n = psw_poly_shave(ax, ay, n, PSW_POLY_VMAX);
     if (n < 3) n = 0;
+    if (psw_pass && n == 0) sat_psw_noleaf++;   /* r46: a subsector with no plane, ever */
     if (psw_pass == 0) { psw_vtotal += n; return; }
     psw_pvi[num] = (unsigned short)psw_fillpos;
     psw_pvn[num] = (unsigned char)n;
@@ -900,6 +925,7 @@ void R_PswPolysEnsure (void)
     psw_pvn = Z_Malloc(numsubsectors, PU_LEVEL, 0);
     memset(psw_pvn, 0, numsubsectors);
     psw_pass = 1; psw_fillpos = 0; psw_depth = 0;
+    sat_psw_noleaf = 0; sat_psw_pathskip = 0;   /* r46 */
     psw_poly_walk(numnodes - 1);
     psw_polys_ok = 1;
 }
