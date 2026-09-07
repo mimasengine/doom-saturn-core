@@ -722,11 +722,9 @@ static int psw_clip_line (const pswclip_t *L, const fixed_t *ax, const fixed_t *
    (nearer geometry is emitted later and paints over it).  Pick the edge whose
    removal adds the least area; skip near-parallel pairs, whose intersection
    runs away.  Load-time only, O(n^2) is fine. */
-int sat_psw_shaved = 0;      /* leaves that needed a shave (row 13 `s<n>`) */
 
 static int psw_poly_shave (fixed_t *ax, fixed_t *ay, int n, int cap)
 {
-    if (n > cap) sat_psw_shaved++;
     while (n > cap && n > 3)
     {
 	int i, best = -1, bi = 0;
@@ -902,8 +900,6 @@ void R_PswPolysEnsure (void)
     psw_pvn = Z_Malloc(numsubsectors, PU_LEVEL, 0);
     memset(psw_pvn, 0, numsubsectors);
     psw_pass = 1; psw_fillpos = 0; psw_depth = 0;
-    sat_psw_shaved = 0;           /* r40: count the FILLING pass only (the sizing
-                                     pass walks the same tree and would double it) */
     psw_poly_walk(numnodes - 1);
     psw_polys_ok = 1;
 }

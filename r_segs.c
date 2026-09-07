@@ -2787,6 +2787,25 @@ int R_PswBandBoxHidden (int xl, int xr, int yt, int yb)
     return 1;
 }
 
+/* ROUND 42 -- THE FOLD MAY ONLY CLAIM COLUMNS THE TIER ACTUALLY PAINTED.
+   Round 36 gated the fold's PLANE claim on what the note hook really kept and
+   left the TIER half claiming unconditionally.  A tier can leave here without
+   painting a texel -- the platform hook refuses it (sat_psw_ref: budget / list
+   full / the px refusal), the magnified path abandons mid-subdivision after a
+   few slices, or the band cull drops it -- and the fold still closed the band
+   down to pixhigh across its WHOLE column range.  Every ceiling plane behind
+   those columns then answered R_PswBandBoxHidden = a WHOLE PLANE dropped at
+   note time (overlay `h../<band>`, which read 4 on every console capture,
+   including at cran 2 where nothing else can kill a ceiling).
+   This is the owner's console law stated exactly: "the partly visible wall has
+   its ceiling band visible; the band whose wall is not painted is masked all
+   the way to the pylon".  The floor twin tells the same lie, but RBG0 fills a
+   lost floor -- which is why nine rounds of this hunt only ever saw ceilings.
+   psw_tier_endx = the EXCLUSIVE column bound this tier really painted. */
+static int psw_tier_endx = 0;      /* written by R_PswEmitTier */
+static int psw_top_endx  = 0;      /* copied out per tier, read by the fold */
+static int psw_bot_endx  = 0;
+
 static void R_PswEmitTier (int texnum, fixed_t texmid,
                            fixed_t tf, fixed_t ts,    /* top edge frac/step (HEIGHTBITS) */
                            fixed_t bf, fixed_t bs,    /* bottom edge frac/step */
@@ -2806,6 +2825,7 @@ static void R_PswEmitTier (int texnum, fixed_t texmid,
     int v1 = (int)((texmid + (fixed_t)((yh1 - centery) * (int)is)) >> FRACBITS);
     int sx = rw_stopx - rw_x;
     int mdu = u2 - u1; if (mdu < 0) mdu = -mdu; if (mdu < 1) mdu = 1;
+    psw_tier_endx = rw_x;              /* r42: nothing painted yet */
 
     {   /* PORTAL-BAND CULL: this tier vs the bands of strictly NEARER segs
 	   (the fold runs after a seg's tiers, so a seg never tests against
@@ -2851,18 +2871,19 @@ static void R_PswEmitTier (int texnum, fixed_t texmid,
                 int sv0 = (int)((texmid + (fixed_t)((yll - centery) * (int)is)) >> FRACBITS);
                 int sv1 = (int)((texmid + (fixed_t)((yhl - centery) * (int)is)) >> FRACBITS);
                 if (sat_wall_hook (xl, yll, yhl, xr, ylr, yhr, texnum, ul, ur, sv0, sv1, cm))
-                    { sat_psw_ref++; return; }
+                    { sat_psw_ref++; psw_tier_endx = xl; return; }   /* r42: slices [rw_x,xl) stand */
                 sat_psw_tiers++;
             }
         }
         }
+        psw_tier_endx = rw_stopx;          /* r42: every slice landed */
         return;
     }
 
     if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, texnum, u1, u2, v0, v1, cm))
         sat_psw_ref++;
     else
-        sat_psw_tiers++;
+    { sat_psw_tiers++; psw_tier_endx = rw_stopx; }     /* r42 */
 }
 
 static void R_PswWallRange (int start, int stop)
@@ -3004,15 +3025,22 @@ static void R_PswWallRange (int start, int stop)
 	}
     }
 
+    psw_top_endx = psw_bot_endx = rw_x;   /* r42: claim nothing by default */
     if (midtexture)
 	R_PswEmitTier (midtexture, rw_midtexturemid,
 	               topfrac, topstep, bottomfrac, bottomstep, cm);
     if (toptexture)
+    {
 	R_PswEmitTier (toptexture, rw_toptexturemid,
 	               topfrac, topstep, pixhigh, pixhighstep, cm);
+	psw_top_endx = psw_tier_endx;      /* r42 */
+    }
     if (bottomtexture)
+    {
 	R_PswEmitTier (bottomtexture, rw_bottomtexturemid,
 	               pixlow, pixlowstep, bottomfrac, bottomstep, cm);
+	psw_bot_endx = psw_tier_endx;      /* r42 */
+    }
 
     {   /* PORTAL-BAND FOLD -- after this seg's tiers were tested (a tier never
 	   occludes itself).  Vanilla ceilingclip/floorclip semantics per column:
@@ -3048,7 +3076,9 @@ static void R_PswWallRange (int start, int stop)
 		{
 		    int ph = SAT_SHR12 (phx);
 		    if (ph >= viewheight) ph = viewheight - 1;
-		    if ((ceilvis || yl <= nt) && ph + 1 > nt) nt = ph + 1;
+		    if (x < psw_top_endx)              /* r42: painted => opaque */
+		    { if ((ceilvis || yl <= nt) && ph + 1 > nt) nt = ph + 1; }
+		    else if (ceilvis && yl > nt) nt = yl;   /* the plane region only */
 		    phx += pixhighstep;
 		}
 		else if (ceilvis && yl > nt) nt = yl;
@@ -3056,7 +3086,9 @@ static void R_PswWallRange (int start, int stop)
 		{
 		    int pl = SAT_SHR12 (plx);
 		    if (pl < 0) pl = 0;
-		    if ((floorvis || yh >= nb) && pl - 1 < nb) nb = pl - 1;
+		    if (x < psw_bot_endx)              /* r42 */
+		    { if ((floorvis || yh >= nb) && pl - 1 < nb) nb = pl - 1; }
+		    else if (floorvis && yh < nb) nb = yh;
 		    plx += pixlowstep;
 		}
 		else if (floorvis && yh < nb) nb = yh;
