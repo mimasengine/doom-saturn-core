@@ -2805,6 +2805,22 @@ int R_PswBandBoxHidden (int xl, int xr, int yt, int yb)
 static int psw_tier_endx = 0;      /* written by R_PswEmitTier */
 static int psw_top_endx  = 0;      /* copied out per tier, read by the fold */
 static int psw_bot_endx  = 0;
+/* ROUND 54 -- THE MID SEAL WAS THE LAST UNGATED CLAIM.  r42 gated the top and
+   bottom tier claims on the columns the tier really painted and left the
+   one-sided seal unconditional: a mid tier refused by the platform hook (list
+   cap), abandoned mid-subdivision, or band-culled still sealed its WHOLE
+   column range to viewheight, and every ceiling plane behind those columns
+   then answered R_PswBandBoxHidden = a whole-leaf kill at note time.  Console
+   2026-09-08 proved the kill MODE-INDEPENDENT (cran 1, master flats: the
+   triangle hole persists -- so the slave-side claims/refusals cascade is NOT
+   this hole's seed, and the one mode-blind fold lie left is this seal).  The
+   owner's pillar in one sentence: an edge-on one-sided face is 1-3 refused
+   columns, sealed anyway -- "masque jusqu'au pilone".  Gating on the painted
+   bound is conservative by construction: bands only shrink LESS, nothing
+   visible is ever newly culled.  (A band-culled mid tier's columns are
+   already closed by whatever culled it, so leaving them unsealed here loses
+   nothing either.) */
+static int psw_mid_endx  = 0;
 
 static void R_PswEmitTier (int texnum, fixed_t texmid,
                            fixed_t tf, fixed_t ts,    /* top edge frac/step (HEIGHTBITS) */
@@ -3025,10 +3041,13 @@ static void R_PswWallRange (int start, int stop)
 	}
     }
 
-    psw_top_endx = psw_bot_endx = rw_x;   /* r42: claim nothing by default */
+    psw_top_endx = psw_bot_endx = psw_mid_endx = rw_x;   /* r42/r54: claim nothing by default */
     if (midtexture)
+    {
 	R_PswEmitTier (midtexture, rw_midtexturemid,
 	               topfrac, topstep, bottomfrac, bottomstep, cm);
+	psw_mid_endx = psw_tier_endx;      /* r54 */
+    }
     if (toptexture)
     {
 	R_PswEmitTier (toptexture, rw_toptexturemid,
@@ -3064,7 +3083,10 @@ static void R_PswWallRange (int start, int stop)
 	for (x = rw_x; x < rw_stopx; ++x)
 	{
 	    if (midtexture)
-		sat_psw_bt[x] = (short)viewheight;         /* sealed */
+	    {   /* r54: sealed only where the wall was PAINTED (see above) */
+		if (x < psw_mid_endx)
+		    sat_psw_bt[x] = (short)viewheight;
+	    }
 	    else
 	    {
 		int yl = SAT_SHR12 (tfx + HEIGHTUNIT - 1);
