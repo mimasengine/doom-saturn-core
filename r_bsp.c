@@ -645,15 +645,8 @@ int R_PswCeilingAt (fixed_t x, fixed_t y)
     return R_PointInSubsector (x, y)->sector->ceilingheight;
 }
 
-/* SATURN P68: TRUE ceiling height of a subsector BY NUMBER -- the probe's
-   magenta rings for un-noted subs projected at a borrowed height ("beaucoup
-   trop hautes", sheared: each vertex rises by focal*ph/d, so a wrong ph does
-   not translate the outline, it distorts it).  The platform has no sector
-   access; this is the one honest source. */
-int R_PswSubCeilH (int num)
-{
-    return subsectors[num].sector->ceilingheight;
-}
+/* (P70 cleanup: R_PswSubCeilH removed with the platform probe apparatus --
+   R_PswFloorAt/R_PswCeilingAt above are the live point lookups.) */
 
 /* SATURN PSW round 26 -- THE OVERDRAW MODEL IS DEAD (owner: "les murs doivent
    s'afficher par dessus les plans, a distance equivalente au moins").  Rounds

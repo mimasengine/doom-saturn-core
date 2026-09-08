@@ -2727,8 +2727,6 @@ int  sat_wallprep_defer = 0;
 #endif
 #if SAT_PSW
 extern int sat_psw_active;          /* platform (dg_saturn.cxx): latched at the frame boundary */
-int sat_psw_tiers = 0;              /* per-frame: tier quads accepted by the hook (overlay row 13) */
-int sat_psw_ref   = 0;              /* per-frame: tier quads rejected (budget/list full = far shed) */
 
 /* PSW PORTAL BANDS (round 9 -- the PowerSlave occlusion, done the way the
    software renderer does it).  One open vertical interval [bt, bb] per screen
@@ -2745,7 +2743,6 @@ int sat_psw_ref   = 0;              /* per-frame: tier quads rejected (budget/li
    per-column fold of the plane regions is what makes the bands bite. */
 short sat_psw_bt[SCREENWIDTH];      /* first open row per column */
 short sat_psw_bb[SCREENWIDTH];      /* last open row per column (bt > bb = sealed) */
-int   sat_psw_wcull = 0;            /* tier quads culled by the bands (overlay row 13 `c`) */
 
 /* ROUND 36 -- THE FOLD MAY ONLY CLAIM WHAT THE PAINTER WILL ACTUALLY PAINT.
    The fold below closes a column's band over the front sector's ceiling/floor
@@ -2760,8 +2757,6 @@ int   sat_psw_wcull = 0;            /* tier quads culled by the bands (overlay r
    1 = will be painted (including sky: the HW sky fills it, and the dominant
    floor: RBG0 fills it).  Bands only ever SHRINK, so a weaker claim can never
    cull something that was visible -- this direction cannot make a new hole. */
-int   sat_psw_fold_cvis = 0;
-int   sat_psw_fold_fvis = 0;
 
 void R_PswBandsReset (void)
 {
@@ -2790,7 +2785,7 @@ int R_PswBandBoxHidden (int xl, int xr, int yt, int yb)
 /* ROUND 42 -- THE FOLD MAY ONLY CLAIM COLUMNS THE TIER ACTUALLY PAINTED.
    Round 36 gated the fold's PLANE claim on what the note hook really kept and
    left the TIER half claiming unconditionally.  A tier can leave here without
-   painting a texel -- the platform hook refuses it (sat_psw_ref: budget / list
+   painting a texel -- the platform hook refuses it (budget / list
    full / the px refusal), the magnified path abandons mid-subdivision after a
    few slices, or the band cull drops it -- and the fold still closed the band
    down to pixhigh across its WHOLE column range.  Every ceiling plane behind
@@ -2856,7 +2851,7 @@ static void R_PswEmitTier (int texnum, fixed_t texmid,
 	    if (yh >= sat_psw_bt[x] && yl <= sat_psw_bb[x]) { vis = 1; break; }
 	    tfx += ts; bfx += bs;
 	}
-	if (!vis) { sat_psw_wcull++; return; }
+	if (!vis) return;
     }
 
     if (sx > mdu)
@@ -2887,8 +2882,7 @@ static void R_PswEmitTier (int texnum, fixed_t texmid,
                 int sv0 = (int)((texmid + (fixed_t)((yll - centery) * (int)is)) >> FRACBITS);
                 int sv1 = (int)((texmid + (fixed_t)((yhl - centery) * (int)is)) >> FRACBITS);
                 if (sat_wall_hook (xl, yll, yhl, xr, ylr, yhr, texnum, ul, ur, sv0, sv1, cm))
-                    { sat_psw_ref++; psw_tier_endx = xl; return; }   /* r42: slices [rw_x,xl) stand */
-                sat_psw_tiers++;
+                    { psw_tier_endx = xl; return; }   /* r42: slices [rw_x,xl) stand */
             }
         }
         }
@@ -2896,10 +2890,8 @@ static void R_PswEmitTier (int texnum, fixed_t texmid,
         return;
     }
 
-    if (sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, texnum, u1, u2, v0, v1, cm))
-        sat_psw_ref++;
-    else
-    { sat_psw_tiers++; psw_tier_endx = rw_stopx; }     /* r42 */
+    if (!sat_wall_hook (rw_x, yl1, yh1, rw_stopx - 1, yl2, yh2, texnum, u1, u2, v0, v1, cm))
+        psw_tier_endx = rw_stopx;                      /* r42 */
 }
 
 static void R_PswWallRange (int start, int stop)
@@ -3084,8 +3076,8 @@ static void R_PswWallRange (int start, int stop)
 	   painted: tiers up to their endx, and the one-sided painted seal.
 	   Price: plane-behind-plane band culls are gone -- more far flats
 	   emitted; the honest budget (r50 presence, r52 funded cover)
-	   degrades floors first.  sat_psw_fold_cvis/fvis have no reader
-	   left (the r36 publish still writes them, harmlessly). */
+	   degrades floors first.  (P70: the orphaned fold_cvis/fvis pair
+	   was deleted outright.) */
 	fixed_t tfx = topfrac, bfx = bottomfrac;
 	fixed_t phx = pixhigh, plx = pixlow;   /* valid only when their tier exists */
 	int x;
