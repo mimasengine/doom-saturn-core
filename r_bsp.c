@@ -558,6 +558,13 @@ boolean R_CheckBBox (const short*	bspcoord)
     }
 
 
+#if SAT_PSW
+    /* SATURN P68: cran 3 keeps the frustum tests above but skips BOTH
+       occlusion exits below (sx1==sx2 narrow-cull + solidsegs containment) --
+       the class test for the un-noted ceiling bands (magenta u-rings). */
+    { extern int sat_psw_noprune; if (sat_psw_noprune) return true; }
+#endif
+
     // Find the first clippost
     //  that touches the source post
     //  (adjacent pixels are touching).
@@ -614,6 +621,15 @@ extern int *flattranslation;         /* r_data.c: animated-flat indirection     
 void (*sat_psw_sub_hook)(int subnum, int fh, int ch, int fpic,
                          int flump, int clump, int light, int vis0) = 0;
 
+/* SATURN P68 (psw-world): the owner's magenta frames sat exactly on the missing
+   ceiling bands, and the note inserts unconditionally with o=0 -- so those subs
+   were never VISITED: R_CheckBBox pruned an ancestor.  Vanilla could afford
+   both occlusion prunes because the sector-shared visplane painted the pruned
+   subs' ceilings through neighbouring subs' spans; a per-sub painter cannot.
+   Cran 3 (pad L+Down) sets this to run the walk with the two occlusion exits
+   disabled (frustum kept) -- a CLASS TEST, not a shipping mode. */
+int sat_psw_noprune = 0;
+
 /* floor height at a world point (the platform's pit-visibility cull: one
    sightline/dominant-crossing test per tile).  Pure node walk, no allocation --
    safe at flush time. */
@@ -627,6 +643,16 @@ int R_PswFloorAt (fixed_t x, fixed_t y)
 int R_PswCeilingAt (fixed_t x, fixed_t y)
 {
     return R_PointInSubsector (x, y)->sector->ceilingheight;
+}
+
+/* SATURN P68: TRUE ceiling height of a subsector BY NUMBER -- the probe's
+   magenta rings for un-noted subs projected at a borrowed height ("beaucoup
+   trop hautes", sheared: each vertex rises by focal*ph/d, so a wrong ph does
+   not translate the outline, it distorts it).  The platform has no sector
+   access; this is the one honest source. */
+int R_PswSubCeilH (int num)
+{
+    return subsectors[num].sector->ceilingheight;
 }
 
 /* SATURN PSW round 26 -- THE OVERDRAW MODEL IS DEAD (owner: "les murs doivent
