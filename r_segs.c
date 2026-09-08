@@ -3072,11 +3072,20 @@ static void R_PswWallRange (int start, int stop)
 	     reach the current band edge (no visible plane above/below it)
 	     folds only when it touches the edge -- a floating middle quad
 	     narrows nothing (conservative: nothing visible is ever culled). */
-	int ceilvis  = (frontsector->ceilingheight > viewz
-	                || frontsector->ceilingpic == skyflatnum)
-	               && sat_psw_fold_cvis;          /* r36: and REALLY painted */
-	int floorvis = (frontsector->floorheight < viewz)
-	               && sat_psw_fold_fvis;
+	/* ROUND 55 -- THE PLANE-REGION CLAIM IS DELETED (owner GO, 2026-09-08).
+	   ceilvis/floorvis closed the front plane REGION [band edge .. wall
+	   edge] across the seg's whole column range -- vanilla-sound, because
+	   vanilla's visplane really paints those pixels; FALSE in a per-leaf
+	   painter, where this sub's polygon covers only part of that region
+	   and the rest belongs to OTHER leaves, including the very ones the
+	   claim then kills at R_PswBandBoxHidden (mode-independent: console
+	   2026-09-08, the triangle survives master flats AND the r54 seal
+	   gate, h.band pinned at 4).  The bands now fold ONLY what was
+	   painted: tiers up to their endx, and the one-sided painted seal.
+	   Price: plane-behind-plane band culls are gone -- more far flats
+	   emitted; the honest budget (r50 presence, r52 funded cover)
+	   degrades floors first.  sat_psw_fold_cvis/fvis have no reader
+	   left (the r36 publish still writes them, harmlessly). */
 	fixed_t tfx = topfrac, bfx = bottomfrac;
 	fixed_t phx = pixhigh, plx = pixlow;   /* valid only when their tier exists */
 	int x;
@@ -3098,22 +3107,21 @@ static void R_PswWallRange (int start, int stop)
 		{
 		    int ph = SAT_SHR12 (phx);
 		    if (ph >= viewheight) ph = viewheight - 1;
-		    if (x < psw_top_endx)              /* r42: painted => opaque */
-		    { if ((ceilvis || yl <= nt) && ph + 1 > nt) nt = ph + 1; }
-		    else if (ceilvis && yl > nt) nt = yl;   /* the plane region only */
+		    if (x < psw_top_endx)              /* r42: painted => opaque;
+		                                          r55: only a tier TOUCHING the
+		                                          band edge extends it (no gap
+		                                          promised by any plane claim) */
+		    { if (yl <= nt && ph + 1 > nt) nt = ph + 1; }
 		    phx += pixhighstep;
 		}
-		else if (ceilvis && yl > nt) nt = yl;
 		if (bottomtexture)
 		{
 		    int pl = SAT_SHR12 (plx);
 		    if (pl < 0) pl = 0;
-		    if (x < psw_bot_endx)              /* r42 */
-		    { if ((floorvis || yh >= nb) && pl - 1 < nb) nb = pl - 1; }
-		    else if (floorvis && yh < nb) nb = yh;
+		    if (x < psw_bot_endx)              /* r42 / r55: same law */
+		    { if (yh >= nb && pl - 1 < nb) nb = pl - 1; }
 		    plx += pixlowstep;
 		}
-		else if (floorvis && yh < nb) nb = yh;
 		sat_psw_bt[x] = (short)nt; sat_psw_bb[x] = (short)nb;
 	    }
 	    tfx += topstep; bfx += bottomstep;
