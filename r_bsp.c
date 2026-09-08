@@ -897,6 +897,64 @@ static void psw_poly_walk (int bspnum)
     }
 }
 
+/* SATURN P69 -- NODE BBOXES BOUND SEGS, NOT LEAF POLYGONS.  Console P68
+   (cran 3, prunes off): the missing ceiling bands filled TEXTURED -- their
+   subs' flat areas were visible while every prune input said "hidden".  The
+   WAD's node bbox is built from seg bounds; a leaf's flat polygon (closed by
+   ancestor splitlines) can extend far outside it.  Vanilla never cared: a
+   pruned sub's flats were painted anyway through the sector-shared visplane,
+   marked by OTHER subs' segs -- the exact cover a per-leaf painter does not
+   have.  Fix at LOAD, zero per-frame cost: widen every node's child bbox16 to
+   also cover the leaf POLYGONS of its subtree, so R_CheckBBox judges the true
+   claim area.  Truly-hidden subtrees still prune; only flats-beyond-segs
+   coverage is restored.  bbox16 is read by R_CheckBBox alone. */
+int sat_psw_bbgrow = 0;              /* child boxes widened (platform-readable) */
+static void psw_grow_walk (int bspnum, fixed_t *bb)
+{
+    /* bb out: {minx, miny, maxx, maxy} of the subtree's leaf polygons */
+    bb[0] = bb[1] = 0x7fffffff; bb[2] = bb[3] = (fixed_t)0x80000000;
+    if (bspnum & NF_SUBSECTOR)
+    {
+	int num = (bspnum == -1) ? 0 : (bspnum & ~NF_SUBSECTOR);
+	int n = psw_pvn[num], base = psw_pvi[num], i;
+	for (i = 0; i < n; ++i)
+	{
+	    fixed_t x = psw_pvx[base + i], y = psw_pvy[base + i];
+	    if (x < bb[0]) bb[0] = x;
+	    if (x > bb[2]) bb[2] = x;
+	    if (y < bb[1]) bb[1] = y;
+	    if (y > bb[3]) bb[3] = y;
+	}
+	return;
+    }
+    {
+	node_t *bsp = &nodes[bspnum];
+	fixed_t cb[4];
+	int side;
+	for (side = 0; side < 2; ++side)
+	{
+	    psw_grow_walk(bsp->children[side], cb);
+	    if (cb[0] > cb[2]) continue;               /* empty subtree */
+	    {
+		short L = (short)(cb[0] >> FRACBITS);              /* floor */
+		short B = (short)(cb[1] >> FRACBITS);
+		short R = (short)((cb[2] + 0xffff) >> FRACBITS);   /* ceil */
+		short T = (short)((cb[3] + 0xffff) >> FRACBITS);
+		int grew = 0;
+		if (L < bsp->bbox16[side][BOXLEFT])   { bsp->bbox16[side][BOXLEFT]   = L; grew = 1; }
+		if (R > bsp->bbox16[side][BOXRIGHT])  { bsp->bbox16[side][BOXRIGHT]  = R; grew = 1; }
+		if (B < bsp->bbox16[side][BOXBOTTOM]) { bsp->bbox16[side][BOXBOTTOM] = B; grew = 1; }
+		if (T > bsp->bbox16[side][BOXTOP])    { bsp->bbox16[side][BOXTOP]    = T; grew = 1; }
+		sat_psw_bbgrow += grew;
+	    }
+	    if (cb[0] < bb[0]) bb[0] = cb[0];
+	    if (cb[1] < bb[1]) bb[1] = cb[1];
+	    if (cb[2] > bb[2]) bb[2] = cb[2];
+	    if (cb[3] > bb[3]) bb[3] = cb[3];
+	}
+    }
+}
+
 /* (Re)build for the current level; called once per PSW frame from R_DrawPlanes'
    PSW block (cheap identity check after the first build). */
 void R_PswPolysEnsure (void)
@@ -928,6 +986,11 @@ void R_PswPolysEnsure (void)
     psw_pass = 1; psw_fillpos = 0; psw_depth = 0;
     psw_poly_walk(numnodes - 1);
     psw_polys_ok = 1;
+    {   /* P69: widen node bboxes to the leaf polygons (see psw_grow_walk) */
+	fixed_t bb[4];
+	sat_psw_bbgrow = 0;
+	psw_grow_walk(numnodes - 1, bb);
+    }
 }
 #endif /* SAT_PSW */
 
